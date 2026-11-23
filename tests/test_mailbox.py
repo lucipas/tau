@@ -436,11 +436,57 @@ def test_enqueue_retract_rejects_combined_fields(tmp_path):
             retract=_retract_payload(),
             location={"lat": 1.0, "lon": 2.0},
         )
+
+
+def test_enqueue_group_retract_round_trips(tmp_path):
+    # A group retract carries its group context plus the author and
+    # send time of the retracted copy, so a sealed relay copy names
+    # the copy the recipient holds even though wire ids differ per leg.
+    box = Mailbox(tmp_path / "mailbox.json")
+    entry = box.enqueue(
+        to=BOB,
+        text="retraction",
+        retract=_retract_payload(
+            target_author="ab" * 16, target_sent_at=100.0
+        ),
+        group={
+            "id": "ab" * 16,
+            "name": "crew",
+            "creator": "ab" * 16,
+            "members": ["ab" * 16],
+        },
+    )
+    assert entry.kind == "retract"
+    assert entry.group_id == "ab" * 16
+    assert entry.retract["target_author"] == "ab" * 16
+    assert entry.retract["target_sent_at"] == 100.0
+
+    reloaded = Mailbox(tmp_path / "mailbox.json")
+    again = reloaded.outbox_list()[0]
+    assert again.kind == "retract"
+    assert again.group_id == "ab" * 16
+    assert again.retract == entry.retract
+
+
+def test_enqueue_group_retract_rejects_bad_group_context(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
     with pytest.raises(MailboxError):
         box.enqueue(
             to=BOB,
             text="retraction",
-            retract=_retract_payload(),
+            retract=_retract_payload(target_author="not-a-hash"),
+            group={
+                "id": "ab" * 16,
+                "name": "crew",
+                "creator": "ab" * 16,
+                "members": ["ab" * 16],
+            },
+        )
+    with pytest.raises(MailboxError):
+        box.enqueue(
+            to=BOB,
+            text="retraction",
+            retract=_retract_payload(target_sent_at=float("nan")),
             group={
                 "id": "ab" * 16,
                 "name": "crew",
@@ -2027,6 +2073,210 @@ def test_sent_group_retraction_markers_persist_and_expire(tmp_path):
     assert reloaded.is_sent_group_retracted(group, 100.0) is False
 
 
+def test_retract_cleanup_blocked_markers_persist_and_expire(tmp_path):
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    assert box.is_retract_cleanup_blocked("retract-1") is False
+
+    recorded_at = time.time()
+    box.record_retract_cleanup_blocked("retract-1", now=recorded_at)
+    assert box.is_retract_cleanup_blocked("retract-1") is True
+    # Keyed by retract id alone: another retract is unaffected.
+    assert box.is_retract_cleanup_blocked("retract-2") is False
+
+    # The marker survives a reload, and lifts once its retention ends.
+    reloaded = Mailbox(path)
+    assert reloaded.is_retract_cleanup_blocked("retract-1") is True
+    assert (
+        reloaded.is_retract_cleanup_blocked(
+            "retract-1", now=recorded_at + SENT_RETRACTED_RETENTION - 1
+        )
+        is True
+    )
+    assert (
+        reloaded.is_retract_cleanup_blocked(
+            "retract-1", now=recorded_at + SENT_RETRACTED_RETENTION
+        )
+        is False
+    )
+
+    removed = reloaded.prune(now=recorded_at + SENT_RETRACTED_RETENTION)
+    assert reloaded.is_retract_cleanup_blocked("retract-1") is False
+
+
+def test_prune_blocks_cleanup_for_expired_group_retract_leg(tmp_path):
+    # An expired leg of a queued group retract blocks the fan-out's
+    # local cleanup, exactly like a refused leg: the member never got
+    # the retract, so the sender's copies must survive even after the
+    # surviving legs deliver.
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    now = time.time()
+    box.enqueue(
+        to=bytes.fromhex("cd" * 16),
+        text="retraction",
+        message_id="leg-bob",
+        group={
+            "id": "cc" * 16,
+            "name": "crew",
+            "creator": "ab" * 16,
+            "members": ["ab" * 16, "cd" * 16],
+        },
+        sent_at=now - 100,
+        now=now,
+        expires_at=now + 10,
+        retract={
+            "target": "leg-1",
+            "retract_id": "retract-1",
+            "sent_at": now - 100,
+            "target_author": "ab" * 16,
+            "target_sent_at": 100.0,
+            "payload_b64": "AAAA",
+        },
+    )
+    entry = box.get_outbox("leg-bob")
+    assert entry is not None
+    # Past the leg's expiry, prune drops it — and records the block.
+    removed = box.prune(now=now + 11)
+    assert removed["outbox"] == 1
+    assert box.get_outbox("leg-bob") is None
+    assert box.is_retract_cleanup_blocked("retract-1") is True
+
+
+def test_prune_blocks_cleanup_for_corrupt_group_retract_leg(tmp_path):
+    # Qodo Warning on PR #706: a group-retract leg whose stored
+    # payload did not survive carried no retract id, so pruning it
+    # recorded no block and a valid sibling's delivery deleted the
+    # sender's copies. The id now survives as a hint (see
+    # OutboxEntry.group_retract_id), so the corrupt leg still blocks
+    # the cleanup.
+    import json
+
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    now = time.time()
+    box.enqueue(
+        to=bytes.fromhex("cd" * 16),
+        text="retraction",
+        message_id="leg-bob",
+        group={
+            "id": "cc" * 16,
+            "name": "crew",
+            "creator": "ab" * 16,
+            "members": ["ab" * 16, "cd" * 16],
+        },
+        sent_at=now - 100,
+        now=now,
+        expires_at=now + 10,
+        retract={
+            "target": "leg-1",
+            "retract_id": "retract-1",
+            "sent_at": now - 100,
+            "target_author": "ab" * 16,
+            "target_sent_at": 100.0,
+            "payload_b64": "AAAA",
+        },
+    )
+    # Corrupt the stored payload on disk: the signed bytes are gone,
+    # but the retract id survives in the stored record.
+    data = json.loads(path.read_text())
+    [stored] = [e for e in data["outbox"] if e["id"] == "leg-bob"]
+    stored["retract"] = {"retract_id": "retract-1"}
+    path.write_text(json.dumps(data))
+
+    reloaded = Mailbox(path)
+    entry = reloaded.get_outbox("leg-bob")
+    assert entry is not None
+    assert entry.kind == "retract"
+    assert entry.retract is None
+    assert entry.group_retract_id == "retract-1"
+    removed = reloaded.prune(now=now + 11)
+    assert removed["outbox"] == 1
+    assert reloaded.get_outbox("leg-bob") is None
+    assert reloaded.is_retract_cleanup_blocked("retract-1") is True
+
+
+def test_retract_cleanup_blocked_eviction_keeps_markers_with_queued_legs(
+    tmp_path, monkeypatch
+):
+    # Qodo Warning on PR #706: the cap eviction could drop a marker
+    # whose retract still had a queued leg, so the surviving leg's
+    # delivery deleted the sender's copies. Eviction now skips
+    # markers with a queued leg.
+    monkeypatch.setattr(mailbox_module, "MAX_RETRACT_CLEANUP_BLOCKED", 2)
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    now = time.time()
+    box.enqueue(
+        to=bytes.fromhex("cd" * 16),
+        text="retraction",
+        message_id="leg-bob",
+        group={
+            "id": "cc" * 16,
+            "name": "crew",
+            "creator": "ab" * 16,
+            "members": ["ab" * 16, "cd" * 16],
+        },
+        sent_at=now - 100,
+        now=now,
+        expires_at=now + 1000,
+        retract={
+            "target": "leg-1",
+            "retract_id": "retract-protected",
+            "sent_at": now - 100,
+            "target_author": "ab" * 16,
+            "target_sent_at": 100.0,
+            "payload_b64": "AAAA",
+        },
+    )
+    # The protected marker expires first, but its leg is still queued.
+    box.record_retract_cleanup_blocked("retract-protected", now=now)
+    box.record_retract_cleanup_blocked("other-1", now=now + 1)
+    box.record_retract_cleanup_blocked("other-2", now=now + 2)
+    assert box.is_retract_cleanup_blocked("retract-protected", now=now) is True
+    assert box.is_retract_cleanup_blocked("other-1", now=now) is False
+    assert box.is_retract_cleanup_blocked("other-2", now=now) is True
+    # And the plain case still evicts the earliest expiry.
+    box.record_retract_cleanup_blocked("other-3", now=now + 3)
+    assert box.is_retract_cleanup_blocked("other-2", now=now) is False
+    assert box.is_retract_cleanup_blocked("other-3", now=now) is True
+    assert box.is_retract_cleanup_blocked("retract-protected", now=now) is True
+
+
+def test_retract_cleanup_blocked_read_and_write_time_out_on_busy_lock(
+    tmp_path,
+):
+    # Qodo Warning on PR #706: the marker read and write waited on
+    # the mailbox locks without a limit inside the deadline-bounded
+    # sweep. Both now take a timeout and raise TimeoutError once the
+    # budget is spent, like outbox_list.
+    import threading
+
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    held = threading.Event()
+    release = threading.Event()
+
+    def hold_lock():
+        box._lock.acquire()
+        held.set()
+        release.wait(timeout=30)
+        box._lock.release()
+
+    holder = threading.Thread(target=hold_lock, daemon=True)
+    holder.start()
+    assert held.wait(timeout=5)
+    try:
+        with pytest.raises(TimeoutError):
+            box.is_retract_cleanup_blocked("retract-1", timeout=0.0)
+        with pytest.raises(TimeoutError):
+            box.record_retract_cleanup_blocked("retract-1", timeout=0.0)
+    finally:
+        release.set()
+        holder.join(timeout=5)
+    assert box.is_retract_cleanup_blocked("retract-1") is False
+
+
 def test_group_retraction_markers_are_capped(tmp_path, monkeypatch):
     monkeypatch.setattr(mailbox_module, "MAX_GROUP_RETRACTED", 2)
     box = Mailbox(tmp_path / "mailbox.json")
@@ -2313,6 +2563,59 @@ def test_seal_message_rejects_retract_without_id():
             sent_at=4242.0,
             kind="retract",
             retract={},
+        )
+
+
+def test_seal_message_carries_group_retract_context():
+    # A sealed group retract names the retracted copy by its author
+    # and shared send time, so the recipient resolves its own leg
+    # even though the target id only matches the author's sent record.
+    from tau.mailbox import open_message
+
+    sender, recipient = make_identity_pair()
+    blob = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="leg-author",
+        text="retraction",
+        sent_at=4242.0,
+        group={
+            "id": "ab" * 16,
+            "name": "crew",
+            "creator": "cd" * 16,
+            "members": ["ab" * 16, "cd" * 16],
+        },
+        kind="retract",
+        retract={
+            "retract_id": "r-1",
+            "target_author": "ab" * 16,
+            "target_sent_at": 100.0,
+        },
+    )
+    leg = open_message(recipient, blob)
+    assert leg["id"] == "leg-author"
+    assert leg["kind"] == "retract"
+    assert leg["retract"] == {
+        "retract_id": "r-1",
+        "target_author": "ab" * 16,
+        "target_sent_at": 100.0,
+    }
+    assert leg["group"]["id"] == "ab" * 16
+    with pytest.raises(MailboxError):
+        seal_message(
+            sender,
+            sender_name="alice",
+            recipient_public_key=recipient.get_public_key(),
+            message_id="leg-author",
+            text="retraction",
+            sent_at=4242.0,
+            kind="retract",
+            retract={
+                "retract_id": "r-1",
+                "target_author": "not-a-hash",
+                "target_sent_at": 100.0,
+            },
         )
 
 

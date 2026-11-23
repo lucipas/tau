@@ -154,6 +154,7 @@ SENT_RETENTION = 30 * 24 * 60 * 60
 SENT_RETRACTED_RETENTION = SENT_RETENTION
 MAX_SENT_RETRACTED = 1024
 MAX_SENT_GROUP_RETRACTED = 1024
+MAX_RETRACT_CLEANUP_BLOCKED = 1024
 
 
 def _retraction_key(sender_hash: str, message_id: str) -> str:
@@ -466,6 +467,21 @@ def _raw_edit_id(raw: Any) -> Optional[str]:
     return None
 
 
+def _raw_retract_id(raw: Any) -> Optional[str]:
+    """The retract id of a stored retract payload that failed validation.
+
+    ``clean_queued_retract`` drops the whole payload; the signed
+    retract id is still needed to tell which group retract the leg
+    belongs to.
+    """
+    if not isinstance(raw, dict):
+        return None
+    retract_id = raw.get("retract_id")
+    if isinstance(retract_id, str) and retract_id:
+        return retract_id
+    return None
+
+
 def clean_queued_reaction(raw: Any) -> Optional[Dict[str, Any]]:
     """Validate one queued reaction, or ``None`` when it is unusable.
 
@@ -545,10 +561,10 @@ def clean_queued_retract(raw: Any) -> Optional[Dict[str, Any]]:
     re-sends verbatim: the target wire id, the signed retract id and
     send time, and the signed bytes as base64.  A corrupt value drops
     the retract — the entry keeps kind "retract" and ``_deliver_entry``
-    drops it instead of ever sending the display text as chat.
-    Retracts are DM-only: group retracts are never queued (see
-    :meth:`TauNode.send_group_retraction`), so there is no group
-    context to carry.
+    drops it instead of ever sending the display text as chat.  A
+    group retract also carries the group context (author and send time
+    of the retracted copy), so a sealed relay copy names the copy the
+    recipient holds even though wire ids differ per leg.
     """
     if not isinstance(raw, dict):
         return None
@@ -574,12 +590,36 @@ def clean_queued_retract(raw: Any) -> Optional[Dict[str, Any]]:
         base64.b64decode(payload_b64, validate=True)
     except Exception:
         return None
-    return {
+    target_author = raw.get("target_author")
+    if target_author is not None and (
+        not isinstance(target_author, str)
+        or len(target_author) != 32
+        or not _is_hex(target_author)
+    ):
+        return None
+    target_sent_at = raw.get("target_sent_at")
+    if target_sent_at is not None:
+        if isinstance(target_sent_at, bool) or not isinstance(
+            target_sent_at, (int, float)
+        ):
+            return None
+        try:
+            target_sent_at = float(target_sent_at)
+        except (OverflowError, ValueError):
+            return None
+        if not math.isfinite(target_sent_at):
+            return None
+    cleaned: Dict[str, Any] = {
         "target": target,
         "retract_id": retract_id,
         "sent_at": sent_at,
         "payload_b64": payload_b64,
     }
+    if target_author is not None:
+        cleaned["target_author"] = target_author.lower()
+    if target_sent_at is not None:
+        cleaned["target_sent_at"] = target_sent_at
+    return cleaned
 
 
 class MailboxError(RuntimeError):
@@ -701,6 +741,11 @@ class OutboxEntry:
     # location, beacon or reply fields.  Shape: {"target",
     # "retract_id", "sent_at", "payload_b64"}.
     retract: Optional[Dict[str, Any]] = None
+    # Group-retract identity kept when the stored ``retract`` payload
+    # fails validation (``retract`` is then ``None``).  A corrupt leg
+    # still belongs to its retract, so pruning it can block the
+    # fan-out's local cleanup and the sweep can find its siblings.
+    retract_id_hint: Optional[str] = None
 
     @property
     def to_hex(self) -> str:
@@ -718,6 +763,19 @@ class OutboxEntry:
             if isinstance(edit_id, str) and edit_id:
                 return edit_id
         return self.edit_id_hint
+
+    @property
+    def group_retract_id(self) -> Optional[str]:
+        """The retract id this entry is a leg of, or ``None``.
+
+        Read from the validated ``retract`` payload, else from the id
+        kept for a corrupt payload.
+        """
+        if isinstance(self.retract, dict):
+            retract_id = self.retract.get("retract_id")
+            if isinstance(retract_id, str) and retract_id:
+                return retract_id
+        return self.retract_id_hint
 
     @property
     def wire_sent_at(self) -> float:
@@ -820,6 +878,10 @@ class OutboxEntry:
             payload["reaction"] = dict(self.reaction)
         if self.retract is not None:
             payload["retract"] = dict(self.retract)
+        elif self.retract_id_hint is not None:
+            # Keep the identity of a corrupt leg across a save, so a
+            # reload still knows which retract it belongs to.
+            payload["retract"] = {"retract_id": self.retract_id_hint}
         return payload
 
     @classmethod
@@ -1035,6 +1097,11 @@ class OutboxEntry:
             edit_id_hint=None if edit is not None else _raw_edit_id(raw.get("edit")),
             reaction=reaction,
             retract=retract,
+            retract_id_hint=(
+                None
+                if retract is not None
+                else _raw_retract_id(raw.get("retract"))
+            ),
         )
 
 
@@ -1322,6 +1389,14 @@ class Mailbox:
         # always names this node's own message.
         self._sent_retracted: Dict[str, float] = {}
         self._sent_group_retracted: Dict[str, float] = {}
+        # Retract ids whose fan-out can never complete: a leg of the
+        # retract was finally refused, rejected, or expired, so a
+        # member still holds the message and the sender's local copies
+        # must survive even after the last queued leg delivers (see
+        # TauNode._deliver_queued_retract). Keyed by retract id, with
+        # the same retention as the sent-retraction markers — long
+        # enough to outlive any queued leg of the same retract.
+        self._retract_cleanup_blocked: Dict[str, float] = {}
         if self.path is not None:
             self.load()
 
@@ -1441,6 +1516,7 @@ class Mailbox:
             self._group_retracted_unknown = state["group_retracted_unknown"]
             self._sent_retracted = state["sent_retracted"]
             self._sent_group_retracted = state["sent_group_retracted"]
+            self._retract_cleanup_blocked = state["retract_cleanup_blocked"]
             self._group_pending_edits = state["group_pending_edits"]
             self._pending_local_edits = state["pending_local_edits"]
             self._aborted_local_edits = state["aborted_local_edits"]
@@ -1600,6 +1676,10 @@ class Mailbox:
             raw.get("sent_group_retracted"),
             retention=SENT_RETRACTED_RETENTION,
         )
+        retract_cleanup_blocked = _parse_retraction_markers(
+            raw.get("retract_cleanup_blocked"),
+            retention=SENT_RETRACTED_RETENTION,
+        )
         group_pending_edits = _parse_pending_edit_markers(
             raw.get("group_pending_edits")
         )
@@ -1707,6 +1787,7 @@ class Mailbox:
             "group_retracted_unknown": group_retracted_unknown,
             "sent_retracted": sent_retracted,
             "sent_group_retracted": sent_group_retracted,
+            "retract_cleanup_blocked": retract_cleanup_blocked,
             "group_pending_edits": group_pending_edits,
             "pending_local_edits": pending_local_edits,
             "aborted_local_edits": aborted_local_edits,
@@ -1741,6 +1822,7 @@ class Mailbox:
                 ),
                 "sent_retracted": dict(self._sent_retracted),
                 "sent_group_retracted": dict(self._sent_group_retracted),
+                "retract_cleanup_blocked": dict(self._retract_cleanup_blocked),
                 "group_pending_edits": {
                     key: dict(marker)
                     for key, marker in self._group_pending_edits.items()
@@ -1904,11 +1986,6 @@ class Mailbox:
                 raise MailboxError(
                     "a queued retract cannot carry poll, location, "
                     "beacon or reply fields"
-                )
-            if group is not None:
-                raise MailboxError(
-                    "a queued retract cannot carry group context: "
-                    "group retracts are never queued"
                 )
         clean_options: Optional[List[str]] = None
         if poll_options is not None:
@@ -3420,22 +3497,39 @@ class Mailbox:
             self.save()
 
     def is_sent_group_retracted(
-        self, group_id: str, sent_at: float, *, now: Optional[float] = None
+        self,
+        group_id: str,
+        sent_at: float,
+        *,
+        now: Optional[float] = None,
+        timeout: Optional[float] = None,
     ) -> bool:
         """True while a live sent group-retraction marker covers this send.
 
         An expired marker reads as absent even before :meth:`prune`
         sweeps it away; a non-numeric send time cannot match a
-        recorded marker.
+        recorded marker. With ``timeout`` set, the wait for the
+        in-process lock is bounded by it (a ``TimeoutError`` is raised
+        once the budget is spent), so a caller with its own deadline
+        is not held past it by a stalled lock holder.
         """
-        with self._lock:
-            timestamp = now if now is not None else time.time()
+        timestamp = now if now is not None else time.time()
+        try:
+            key = _sent_group_retraction_key(group_id, float(sent_at))
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if timeout is None:
+            with self._lock:
+                until = self._sent_group_retracted.get(key)
+        else:
+            acquired = self._lock.acquire(timeout=max(0.0, timeout))
+            if not acquired:
+                raise TimeoutError("mailbox lock is held by another thread")
             try:
-                key = _sent_group_retraction_key(group_id, float(sent_at))
-            except (TypeError, ValueError, OverflowError):
-                return False
-            until = self._sent_group_retracted.get(key)
-            return until is not None and timestamp < until
+                until = self._sent_group_retracted.get(key)
+            finally:
+                self._lock.release()
+        return until is not None and timestamp < until
 
     def _evict_sent_group_retracted(self) -> None:
         """Drop earliest-expiry sent group markers until the pool fits.
@@ -3447,6 +3541,103 @@ class Mailbox:
                 self._sent_group_retracted.items(), key=lambda kv: kv[1]
             )
             del self._sent_group_retracted[oldest[0]]
+
+    def record_retract_cleanup_blocked(
+        self,
+        retract_id: str,
+        *,
+        now: Optional[float] = None,
+        timeout: Optional[float] = None,
+    ) -> None:
+        """Remember that a group retract's fan-out can never complete.
+
+        A leg of the retract was finally refused, rejected, or expired,
+        so a member still holds the message: the sender's local copies
+        must survive even after the last queued leg delivers (see
+        :meth:`tau.node.TauNode._deliver_queued_retract`). Recording the
+        same retract again refreshes the marker. With ``timeout`` set,
+        the wait for the mailbox lock is bounded by it (a
+        ``TimeoutError`` is raised once the budget is spent), so a
+        caller with its own deadline — a delivery sweep, say — is not
+        held past it by a stalled lock holder.
+        """
+        with self._transaction(timeout=timeout):
+            self._record_retract_cleanup_blocked_locked(
+                retract_id, now=now
+            )
+            self.save()
+
+    def _record_retract_cleanup_blocked_locked(
+        self, retract_id: str, *, now: Optional[float] = None
+    ) -> None:
+        """Record a cleanup block; call with the transaction held.
+
+        The caller saves: this only mutates the in-memory marker pool,
+        so a removal in the same transaction (see
+        :meth:`tau.node.TauNode._remove_queued_version`) is persisted
+        with it atomically.
+        """
+        timestamp = now if now is not None else time.time()
+        self._retract_cleanup_blocked[retract_id] = (
+            timestamp + SENT_RETRACTED_RETENTION
+        )
+        self._evict_retract_cleanup_blocked()
+
+    def is_retract_cleanup_blocked(
+        self,
+        retract_id: str,
+        *,
+        now: Optional[float] = None,
+        timeout: Optional[float] = None,
+    ) -> bool:
+        """True while a live cleanup-blocked marker covers this retract.
+
+        An expired marker reads as absent even before :meth:`prune`
+        sweeps it away. With ``timeout`` set, the wait for the
+        in-process lock is bounded by it (a ``TimeoutError`` is raised
+        once the budget is spent), so a caller with its own deadline
+        is not held past it by a stalled lock holder; with no timeout
+        the wait is unbounded, as before.
+        """
+        timestamp = now if now is not None else time.time()
+        if timeout is None:
+            with self._lock:
+                until = self._retract_cleanup_blocked.get(retract_id)
+        else:
+            acquired = self._lock.acquire(timeout=max(0.0, timeout))
+            if not acquired:
+                raise TimeoutError("mailbox lock is held by another thread")
+            try:
+                until = self._retract_cleanup_blocked.get(retract_id)
+            finally:
+                self._lock.release()
+        return until is not None and timestamp < until
+
+    def _evict_retract_cleanup_blocked(self) -> None:
+        """Drop earliest-expiry cleanup-blocked markers until the pool fits.
+
+        Call with the transaction held. A marker whose retract still
+        has a queued leg is never evicted: evicting it would let the
+        surviving leg's delivery delete the sender's copies while a
+        member still holds the message. The pool can grow past the cap
+        while legs are outstanding — at most one marker per queued leg,
+        and the outbox itself is capped.
+        """
+        live = {
+            entry.group_retract_id
+            for entry in self._outbox.values()
+            if entry.group_retract_id is not None
+        }
+        while len(self._retract_cleanup_blocked) > MAX_RETRACT_CLEANUP_BLOCKED:
+            candidates = [
+                (retract_id, until)
+                for retract_id, until in self._retract_cleanup_blocked.items()
+                if retract_id not in live
+            ]
+            if not candidates:
+                break
+            oldest = min(candidates, key=lambda kv: kv[1])
+            del self._retract_cleanup_blocked[oldest[0]]
 
     # -- pending fetch acknowledgements --------------------------------------
 
@@ -3521,6 +3712,30 @@ class Mailbox:
                 if (entry := self._outbox.get(key)) is not None
                 and entry.group_edit_id is not None
             }
+            # An expired leg of a queued group retract blocks the
+            # fan-out's local cleanup: the member never got the
+            # retract, so the sender's copies must survive even after
+            # the surviving legs deliver (see
+            # TauNode._deliver_queued_retract). The marker is written
+            # inline, before the dead legs are deleted below — prune
+            # saves at the end, since dead_outbox is non-empty
+            # whenever a leg expired.
+            for key in dead_outbox:
+                entry = self._outbox.get(key)
+                if entry is None or entry.kind != "retract":
+                    continue
+                if getattr(entry, "group_id", None) is None:
+                    continue
+                # The retract id survives a corrupt payload as a hint
+                # (see OutboxEntry.group_retract_id), so a damaged leg
+                # still blocks the cleanup its fan-out can never finish.
+                retract_id = entry.group_retract_id
+                if not retract_id:
+                    continue
+                self._retract_cleanup_blocked[retract_id] = (
+                    timestamp + SENT_RETRACTED_RETENTION
+                )
+            self._evict_retract_cleanup_blocked()
             for key in dead_outbox:
                 del self._outbox[key]
             # An expired leg aborts its edit: a deferred local apply
@@ -3619,6 +3834,13 @@ class Mailbox:
             ]
             for key in dead_aborted_local_edits:
                 del self._aborted_local_edits[key]
+            dead_retract_cleanup_blocked = [
+                key
+                for key, until in self._retract_cleanup_blocked.items()
+                if until <= timestamp
+            ]
+            for key in dead_retract_cleanup_blocked:
+                del self._retract_cleanup_blocked[key]
             if (
                 dead_outbox
                 or dead_held
@@ -3634,6 +3856,7 @@ class Mailbox:
                 or dead_sent_group_retracted
                 or dead_group_pending_edits
                 or dead_aborted_local_edits
+                or dead_retract_cleanup_blocked
             ):
                 self.save()
             return {
@@ -3713,7 +3936,10 @@ def seal_message(
     and the signed send time (``sent_at``) travel inside the same
     signed envelope, so a relayed retract still applies exactly like
     a direct one — the recipient keys dedupe on the retract id, and
-    the envelope's own signature proves who retracted.
+    the envelope's own signature proves who retracted.  A group
+    retract also carries ``target_author`` / ``target_sent_at``: the
+    recipient resolves its own leg copy from that context, since the
+    target id alone only matches the author's sent record.
     """
     if len(recipient_public_key) != _PUBLIC_KEY_BYTES:
         raise MailboxError("recipient public key must be 64 bytes")
@@ -3895,7 +4121,42 @@ def seal_message(
             raise MailboxError(
                 "retract id must be a 1-64 character string"
             )
-        inner["retract"] = {"retract_id": retract_id}
+        sealed_retract: Dict[str, Any] = {"retract_id": retract_id}
+        # The group context names the retracted copy: group legs carry
+        # a different wire id per member, so the target id alone only
+        # matches the author's sent record — the recipient resolves its
+        # own copy from the author and shared send time instead.
+        target_author = retract.get("target_author")
+        if target_author is not None:
+            if (
+                not isinstance(target_author, str)
+                or len(target_author) != 32
+                or not _is_hex(target_author)
+            ):
+                raise MailboxError(
+                    "retract target author must be a 32-hex hash"
+                )
+            sealed_retract["target_author"] = target_author.lower()
+        target_sent_at = retract.get("target_sent_at")
+        if target_sent_at is not None:
+            if isinstance(target_sent_at, bool) or not isinstance(
+                target_sent_at, (int, float)
+            ):
+                raise MailboxError(
+                    "retract target send time must be a number"
+                )
+            try:
+                target_sent_at = float(target_sent_at)
+            except (OverflowError, ValueError) as exc:
+                raise MailboxError(
+                    "retract target send time must be a number"
+                ) from exc
+            if not math.isfinite(target_sent_at):
+                raise MailboxError(
+                    "retract target send time must be finite"
+                )
+            sealed_retract["target_sent_at"] = target_sent_at
+        inner["retract"] = sealed_retract
     reply_to = clean_in_reply_to(in_reply_to)
     if reply_to is not None:
         inner["in_reply_to"] = reply_to
@@ -4219,7 +4480,11 @@ def _validated_sealed_message(payload: Dict[str, Any]) -> Dict[str, Any]:
     # A retract leg rides the same way: without the signed retract id
     # the recipient could not dedupe it, and the leg would read as
     # chat.  Malformed retract data drops the field, never the message
-    # — the delivery path refuses a leg with no retract payload.
+    # — the delivery path refuses a leg with no retract payload.  A
+    # group retract also carries the author and shared send time of
+    # the retracted copy, so the recipient resolves its own leg copy;
+    # malformed context drops just those fields, and the leg is then
+    # refused for lack of anything to resolve by.
     retract_raw = payload.get("retract")
     if isinstance(retract_raw, dict):
         retract_id = retract_raw.get("retract_id")
@@ -4228,7 +4493,31 @@ def _validated_sealed_message(payload: Dict[str, Any]) -> Dict[str, Any]:
             and retract_id
             and len(retract_id) <= 64
         ):
-            result["retract"] = {"retract_id": retract_id}
+            sealed_retract: Dict[str, Any] = {"retract_id": retract_id}
+            target_author = retract_raw.get("target_author")
+            if (
+                isinstance(target_author, str)
+                and len(target_author) == 32
+                and _is_hex(target_author)
+            ):
+                sealed_retract["target_author"] = target_author.lower()
+            target_sent_at = retract_raw.get("target_sent_at")
+            if isinstance(target_sent_at, bool) or not isinstance(
+                target_sent_at, (int, float)
+            ):
+                target_sent_at = None
+            else:
+                try:
+                    target_sent_at = float(target_sent_at)
+                except (OverflowError, ValueError):
+                    target_sent_at = None
+                if target_sent_at is not None and not math.isfinite(
+                    target_sent_at
+                ):
+                    target_sent_at = None
+            if target_sent_at is not None:
+                sealed_retract["target_sent_at"] = target_sent_at
+            result["retract"] = sealed_retract
     group_raw = payload.get("group")
     if group_raw is not None:
         if not isinstance(group_raw, dict):

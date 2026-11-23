@@ -5946,6 +5946,7 @@ class TauNode:
         text: str,
         edited_at: Optional[float],
         timeout: Optional[float] = None,
+        block_retract_id: Optional[str] = None,
     ) -> bool:
         """Remove the queued entry only if it still carries this version.
 
@@ -5954,6 +5955,13 @@ class TauNode:
         recipient has not seen yet.  Returns False when the entry is
         gone or a replacement landed; the caller leaves the replacement
         queued for a later round.
+
+        With ``block_retract_id`` set, the leg is being dropped
+        finally, not delivered: the cleanup-blocked marker for that
+        retract is written in the same transaction as the removal, so
+        a failed save keeps the leg queued instead of losing the
+        failure record — and a replacement landing first writes no
+        marker, since the replacement leg is still queued.
         """
         with self.mailbox.transaction(timeout=timeout):
             current = self.mailbox.get_outbox(message_id)
@@ -5961,6 +5969,10 @@ class TauNode:
                 return False
             if current.text != text or current.edited_at != edited_at:
                 return False
+            if block_retract_id is not None:
+                self.mailbox._record_retract_cleanup_blocked_locked(
+                    block_retract_id
+                )
             return self.mailbox.remove_outbox(message_id)
 
     def _current_group_topic(
@@ -6185,6 +6197,186 @@ class TauNode:
             if getattr(candidate, "group_edit_id", None) == edit_id:
                 siblings.append(candidate)
         return siblings
+
+    def _block_retract_cleanup(
+        self, retract: Dict[str, Any], *, timeout: Optional[float] = None
+    ) -> bool:
+        """Durably block local cleanup for a retract whose fan-out failed.
+
+        A leg of the retract was finally refused, rejected, unusable,
+        or expired, so a member still holds the message: when the last
+        queued leg delivers, the sweep must not drop the sender's
+        local copies merely because no sibling legs remain queued
+        (see :meth:`_deliver_queued_retract`). The marker lives in the
+        mailbox, so it survives across sweep rounds. Returns True when
+        the marker was recorded; False when there was no id to record
+        or the write failed — the caller must then keep the leg queued
+        (or retry the write) instead of treating the fan-out as
+        failed-finally. A leg dropped inside the sweep does not take
+        this path: :meth:`_remove_queued_version` writes its marker in
+        the same transaction as the removal, so a failed write keeps
+        the leg instead of losing the failure record.
+        """
+        retract_id = retract.get("retract_id")
+        if not isinstance(retract_id, str) or not retract_id:
+            return False
+        try:
+            self.mailbox.record_retract_cleanup_blocked(
+                retract_id, timeout=timeout
+            )
+        except (TimeoutError, OSError) as exc:
+            log.warning(
+                "Could not record blocked retract cleanup for %s: %s",
+                retract_id,
+                exc,
+            )
+            return False
+        return True
+
+    def _queued_retract_siblings(
+        self,
+        retract_id: str,
+        *,
+        exclude: Optional[str] = None,
+        deadline: Optional[float] = None,
+    ) -> List[Any]:
+        """Still-queued entries carrying the same retract id.
+
+        Group-retract legs share one retract id, so the siblings of a
+        leg are the other members' legs for the same retract.  A DM
+        retract has no siblings: one peer, one leg.
+
+        A leg whose stored payload did not survive still belongs to
+        the retract — its id is kept as a hint (see
+        ``OutboxEntry.group_retract_id``) — so match on that too: a
+        corrupt sibling must still block the local cleanup until the
+        fan-out resolves, or the sender sees a retract its recipient
+        never received.  With a deadline the mailbox-lock wait is
+        bounded by it (``TimeoutError`` when the budget is spent).
+        """
+        siblings: List[Any] = []
+        for candidate in self.mailbox.outbox_list(
+            timeout=_remaining(deadline)
+        ):
+            if exclude is not None and candidate.id == exclude:
+                continue
+            if getattr(candidate, "group_retract_id", None) == retract_id:
+                siblings.append(candidate)
+        return siblings
+
+    def _record_sent_group_retract_locally(
+        self,
+        target_id: str,
+        group_id: str,
+        target_sent_at: Optional[float],
+        target_author: Optional[str] = None,
+    ) -> Tuple[Optional[Dict[str, Any]], List[str]]:
+        """Drop this node's own copies of a retracted group send.
+
+        Mirrors the live path in :meth:`send_group_retraction` /
+        :func:`tau.cli._retract_group_message`: the inbox record and
+        every leg's sent record go, and the group-retraction marker is
+        recorded so the serving console drops its legs.  Returns the
+        removed inbox record (for the ``on_retract`` callback) and any
+        local errors — a caller that sees errors keeps the queued leg
+        for a later round instead of losing the retry state.  A record
+        that is already gone is fine: the copies are already dropped.
+        """
+        local_errors: List[str] = []
+        removed: Optional[Dict[str, Any]] = None
+        try:
+            own_hash = self.destination_hexhash
+        except NodeError:  # pragma: no cover - a started node has one
+            own_hash = ""
+        if target_author and own_hash and target_author != own_hash:
+            # A moderator retract: the target is this node's received
+            # copy of another member's message, not a send of its own.
+            # Delete that copy and record no sent-group marker — this
+            # node sent nothing to cancel.
+            moderated: Optional[Dict[str, Any]] = None
+            try:
+                resolved = self.inbox.resolve(target_id)
+            except ValueError:
+                resolved = None
+            if (
+                resolved is not None
+                and resolved.get("direction") == "in"
+                and resolved.get("group") == group_id
+                and resolved.get("destination") == target_author
+            ):
+                moderated = resolved
+            elif isinstance(target_sent_at, (int, float)) and not isinstance(
+                target_sent_at, bool
+            ):
+                moderated = self.inbox.find_group_message(
+                    group_id, target_author, float(target_sent_at)
+                )
+            if moderated is not None:
+                try:
+                    removed = self.inbox.delete_authorized(
+                        str(moderated["id"]),
+                        direction="in",
+                        destination=target_author,
+                    )
+                except InboxError as exc:
+                    if not str(exc).startswith("unknown message"):
+                        log.warning("Could not delete moderated copy: %s", exc)
+                        local_errors.append(f"inbox copy not deleted: {exc}")
+            if removed is not None and self.on_retract is not None:
+                try:
+                    self.on_retract(removed)
+                except Exception:  # pragma: no cover - console callback
+                    log.warning("on_retract callback failed", exc_info=True)
+            return removed, local_errors
+        try:
+            record = self.inbox.resolve(target_id)
+        except ValueError:
+            record = None
+        leg_ids: List[str] = []
+        own_record = (
+            record is not None
+            and record.get("direction") == "out"
+            and record.get("group") == group_id
+        )
+        if own_record:
+            leg_ids = list(record.get("leg_ids") or [])
+        if not leg_ids:
+            leg_ids = [target_id]
+        try:
+            # The inbox record goes last: it is the only persisted
+            # list of this send's leg ids, so a retry that found it
+            # gone could not discard the remaining sent records.
+            for leg_id in leg_ids:
+                self.mailbox.discard_sent(str(leg_id))
+            if (
+                isinstance(target_sent_at, (int, float))
+                and not isinstance(target_sent_at, bool)
+            ):
+                self.mailbox.record_sent_group_retraction(
+                    group_id, float(target_sent_at)
+                )
+        except Exception as exc:
+            log.warning("Could not drop sent group records: %s", exc)
+            local_errors.append(f"sent records not dropped: {exc}")
+        if own_record and not local_errors:
+            # Only this node's own sent record for this group names
+            # the send: resolve() matches the wire id alone, so after
+            # the sent copy is pruned it can return an inbound record
+            # instead — deleting that would drop a received message.
+            try:
+                removed = self.inbox.delete(str(record["id"]))
+            except InboxError as exc:
+                if str(exc).startswith("unknown message"):
+                    removed = None
+                else:
+                    log.warning("Could not delete sent group copy: %s", exc)
+                    local_errors.append(f"inbox copy not deleted: {exc}")
+        if removed is not None and self.on_retract is not None:
+            try:
+                self.on_retract(removed)
+            except Exception:  # pragma: no cover - console callback
+                log.warning("on_retract callback failed", exc_info=True)
+        return removed, local_errors
 
     def _drop_queued_edit(
         self, entry: Any, *, deadline: Optional[float] = None
@@ -7092,26 +7284,40 @@ class TauNode:
                 entry.id,
             )
             try:
+                # The retract id survives a corrupt payload as a hint
+                # (see OutboxEntry.group_retract_id): a damaged leg
+                # still ends the fan-out, so the marker is written in
+                # the same transaction as the removal.
                 self._remove_queued_version(
                     entry.id,
                     text=entry.text,
                     edited_at=getattr(entry, "edited_at", None),
                     timeout=_remaining(deadline),
+                    block_retract_id=(
+                        getattr(entry, "group_retract_id", None)
+                        if getattr(entry, "group_id", None) is not None
+                        else None
+                    ),
                 )
-            except TimeoutError:
+            except (TimeoutError, OSError):
                 log.debug(
                     "Could not drop unusable queued retract %s: "
-                    "mailbox lock busy; leaving it for a later round",
+                    "mailbox lock busy or the removal could not be "
+                    "saved; leaving it for a later round",
                     entry.id,
                 )
             return False
-        if getattr(entry, "group_id", None) is not None:
-            # Group retracts are never queued; a group_id on a retract
-            # entry means a hand-edited outbox.  The pre-signed bytes
-            # name a DM retract, so sending them for a group message
-            # would record a marker for an id no member holds.
+        if getattr(entry, "group_id", None) is not None and (
+            not isinstance(retract.get("target_author"), str)
+            or not isinstance(retract.get("target_sent_at"), (int, float))
+        ):
+            # A group retract without its group context cannot name
+            # the copy the recipient holds (wire ids differ per leg),
+            # so it can never deliver or seal: drop it instead of
+            # sending bytes that resolve to nothing.
             log.error(
-                "Dropping queued retract %s: group retracts are not queued",
+                "Dropping queued retract %s: group retract is missing "
+                "its target author or send time",
                 entry.id,
             )
             try:
@@ -7120,11 +7326,16 @@ class TauNode:
                     text=entry.text,
                     edited_at=getattr(entry, "edited_at", None),
                     timeout=_remaining(deadline),
+                    # A leg that can never deliver ends the fan-out
+                    # the same way a refusal does: the marker is
+                    # written in the same transaction as the removal.
+                    block_retract_id=retract.get("retract_id"),
                 )
-            except TimeoutError:
+            except (TimeoutError, OSError):
                 log.debug(
-                    "Could not drop group queued retract %s: mailbox "
-                    "lock busy; leaving it for a later round",
+                    "Could not drop unusable queued group retract %s: "
+                    "mailbox lock busy or the removal could not be "
+                    "saved; leaving it for a later round",
                     entry.id,
                 )
             return False
@@ -7144,16 +7355,25 @@ class TauNode:
                     text=entry.text,
                     edited_at=getattr(entry, "edited_at", None),
                     timeout=_remaining(deadline),
+                    # A leg that can never deliver ends the fan-out
+                    # the same way a refusal does: the marker is
+                    # written in the same transaction as the removal.
+                    block_retract_id=(
+                        retract.get("retract_id")
+                        if getattr(entry, "group_id", None) is not None
+                        else None
+                    ),
                 )
-            except TimeoutError:
+            except (TimeoutError, OSError):
                 log.debug(
                     "Could not drop unusable queued retract %s: mailbox "
-                    "lock busy; leaving it for a later round",
+                    "lock busy or the removal could not be saved; "
+                    "leaving it for a later round",
                     entry.id,
                 )
             return False
         try:
-            self._request(
+            response = self._request(
                 peer, REQUEST_RETRACT, payload_bytes, timeout, deadline=deadline
             )
         except (PeerRefusedError, NotAMemberError, PeerRejectedError) as exc:
@@ -7185,11 +7405,21 @@ class TauNode:
                     text=entry.text,
                     edited_at=getattr(entry, "edited_at", None),
                     timeout=_remaining(deadline),
+                    # The fan-out can never complete now: this member
+                    # keeps the message, so a later leg must not drop
+                    # the sender's local copies. The marker is written
+                    # in the same transaction as the removal.
+                    block_retract_id=(
+                        retract.get("retract_id")
+                        if getattr(entry, "group_id", None) is not None
+                        else None
+                    ),
                 )
-            except TimeoutError:
+            except (TimeoutError, OSError):
                 log.debug(
                     "Could not drop refused queued retract %s: mailbox "
-                    "lock busy; leaving it for a later round",
+                    "lock busy or the removal could not be saved; "
+                    "leaving it for a later round",
                     entry.id,
                 )
             return False
@@ -7205,62 +7435,202 @@ class TauNode:
                     entry.id,
                 )
             return False
+        if getattr(entry, "group_id", None) is not None and not (
+            response.get("group_retract")
+        ):
+            # An older member answers ok without understanding the
+            # group context: it kept its copy, so the leg is not
+            # delivered.  Like the live fan-out, that is a final
+            # refusal — drop the leg and keep the sender's copies.
+            log.warning(
+                "Dropping queued retract %s: member runs a version "
+                "without group retract",
+                entry.id,
+            )
+            try:
+                self._remove_queued_version(
+                    entry.id,
+                    text=entry.text,
+                    edited_at=getattr(entry, "edited_at", None),
+                    timeout=_remaining(deadline),
+                    # The fan-out can never complete now: the marker
+                    # is written in the same transaction as the removal.
+                    block_retract_id=retract.get("retract_id"),
+                )
+            except (TimeoutError, OSError):
+                log.debug(
+                    "Could not drop queued retract %s: mailbox lock busy "
+                    "or the removal could not be saved; leaving it for "
+                    "a later round",
+                    entry.id,
+                )
+            return False
         # Confirmed: the peer deleted their copy (or already had it
-        # gone), so this node's own sent copy goes too.  A cleanup
-        # step that cannot be persisted leaves the leg queued for a
-        # later round instead of dropping it: the peer's copy is
-        # already gone, and a retried delivery answers deleted False
-        # while the bookkeeping is attempted again.
+        # gone).  A cleanup step that cannot be persisted leaves the
+        # leg queued for a later round instead of dropping it: the
+        # peer's copy is already gone, and a retried delivery answers
+        # deleted False while the bookkeeping is attempted again.  A
+        # DM's own sent copy goes here; a group message's local copies
+        # go only when this was the last queued leg for the retract —
+        # the live path's full-fan-out rule — so a partial fan-out
+        # keeps the retry state (see
+        # :meth:`_record_sent_group_retract_locally`).
         target_id = retract["target"]
         removed = None
-        try:
-            removed = self.inbox.delete_authorized(
-                target_id, direction="out", destination=peer.hexhash
-            )
-        except InboxError as exc:
-            log.warning(
-                "Delivered queued retract %s but the local copy could "
-                "not be deleted: %s; leaving the leg queued",
-                entry.id,
-                exc,
-            )
+        if getattr(entry, "group_id", None) is not None:
             try:
-                self.mailbox.record_attempt(
-                    entry.id, error=str(exc), timeout=_remaining(deadline)
+                siblings = self._queued_retract_siblings(
+                    retract["retract_id"],
+                    exclude=entry.id,
+                    deadline=deadline,
                 )
             except TimeoutError:
-                log.debug(
-                    "Could not record failed delivery attempt for %s: "
-                    "mailbox lock busy",
+                # The mailbox lock stayed busy, so the fan-out cannot
+                # be proven complete: leave the leg queued — a later
+                # round re-delivers it (the peer dedupes by retract
+                # id) and retries the check.
+                log.warning(
+                    "Delivered queued retract %s but the mailbox lock "
+                    "stayed busy; leaving it queued for a later round",
                     entry.id,
                 )
-            return False
-        if removed is not None and self.on_retract is not None:
+                try:
+                    self.mailbox.record_attempt(
+                        entry.id,
+                        error="could not check for sibling queued retracts",
+                        timeout=_remaining(deadline),
+                    )
+                except TimeoutError:
+                    log.debug(
+                        "Could not record failed delivery attempt for %s: "
+                        "mailbox lock busy",
+                        entry.id,
+                    )
+                return False
+            if not siblings:
+                try:
+                    blocked = self.mailbox.is_retract_cleanup_blocked(
+                        retract.get("retract_id") or "",
+                        timeout=_remaining(deadline),
+                    )
+                except TimeoutError:
+                    # The mailbox lock stayed busy, so the cleanup
+                    # decision cannot be made: leave the leg queued —
+                    # a later round re-delivers it (the peer dedupes
+                    # by retract id) and retries the check.
+                    log.warning(
+                        "Delivered queued retract %s but the mailbox "
+                        "lock stayed busy; leaving it queued for a "
+                        "later round",
+                        entry.id,
+                    )
+                    try:
+                        self.mailbox.record_attempt(
+                            entry.id,
+                            error="could not check whether the retract "
+                            "cleanup is blocked",
+                            timeout=_remaining(deadline),
+                        )
+                    except TimeoutError:
+                        log.debug(
+                            "Could not record failed delivery attempt "
+                            "for %s: mailbox lock busy",
+                            entry.id,
+                        )
+                    return False
+                if blocked:
+                    # A sibling leg was finally refused, rejected, or
+                    # expired, so a member still holds the message:
+                    # the local copies stay, so the retract stays
+                    # retryable — the delivered leg itself still goes,
+                    # it landed. A refused sibling is not a queued one,
+                    # so "no siblings" alone must never authorize the
+                    # cleanup (see _block_retract_cleanup).
+                    log.warning(
+                        "Delivered queued retract %s but a sibling leg "
+                        "failed finally; keeping the local copies",
+                        entry.id,
+                    )
+                    removed = None
+                    local_errors = []
+                else:
+                    removed, local_errors = (
+                        self._record_sent_group_retract_locally(
+                            target_id,
+                            entry.group_id,
+                            retract.get("target_sent_at"),
+                            target_author=retract.get("target_author"),
+                        )
+                    )
+                if local_errors:
+                    log.warning(
+                        "Delivered queued retract %s but the local copies "
+                        "could not be dropped: %s; leaving the leg queued",
+                        entry.id,
+                        "; ".join(local_errors),
+                    )
+                    try:
+                        self.mailbox.record_attempt(
+                            entry.id,
+                            error="; ".join(local_errors),
+                            timeout=_remaining(deadline),
+                        )
+                    except TimeoutError:
+                        log.debug(
+                            "Could not record failed delivery attempt for "
+                            "%s: mailbox lock busy",
+                            entry.id,
+                        )
+                    return False
+        else:
             try:
-                self.on_retract(removed)
-            except Exception:  # pragma: no cover - console callback
-                log.warning("on_retract callback failed", exc_info=True)
-        try:
-            self.mailbox.discard_sent(target_id)
-            self.mailbox.record_sent_retraction(target_id)
-        except Exception as exc:
-            log.warning(
-                "Delivered queued retract %s but the sent record could "
-                "not be dropped: %s; leaving the leg queued",
-                entry.id,
-                exc,
-            )
-            try:
-                self.mailbox.record_attempt(
-                    entry.id, error=str(exc), timeout=_remaining(deadline)
+                removed = self.inbox.delete_authorized(
+                    target_id, direction="out", destination=peer.hexhash
                 )
-            except TimeoutError:
-                log.debug(
-                    "Could not record failed delivery attempt for %s: "
-                    "mailbox lock busy",
+            except InboxError as exc:
+                log.warning(
+                    "Delivered queued retract %s but the local copy could "
+                    "not be deleted: %s; leaving the leg queued",
                     entry.id,
+                    exc,
                 )
-            return False
+                try:
+                    self.mailbox.record_attempt(
+                        entry.id, error=str(exc), timeout=_remaining(deadline)
+                    )
+                except TimeoutError:
+                    log.debug(
+                        "Could not record failed delivery attempt for %s: "
+                        "mailbox lock busy",
+                        entry.id,
+                    )
+                return False
+            if removed is not None and self.on_retract is not None:
+                try:
+                    self.on_retract(removed)
+                except Exception:  # pragma: no cover - console callback
+                    log.warning("on_retract callback failed", exc_info=True)
+            try:
+                self.mailbox.discard_sent(target_id)
+                self.mailbox.record_sent_retraction(target_id)
+            except Exception as exc:
+                log.warning(
+                    "Delivered queued retract %s but the sent record could "
+                    "not be dropped: %s; leaving the leg queued",
+                    entry.id,
+                    exc,
+                )
+                try:
+                    self.mailbox.record_attempt(
+                        entry.id, error=str(exc), timeout=_remaining(deadline)
+                    )
+                except TimeoutError:
+                    log.debug(
+                        "Could not record failed delivery attempt for %s: "
+                        "mailbox lock busy",
+                        entry.id,
+                    )
+                return False
         self._delivered_ids.append(entry.id)
         try:
             self.mailbox.record_delivered(
@@ -7392,6 +7762,59 @@ class TauNode:
             return self._deliver_queued_reaction(
                 peer, fresh, timeout, deadline=deadline
             )
+        if fresh.group_id is not None:
+            # This send was retracted after the leg was queued — by a
+            # moderator retract that snapshotted the outbox before
+            # this leg was enqueued, or by a relayed retract the sweep
+            # has not seen. The sent-group marker is the authority:
+            # drop the leg instead of delivering a retracted post,
+            # and forget its sent record so it does not linger as an
+            # undelivered message. A leg whose retraction cannot be
+            # checked (mailbox lock busy) stays queued for a later
+            # round instead of being sent on an unchecked guess.
+            try:
+                retracted = self.mailbox.is_sent_group_retracted(
+                    fresh.group_id,
+                    fresh.wire_sent_at,
+                    timeout=_remaining(deadline),
+                )
+            except TimeoutError:
+                log.warning(
+                    "Delivered queued group message %s but the mailbox "
+                    "lock stayed busy; leaving it queued for a later round",
+                    entry.id,
+                )
+                return False
+            if retracted:
+                log.info(
+                    "Dropping queued group message %s: its send was retracted",
+                    entry.id,
+                )
+                try:
+                    removed = self._remove_queued_version(
+                        entry.id,
+                        text=fresh.text,
+                        edited_at=fresh.edited_at,
+                        timeout=_remaining(deadline),
+                    )
+                except (TimeoutError, OSError):
+                    log.debug(
+                        "Could not drop retracted queued group message "
+                        "%s: mailbox lock busy or the removal could not "
+                        "be saved; leaving it for a later round",
+                        entry.id,
+                    )
+                    return False
+                if removed:
+                    try:
+                        self.mailbox.discard_sent(entry.id)
+                    except OSError:
+                        log.debug(
+                            "Could not forget the sent record for "
+                            "retracted queued group message %s",
+                            entry.id,
+                        )
+                return False
         send_text = fresh.text
         send_edited_at = fresh.edited_at
         if fresh.group_id is not None:
@@ -7943,19 +8366,6 @@ class TauNode:
             getattr(fresh, "kind", None) == "retract"
         )
         if is_retract:
-            if fresh.group_id is not None:
-                # Group retracts are never queued (see
-                # send_group_retraction): a group_id on a retract
-                # entry means a hand-edited outbox, and a sealed leg
-                # naming the author's id would match nothing on any
-                # member — the same per-leg wire-id blocker as group
-                # edits and group reactions.
-                log.info(
-                    "Skipping deposit of queued retract %s: group "
-                    "retracts are not sealed for holders",
-                    entry.id,
-                )
-                return False
             if not isinstance(retract, dict):
                 # Kind "retract" but the payload did not survive
                 # storage: there is no target to seal a leg for, and
@@ -7966,17 +8376,35 @@ class TauNode:
                     entry.id,
                 )
                 return False
-            # A DM retract deposits as a retract leg of the target
+            if fresh.group_id is not None and (
+                not isinstance(retract.get("target_author"), str)
+                or not isinstance(retract.get("target_sent_at"), (int, float))
+            ):
+                # A group retract without its group context names no
+                # copy the recipient holds (wire ids differ per leg),
+                # so sealing it would only spend the holder's quota;
+                # the direct retry still delivers it.
+                log.info(
+                    "Skipping deposit of queued group retract %s: no "
+                    "target author or send time",
+                    entry.id,
+                )
+                return False
+            # A retract deposits as a retract leg of the target
             # message (see the seal below): the envelope carries the
             # target's id, the signed retract id and the signed send
             # time, so the recipient applies it exactly like a direct
             # retract — no pre-signed /tau/retract bytes ride the relay.
-        if fresh.group_id is not None:
+            # A group retract also carries the signed group context,
+            # so the recipient resolves its own leg copy even though
+            # wire ids differ per member.
+        if fresh.group_id is not None and not is_retract:
             # Do not leave a sealed copy with a holder for a member
             # post queued before the group went announcements-only:
             # the recipient drops it on receipt, so depositing it only
             # spends the holder's quota.  Votes and poll closes are not
-            # posts, so they still deposit.
+            # posts, so they still deposit — and neither is a retract,
+            # which revises the author's own post rather than adding one.
             announcements = self._current_group_announcements(fresh.group_id)
             if (
                 announcements is not None
@@ -8141,6 +8569,13 @@ class TauNode:
                 sealed_id = known_target["id"]
             sealed_kind = "retract"
             sealed_retract = {"retract_id": retract["retract_id"]}
+            if fresh.group_id is not None:
+                # The group context names the retracted copy: legs
+                # carry a different wire id per member, so the
+                # recipient resolves its own copy from the author and
+                # shared send time instead (see _deliver_collected).
+                sealed_retract["target_author"] = retract["target_author"]
+                sealed_retract["target_sent_at"] = retract["target_sent_at"]
         try:
             blob = seal_message(
                 self.identity,
@@ -9061,6 +9496,365 @@ class TauNode:
                 log.warning("on_retract callback failed", exc_info=True)
         return True
 
+    def _cancel_queued_group_send(
+        self, group_id: str, sent_at: float
+    ) -> None:
+        """Cancel this node's still-queued legs for one group send.
+
+        Removes every outbox leg for ``(group_id, sent_at)`` and
+        records the sent-group retraction marker, so a later sweep
+        cannot deliver the retracted post to members who were
+        offline.  Raises :class:`DeliveryDeferredError` when the
+        cancellation could not be persisted: the caller must then
+        leave the retract unmarked-seen, so a retry finishes the
+        cancellation instead of dropping the only copy of a
+        retract whose legs are still queued.
+        """
+        try:
+            for entry in self.mailbox.outbox_list():
+                if (
+                    entry.group_id == group_id
+                    and entry.wire_sent_at == sent_at
+                ):
+                    self.mailbox.remove_outbox(entry.id)
+                    # A cancelled leg never went out: forget its sent
+                    # record too, or the retracted post lingers in
+                    # the sender's history as an undelivered message.
+                    self.mailbox.discard_sent(entry.id)
+            self.mailbox.record_sent_group_retraction(group_id, sent_at)
+        except Exception as exc:
+            # The message stays group-neutral: a secret group's opaque
+            # id must not reach the log through this error (see the
+            # CodeQL clear-text-logging alerts on main). The cause
+            # stays chained for debugging.
+            raise DeliveryDeferredError(
+                "could not cancel queued legs for a retracted group send"
+            ) from exc
+
+    def _apply_relayed_group_retract(
+        self,
+        message: Dict[str, Any],
+        *,
+        held_id: Optional[str] = None,
+        held_to: Optional[bytes] = None,
+    ) -> bool:
+        """Apply a relayed group-retract leg to the copy it names.
+
+        The leg's id is the author's wire id for the message (see
+        :meth:`_deposit_entry`); its ``retract`` field carries the
+        signed retract id plus the group context (author and shared
+        send time), and its ``group`` field names the group — so the
+        recipient resolves its own leg copy even though wire ids
+        differ per member.  The sealed envelope's own signature
+        proves who retracted, exactly as on the direct path
+        (:meth:`_handle_retract`): only the message's author or the
+        group's creator may retract it, the group-context marker is
+        recorded so a copy arriving later still loses, and a duplicate
+        leg is dropped on its seen key.  A retract whose target has
+        not arrived yet still records its marker, so the original
+        loses to it when it lands.  Returns True when the retract
+        landed (the delivery counts as received, and the console is
+        told via ``on_retract`` exactly like a direct retract); False
+        when the leg is stale, a duplicate, expired, malformed, or
+        refuses authorization — the copy is resolved either way, so
+        the holder can drop it.  Raises :class:`DeliveryDeferredError`
+        when the retract could not be persisted, so the holder keeps
+        its copy for a later retry instead of dropping a retract the
+        recipient never got.
+        """
+        sender = message.get("from") if isinstance(message.get("from"), str) else ""
+        retract = message.get("retract")
+        if not isinstance(retract, dict):
+            # A leg with no retract payload names nothing to apply.
+            return False
+        retract_id = retract.get("retract_id")
+        if not isinstance(retract_id, str) or not retract_id:
+            return False
+        group = message.get("group")
+        if not isinstance(group, dict):
+            return False
+        group_id = group.get("id")
+        target_author = retract.get("target_author")
+        target_sent_at = retract.get("target_sent_at")
+        if (
+            not isinstance(group_id, str)
+            or not group_id
+            or not isinstance(target_author, str)
+            or not target_author
+            or not isinstance(target_sent_at, (int, float))
+            or isinstance(target_sent_at, bool)
+        ):
+            # No group context to resolve by: the target id alone
+            # only matches the author's sent record, never this
+            # node's copy.
+            return False
+        expires_at = message.get("expires_at")
+        if expires_at is not None and (
+            not isinstance(expires_at, (int, float))
+            or isinstance(expires_at, bool)
+            or float(expires_at) <= time.time()
+        ):
+            # An expired leg never applies.
+            return False
+        sent_at = message.get("sent_at")
+        if not isinstance(sent_at, (int, float)) or isinstance(sent_at, bool):
+            return False
+        # A retried or relayed retract replays with the same id; the
+        # direct path answers a retried retract ok with deleted False
+        # (see _handle_retract), and the same key dedupes it here.
+        seen_key = f"retract:{sender}:{retract_id}"
+        if self.mailbox.is_seen(seen_key):
+            return False
+        target_id = message.get("id")
+        if not isinstance(target_id, str) or not target_id:
+            return False
+        # Reload, resolve, authorize and persist under one mailbox and
+        # inbox transaction: the group check must see the inbox as it
+        # is at the store (another process may have imported the group
+        # message since any cached read), and the held-ownership
+        # recheck must see a drop made by another process before
+        # anything lands.
+        removed = None
+        with self.mailbox.transaction(), self.inbox.transaction():
+            if held_id is not None and not self.mailbox.is_held(
+                held_id, to=held_to
+            ):
+                # Dropped by the owner after this sweep listed it: defer
+                # before anything is stored or published.
+                raise DeliveryDeferredError(
+                    f"held envelope {held_id} no longer held"
+                )
+            if self.mailbox.is_seen(seen_key):
+                return False
+            # Resolve this node's copy from the signed group context:
+            # the envelope's signature (verified by open_message)
+            # covers the context, so a relay cannot retarget the
+            # retract onto a different message.
+            local = self.inbox.find_group_message(
+                group_id, target_author, target_sent_at
+            )
+            stored = local
+            local_id = str(local["id"]) if local is not None else None
+            # A group creator may retract any member's message
+            # (moderation).  The creator is verified against the
+            # pinned roster for the group id in the signed context —
+            # never against a claim in the payload.
+            pinned = pinned_group(self.groups, group_id)
+            moderator = (
+                pinned is not None
+                and (pinned.get("creator") or "") == sender
+                and sender != target_author
+            )
+            try:
+                own_hash = self.destination_hexhash
+            except NodeError:  # pragma: no cover - a started node has one
+                own_hash = ""
+            if stored is None and moderator and target_author == own_hash:
+                # The author's own copy of their group send is a sent
+                # record (direction "out", no member destination, the
+                # shared time in leg_sent_at), so the received-copy
+                # lookup above never finds it — resolve it by its
+                # shared send time.
+                sent = self.inbox.find_sent_group_message(
+                    group_id, target_sent_at
+                )
+                if sent is not None:
+                    stored = sent
+                    local_id = str(sent["id"])
+            if stored is None:
+                # A group-context marker is keyed by the group, so a
+                # caller the pinned roster does not name must not
+                # write one: otherwise any authenticated caller could
+                # flood the bounded marker store and evict real
+                # markers.  But a missing roster must not refuse: a
+                # member who has not received any group traffic yet
+                # has no pinned roster, and their retract is exactly
+                # what must record the marker, so a copy arriving
+                # later still loses to it.
+                if pinned is not None and sender not in (
+                    pinned.get("members") or []
+                ):
+                    return False
+                # A caller retracting someone else's message must be
+                # the group's verified creator (see moderator above):
+                # without a pinned roster there is nothing to verify
+                # against, so fail closed instead of recording a marker
+                # that could never suppress the message — and a member
+                # who is neither the author nor the creator must not
+                # write one either, or their marker would sit confirmed
+                # in the bounded store while suppressing nothing.
+                if sender != target_author and not moderator:
+                    return False
+                # No stored copy to check the sender against — the
+                # message may already be deleted or never have
+                # arrived.  Record the marker anyway: the retract is
+                # authenticated, and a copy arriving later (a relayed
+                # copy, or one that outlives the seen cache) must
+                # still lose to it.  The key carries the author's hash
+                # — the caller's own for an author retract, the named
+                # author for a moderator retract — so a sender can
+                # only ever suppress their own messages, and a
+                # creator only ever their own group's.
+                try:
+                    marker_sender = (
+                        target_author if moderator else sender
+                    )
+                    self._record_retraction(
+                        marker_sender, target_id, confirmed=pinned is not None
+                    )
+                    self.mailbox.record_group_retraction(
+                        marker_sender,
+                        group_id,
+                        target_sent_at,
+                        confirmed=pinned is not None,
+                    )
+                except Exception as exc:
+                    raise DeliveryDeferredError(
+                        f"could not record relayed retraction for "
+                        f"{target_id}: {exc}"
+                    ) from exc
+                if moderator and target_author == own_hash:
+                    # The retracted post is this node's own send and
+                    # its sent record is already gone — a direct
+                    # retract, or an earlier relayed attempt that
+                    # deleted the copy before its cancellation
+                    # failed.  Cancel the still-queued legs here, so
+                    # a retry after a failed cancellation finishes
+                    # the job instead of returning with the legs
+                    # still deliverable.
+                    self._cancel_queued_group_send(
+                        group_id, float(target_sent_at)
+                    )
+                try:
+                    self.mailbox.mark_seen(seen_key)
+                except OSError as exc:
+                    # The retract is already durable (marker
+                    # recorded) and the marker suppresses a retry, so
+                    # a failed seen marker must not abort the held-mail
+                    # sweep: log it and complete the delivery instead.
+                    log.warning(
+                        "Could not mark relayed retract %s seen: %s",
+                        seen_key,
+                        exc,
+                    )
+                return True
+            # Only the message's author or the group's creator may
+            # retract it: a received copy from the named author, or
+            # this node's own sent record when the creator retracts a
+            # message this node authored (its direction is "out" and
+            # it carries no member destination — the shared send time
+            # identifies it).
+            is_author = (
+                stored.get("direction") == "in"
+                and stored.get("destination") == sender
+            )
+            is_moderated = (
+                moderator
+                and stored.get("kind") == "group"
+                and stored.get("group") == group_id
+                and (
+                    (
+                        stored.get("direction") == "in"
+                        and stored.get("destination") == target_author
+                    )
+                    or (
+                        stored.get("direction") == "out"
+                        and target_author == own_hash
+                    )
+                )
+            )
+            if not (is_author or is_moderated):
+                return False
+            # Membership is checked against the pinned roster, exactly
+            # as for a group reaction: an allow-listed outsider who
+            # learned a group id must not retract a retained copy, and
+            # a missing roster fails closed (the group was deleted, so
+            # there is no membership to verify).
+            if pinned is None or sender not in (pinned.get("members") or []):
+                return False
+            # Record the marker before deleting the copy: if it cannot
+            # be persisted, nothing is deleted and the retract is
+            # deferred.  (A refused retract records nothing: the
+            # message stays, so it must stay deliverable.)  The marker
+            # is confirmed: the retract was honoured against a stored
+            # copy, so a flood of unknown-ID markers must not evict it
+            # at the cap.  A group retract also records the
+            # group-context marker, so a copy arriving later under
+            # another leg id still loses to it.
+            try:
+                # The marker is keyed by the message's author, never
+                # by the caller: a moderator retract records it under
+                # the named author, or a copy arriving later would
+                # never match it (delivery checks the author's hash).
+                marker_sender = target_author if moderator else sender
+                self._record_retraction(
+                    marker_sender, local_id, confirmed=True
+                )
+                self.mailbox.record_group_retraction(
+                    marker_sender,
+                    group_id,
+                    target_sent_at,
+                    confirmed=True,
+                )
+            except Exception as exc:
+                raise DeliveryDeferredError(
+                    f"could not record relayed retraction for {local_id}: "
+                    f"{exc}"
+                ) from exc
+            # Authorize and delete as one exact-ID operation: the
+            # checks above pick the refusal, but the delete itself
+            # re-verifies the exact id, direction, and sender inside
+            # the same inbox transaction, so two concurrent retracts
+            # of one short id can never reselect a different record
+            # by prefix.
+            try:
+                removed = self.inbox.delete_authorized(
+                    local_id,
+                    direction=str(stored.get("direction") or "in"),
+                    destination=str(stored.get("destination") or ""),
+                )
+            except InboxError as exc:
+                raise DeliveryDeferredError(
+                    f"could not persist relayed retraction for "
+                    f"{local_id}: {exc}"
+                ) from exc
+            if is_moderated and stored.get("direction") == "out":
+                # The moderated post is this node's own send: its
+                # queued legs would still deliver it to members who
+                # were offline, so cancel them before the retract is
+                # marked seen — a failed cancellation defers the
+                # delivery (see _cancel_queued_group_send) instead
+                # of leaving the legs deliverable after the retract
+                # is already seen.
+                self._cancel_queued_group_send(
+                    group_id, float(target_sent_at)
+                )
+            try:
+                self.mailbox.mark_seen(seen_key)
+            except OSError as exc:
+                # The retract is already durable (marker recorded, copy
+                # deleted) and the marker suppresses a retry, so a failed
+                # seen marker must not abort the held-mail sweep: log it
+                # and complete the delivery (and the publish below)
+                # instead.  A duplicate copy of this leg is then
+                # re-processed rather than dropped on its seen key,
+                # but the marker drops it as already retracted, so
+                # nothing is lost or double-counted.
+                log.warning(
+                    "Could not mark relayed retract %s seen: %s",
+                    seen_key,
+                    exc,
+                )
+        # The retract is recorded; a failed fan-out only means the
+        # live console missed this update, exactly as on the direct
+        # path — the console reseeds from the inbox.
+        if removed is not None and self.on_retract is not None:
+            try:
+                self.on_retract(removed)
+            except Exception:  # pragma: no cover - console callback
+                log.warning("on_retract callback failed", exc_info=True)
+        return True
+
     def _deliver_collected(
         self,
         message: Dict[str, Any],
@@ -9136,6 +9930,15 @@ class TauNode:
                 message, held_id=held_id, held_to=held_to
             )
         if message.get("kind") == "retract":
+            if isinstance(message.get("group"), dict):
+                # A relayed group-retract leg: a queued group retract
+                # the sender's sweep deposited with a holder (see
+                # _deposit_entry).  It carries the signed group
+                # context, so the recipient resolves its own leg copy
+                # even though wire ids differ per member.
+                return self._apply_relayed_group_retract(
+                    message, held_id=held_id, held_to=held_to
+                )
             # A relayed retract leg: a queued DM retract the
             # sender's sweep deposited with a holder (see
             # _deposit_entry).  It names the retracted message, so
@@ -12127,8 +12930,9 @@ class TauNode:
         retract id, and the mail sweep delivers the same pre-signed
         bytes when the peer is heard from again.  A queued DM retract
         also rides the sealed relay: the sweep deposits a retract leg
-        with a holder, so an offline peer gets it from a holder; group
-        retracts stay direct-only.  The sender's own local copies are
+        with a holder, so an offline peer gets it from a holder;
+        group retracts ride the same way (see
+        :meth:`send_group_retraction`).  The sender's own local copies are
         removed when the retract is delivered, not at queue time, so
         the sender's history only ever loses a message that actually
         landed.  An explicit refusal (allow-list, block-list) or a
@@ -12322,6 +13126,7 @@ class TauNode:
         discover_timeout: Optional[float] = None,
         target_sent_at: Optional[float] = None,
         target_author: Optional[str] = None,
+        queue: bool = True,
     ) -> Dict[str, Any]:
         """Fan a retraction of a group message out to every member.
 
@@ -12347,9 +13152,20 @@ class TauNode:
         to them, so a copy that reached them another way (a relay
         holder) is deleted and the group marker suppresses any copy
         arriving later.  Returns a per-member result list; ``ok`` is
-        true only when every member received the retract.  A failed
-        leg reports an ``error`` instead of queueing: group retracts
-        are live-only in v1.
+        true only when every member received the retract.
+
+        With ``queue`` enabled (the default), a leg whose member
+        cannot be reached is stored in the local outbox instead of
+        being lost — one entry per member, carrying the same
+        pre-signed payload — and the mail sweep delivers it when the
+        member is heard from again, and deposits a sealed copy with a
+        holder so an offline member gets it from a holder.  A leg
+        that fails because the member explicitly refused (allow-list,
+        block-list, not a member) or runs a version without group
+        retract is final and is never queued.  The sender's own local
+        copies go only when the fan-out completes: a queued leg keeps
+        them, so the retract stays retryable (see
+        :meth:`_deliver_queued_retract`).
         """
         target_id = message_id.strip() if isinstance(message_id, str) else ""
         if not target_id or len(target_id) > 64:
@@ -12380,7 +13196,7 @@ class TauNode:
             ):
                 if self.mailbox.remove_outbox(entry.id):
                     cancelled.append(entry.id)
-        payload_bytes, retract_id, _sent_at = self._signed_retraction_payload(
+        payload_bytes, retract_id, sent_at = self._signed_retraction_payload(
             target_id,
             group=group["id"],
             target_author=target_author or own_hash,
@@ -12404,6 +13220,12 @@ class TauNode:
                         "id": retract_id,
                     }
                 )
+                # This member was never tried, so the fan-out can never
+                # complete: record the block now, while the loop is
+                # still running — a concurrent sweep delivering an
+                # earlier queued leg must not drop the sender's local
+                # copies before the later members are attempted.
+                self._block_retract_cleanup({"retract_id": retract_id})
                 continue
             peer: Optional[Peer] = None
             try:
@@ -12416,13 +13238,20 @@ class TauNode:
                         budget,
                     ),
                 )
-                response = self._request(
-                    peer,
-                    REQUEST_RETRACT,
-                    payload_bytes,
-                    _remaining(deadline) or 0.0,
-                    deadline=deadline,
-                )
+                try:
+                    response = self._request(
+                        peer,
+                        REQUEST_RETRACT,
+                        payload_bytes,
+                        _remaining(deadline) or 0.0,
+                        deadline=deadline,
+                    )
+                except PeerRejectedError as exc:
+                    if getattr(exc, "code", None) == "storage_failed":
+                        # Transient: the peer could not read or persist
+                        # its inbox this time, so the leg may be queued.
+                        raise NodeError(str(exc)) from exc
+                    raise
                 if not response.get("group_retract"):
                     # An older member answers ok without understanding the
                     # group context: it kept its copy, so the leg is not
@@ -12436,6 +13265,11 @@ class TauNode:
                             "id": retract_id,
                         }
                     )
+                    # Record the block now, not after the loop: a
+                    # concurrent sweep delivering an earlier queued leg
+                    # must not drop the sender's local copies before
+                    # the later members are attempted.
+                    self._block_retract_cleanup({"retract_id": retract_id})
                     continue
                 results.append(
                     {
@@ -12447,22 +13281,134 @@ class TauNode:
                         "rtt": response.get("_rtt"),
                     }
                 )
-            except (NotAllowedError, NotAMemberError) as exc:
-                # The member is online and explicitly refused; a
-                # retract has no outbox to queue into, so the leg
-                # is simply reported as failed.
+            except (PeerRefusedError, NotAMemberError, PeerRejectedError) as exc:
+                # The member is online and explicitly refused or
+                # rejected the retract; a refusal is final and is
+                # never queued.
+                if isinstance(exc, NotAllowedError):
+                    error = "not_allowed"
+                elif isinstance(exc, NotAMemberError):
+                    error = "not_a_member"
+                else:
+                    error = str(exc)
                 results.append(
                     {
                         "to": member,
                         "to_name": peer.display_name if peer is not None else "",
                         "ok": False,
-                        "error": "not_allowed"
-                        if isinstance(exc, NotAllowedError)
-                        else "not_a_member",
+                        "error": error,
                         "id": retract_id,
                     }
                 )
+                # Record the block now, not after the loop: a concurrent
+                # sweep delivering an earlier queued leg must not drop
+                # the sender's local copies before the later members
+                # are attempted.
+                self._block_retract_cleanup({"retract_id": retract_id})
             except NodeError as exc:
+                if queue and self.started:
+                    # Unreachable, not refused: queue this leg so the
+                    # sweep delivers the same signed retract when the
+                    # member is heard from again — and deposits a
+                    # sealed copy with a holder meanwhile.
+                    try:
+                        existing = next(
+                            (
+                                item
+                                for item in self.mailbox.outbox_list()
+                                if item.kind == "retract"
+                                and isinstance(item.retract, dict)
+                                and item.retract.get("target") == target_id
+                                and item.to == bytes.fromhex(member)
+                                and item.expires_at > time.time()
+                            ),
+                            None,
+                        )
+                    except TimeoutError:
+                        # The mailbox lock is busy: the enqueue below
+                        # either takes it or raises as it did before
+                        # the dedupe check, so a busy lock never turns
+                        # into a duplicate.
+                        existing = None
+                    if existing is not None:
+                        # A retract for this message is already queued
+                        # for this member: a second one would only
+                        # re-delete the same message under a new id, so
+                        # report the queued one instead of storing a
+                        # duplicate leg.
+                        results.append(
+                            {
+                                "to": member,
+                                "to_name": peer.display_name
+                                if peer is not None
+                                else "",
+                                "ok": False,
+                                "queued": True,
+                                "target": target_id,
+                                "id": existing.retract["retract_id"],
+                                "queued_id": existing.id,
+                            }
+                        )
+                        continue
+                    try:
+                        entry = self.mailbox.enqueue(
+                            to=bytes.fromhex(member),
+                            text="retraction",
+                            to_name=peer.display_name
+                            if peer is not None
+                            else "",
+                            group={
+                                "id": group["id"],
+                                "name": group["name"],
+                                "creator": group["creator"],
+                                "members": group["members"],
+                            },
+                            sent_at=sent_at,
+                            retract={
+                                "target": target_id,
+                                "retract_id": retract_id,
+                                "sent_at": sent_at,
+                                "target_author": target_author or own_hash,
+                                "target_sent_at": float(target_sent_at),
+                                "payload_b64": base64.b64encode(
+                                    payload_bytes
+                                ).decode("ascii"),
+                            },
+                        )
+                    except MailboxError as qexc:
+                        # A full outbox (or a failed write) fails only
+                        # this leg: the remaining members are still
+                        # tried and delivered legs still get recorded.
+                        results.append(
+                            {
+                                "to": member,
+                                "to_name": peer.display_name
+                                if peer is not None
+                                else "",
+                                "ok": False,
+                                "error": f"{exc}; could not queue: {qexc}",
+                                "id": retract_id,
+                            }
+                        )
+                        # The leg could not be queued, so the fan-out
+                        # can never complete: record the block now, not
+                        # after the loop (see the budget case above).
+                        self._block_retract_cleanup(
+                            {"retract_id": retract_id}
+                        )
+                        continue
+                    results.append(
+                        {
+                            "to": member,
+                            "to_name": peer.display_name
+                            if peer is not None
+                            else "",
+                            "queued": True,
+                            "queued_id": entry.id,
+                            "id": retract_id,
+                        }
+                    )
+                    continue
                 results.append(
                     {
                         "to": member,
@@ -12472,7 +13418,24 @@ class TauNode:
                         "id": retract_id,
                     }
                 )
+                # Queueing is disabled (or the node is not started), so
+                # this leg was neither delivered nor queued: the
+                # fan-out can never complete — record the block now,
+                # not after the loop (see the budget case above).
+                self._block_retract_cleanup({"retract_id": retract_id})
         all_ok = all(result.get("delivered") for result in results)
+        if any(
+            not result.get("delivered") and not result.get("queued")
+            for result in results
+        ):
+            # A leg failed finally (refused, rejected, an older member
+            # without group retract, or it could not be queued): the
+            # fan-out can never complete, so the sweep must not drop
+            # the sender's local copies when the queued legs land.
+            # Each failure records the block as it happens, while the
+            # loop is still running; this is the backstop for a write
+            # that failed in the loop (see _deliver_queued_retract).
+            self._block_retract_cleanup({"retract_id": retract_id})
         return {
             "ok": all_ok,
             "v": PROTOCOL_VERSION,

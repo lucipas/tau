@@ -7148,6 +7148,59 @@ def test_outbox_cancel_drops_sibling_group_edit_legs(tmp_path, capsys):
     ]
 
 
+def test_outbox_cancel_of_group_retract_leg_blocks_sweep_cleanup(
+    tmp_path, capsys
+):
+    # Qodo Warning on PR #706: cancelling a queued group-retract leg
+    # removed it without recording that the fan-out can never
+    # complete, so a sibling leg's later delivery deleted the
+    # sender's local copies while the cancelled member still held
+    # the message. Cancelling now records the cleanup block.
+    import base64
+
+    from tau.mailbox import Mailbox
+
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir)
+    box = Mailbox(config.mailbox_path)
+    group = {
+        "id": "aa" * 16,
+        "name": "crew",
+        "creator": "bb" * 16,
+        "members": ["cc" * 16, "dd" * 16, "ee" * 16],
+    }
+    retract = {
+        "target": "leg-1",
+        "retract_id": "retract-1",
+        "sent_at": 100.0,
+        "target_author": "bb" * 16,
+        "target_sent_at": 100.0,
+        "payload_b64": base64.b64encode(b"payload").decode("ascii"),
+    }
+    first = box.enqueue(
+        to=b"\xcc" * 16,
+        text="retraction",
+        group=group,
+        retract=dict(retract),
+        message_id="aa" + "11" * 15,
+    )
+    box.enqueue(
+        to=b"\xdd" * 16,
+        text="retraction",
+        group=group,
+        retract=dict(retract),
+        message_id="aa" + "22" * 15,
+    )
+
+    code = cli.main(
+        ["outbox", "cancel", "--data-dir", str(data_dir), first.id[:8]]
+    )
+    assert code == 0
+    reloaded = Mailbox(config.mailbox_path)
+    assert [e.id for e in reloaded.outbox_list()] == ["aa" + "22" * 15]
+    assert reloaded.is_retract_cleanup_blocked("retract-1") is True
+
+
 def test_outbox_cancel_json_and_unknown(tmp_path, capsys):
     from tau.mailbox import Mailbox
 
@@ -13056,6 +13109,7 @@ def test_retract_sends_group_retract_and_deletes_the_local_copy(
             discover_timeout=None,
             target_sent_at=None,
             target_author=None,
+            queue=True,
         ):
             self.sent.append((group, message_id, target_sent_at))
             return {
@@ -13176,6 +13230,7 @@ def test_retract_moderator_group_message(tmp_path, capsys, monkeypatch):
             discover_timeout=None,
             target_sent_at=None,
             target_author=None,
+            queue=True,
         ):
             self.sent.append(
                 (group, message_id, target_sent_at, target_author)
@@ -13261,6 +13316,7 @@ def test_retract_keeps_group_copy_when_a_member_is_unreachable(
             discover_timeout=None,
             target_sent_at=None,
             target_author=None,
+            queue=True,
         ):
             return {
                 "ok": False,
@@ -13292,6 +13348,83 @@ def test_retract_keeps_group_copy_when_a_member_is_unreachable(
     # stays alongside it).
     outbox = Inbox(config.inbox_path).list_messages(direction="out")
     assert {m["id"] for m in outbox} == {"m-9", "m-10"}
+
+
+def test_retract_queues_group_leg_when_a_member_is_unreachable(
+    tmp_path, capsys, monkeypatch
+):
+    data_dir, recipient_hash = _seed_sent_message(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": "",
+            "text": "group hello",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "m-10",
+            "direction": "out",
+            "kind": "group",
+            "group": "ab" * 16,
+            "group_name": "team",
+            "leg_ids": ["m-10"],
+            "leg_sent_at": 100.0,
+        }
+    )
+    Mailbox(config.mailbox_path).record_sent(
+        "m-10", to=recipient_hash, text="group hello"
+    )
+
+    class _QueuedNode(_FakeRetractNode):
+        def send_group_retraction(
+            self,
+            group,
+            message_id,
+            *,
+            timeout=20.0,
+            discover_timeout=None,
+            target_sent_at=None,
+            target_author=None,
+            queue=True,
+        ):
+            assert queue is True
+            return {
+                "ok": False,
+                "group": group,
+                "target": message_id,
+                "id": "r-1",
+                "cancelled_queued": [],
+                "results": [
+                    {
+                        "to": recipient_hash.hex(),
+                        "to_name": "alice",
+                        "ok": False,
+                        "queued": True,
+                        "queued_id": "q-1",
+                        "id": "r-1",
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(cli, "TauNode", _QueuedNode)
+    _FakeRetractNode.instances.clear()
+
+    code = cli.main(["retract", "--data-dir", str(data_dir), "m-10"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "retraction queued for alice" in out
+    assert "will deliver when they are reachable" in out
+    # The queued retract keeps the local sent copy in place, so the
+    # sweep can drop it once the fan-out completes — and the user can
+    # still retry it (the seeded m-9 DM stays alongside it).
+    outbox = Inbox(config.inbox_path).list_messages(direction="out")
+    assert {m["id"] for m in outbox} == {"m-9", "m-10"}
+    assert Mailbox(config.mailbox_path).sent_list() != []
+    assert (
+        Mailbox(config.mailbox_path).is_sent_group_retracted("ab" * 16, 100.0)
+        is False
+    )
     assert len(Mailbox(config.mailbox_path).sent_list()) == 1
     # No marker either: a partial fan-out keeps the console legs, so
     # the retract stays retryable.

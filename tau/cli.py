@@ -14036,6 +14036,7 @@ def _retract_group_local_message(
     leg_timeout: Optional[float] = None,
     discover_timeout: Optional[float] = None,
     target_author: Optional[str] = None,
+    queue: bool = True,
 ) -> Dict[str, Any]:
     """Retract a group message on the running node, for the local send server.
 
@@ -14047,6 +14048,8 @@ def _retract_group_local_message(
     and the default bound applies.  ``target_author`` names the
     message's author for a moderator retract; an author retract (and
     an older client) omits it and the fan-out stamps this node.
+    ``queue`` queues unreachable legs like the CLI does; an older
+    client omits it and the default applies.
     """
     return node.send_group_retraction(
         group,
@@ -14055,6 +14058,7 @@ def _retract_group_local_message(
         discover_timeout=discover_timeout,
         target_sent_at=target_sent_at,
         target_author=target_author,
+        queue=bool(queue),
     )
 
 
@@ -14527,6 +14531,7 @@ def _retract_group_via_running_node(
     timeout: float,
     discover_timeout: Optional[float],
     target_author: Optional[str] = None,
+    queue: bool = True,
 ) -> Dict[str, Any]:
     """Retract a group message through the serving node on its local socket."""
     from .local_ipc import LocalIPCUnavailable
@@ -14544,6 +14549,7 @@ def _retract_group_via_running_node(
             target_author=target_author,
             leg_timeout=timeout,
             discover_timeout=discover_timeout,
+            queue=queue,
         )
     except LocalIPCUnavailable as exc:
         raise NodeError(
@@ -22586,7 +22592,12 @@ def _retract_group_message(
     dropped only when every member received the retract: a partial
     fan-out keeps it, so the user can retry the members still holding
     the message — re-sending is idempotent, and a member who already
-    deleted their copy answers ``deleted`` False.
+    deleted their copy answers ``deleted`` False.  A leg whose member
+    cannot be reached is queued instead (unless ``--no-queue``): the
+    sweep delivers it when the member is heard from again, and
+    deposits a sealed copy with a holder meanwhile.  Queued legs keep
+    the local copy too — the sweep drops it once the fan-out
+    completes.
     """
     group_id = target.get("group") or ""
     if not group_id:
@@ -22610,6 +22621,7 @@ def _retract_group_message(
     target_author = target.get("destination") or None
     timeout = float(getattr(args, "timeout", 20.0))
     discover_timeout = float(getattr(args, "discover_timeout", 10.0))
+    queue = not getattr(args, "no_queue", False)
     via_running_node = _send_routes_via_running_node(config)
     if via_running_node:
         # A serving node owns the data directory: retract through it
@@ -22625,14 +22637,14 @@ def _retract_group_message(
                 timeout=timeout,
                 discover_timeout=discover_timeout,
                 target_author=target_author,
+                queue=queue,
             )
         except NodeError as exc:
-            # Retracts ride the live link only in v1 — there is no
-            # outbox queue for them yet — so an unreachable member is
-            # a plain failure, not a silent queue.
+            # With queueing on, a transport failure returns a queued
+            # result instead of raising; only a refusal or a
+            # --no-queue failure reaches here.
             raise NodeError(
-                f"could not deliver group retract: {exc} "
-                "(retracts need the members online in v1)"
+                f"could not deliver group retract: {exc}"
             ) from exc
     else:
         node = TauNode(config, name=config.name)
@@ -22646,20 +22658,23 @@ def _retract_group_message(
                     discover_timeout=discover_timeout,
                     target_sent_at=float(leg_sent_at),
                     target_author=target_author,
+                    queue=queue,
                 )
             except NodeError as exc:
-                # Retracts ride the live link only in v1 — there is no
-                # outbox queue for them yet — so an unreachable member
-                # is a plain failure, not a silent queue.
+                # With queueing on, a transport failure returns a queued
+                # result instead of raising; only a refusal or a
+                # --no-queue failure reaches here.
                 raise NodeError(
-                    f"could not deliver group retract: {exc} "
-                    "(retracts need the members online in v1)"
+                    f"could not deliver group retract: {exc}"
                 ) from exc
         finally:
             node.stop()
 
     results = response.get("results") or []
-    failed = [r for r in results if not r.get("delivered")]
+    failed = [
+        r for r in results if not r.get("delivered") and not r.get("queued")
+    ]
+    queued = [r for r in results if r.get("queued")]
     if moderating:
         author_peer = registry.get(target_author or "")
         author_name = (
@@ -22675,7 +22690,8 @@ def _retract_group_message(
             {
                 "target": target["id"],
                 "group": group_id,
-                "ok": bool(response.get("ok")),
+                "ok": not failed,
+                "queued": len(queued),
                 "cancelled_queued": response.get("cancelled_queued") or [],
                 "results": results,
                 "id": response.get("id"),
@@ -22687,7 +22703,12 @@ def _retract_group_message(
             member = result.get("to") or ""
             peer = registry.get(member)
             name = peer.display_name if peer is not None else short_hash(member)
-            if result.get("delivered"):
+            if result.get("queued"):
+                print(
+                    f"retraction queued for {name} — will deliver when "
+                    "they are reachable"
+                )
+            elif result.get("delivered"):
                 if result.get("deleted"):
                     print(
                         f"retracted {message_label} "
@@ -22727,6 +22748,12 @@ def _retract_group_message(
             )
             + "; retry `tau retract` when they are online"
         )
+    if queued:
+        # Queued legs keep the local copy too: the sweep drops it once
+        # the fan-out completes (see TauNode._deliver_queued_retract),
+        # and until then the user can retry the members still holding
+        # the message.  The retract itself is stored, not failed.
+        return _EXIT_OK
 
     # Every member received the retract: drop this node's own sent copy
     # too, so the message is gone on all sides.  A local delete failure
@@ -23469,6 +23496,16 @@ def cmd_outbox_cancel(args: argparse.Namespace) -> int:
             raise NodeError(
                 f"queued message {args.target!r} is no longer queued"
             )
+        if (
+            entry.kind == "retract"
+            and entry.group_id is not None
+            and entry.group_retract_id is not None
+        ):
+            # Cancelling a queued group-retract leg ends the fan-out
+            # the same way a refusal does: the member keeps the
+            # message, so a sibling leg's later delivery must not drop
+            # the sender's local copies.
+            mailbox.record_retract_cleanup_blocked(entry.group_retract_id)
     peer = registry.get(entry.to)
     name = peer.display_name if peer is not None else entry.to_name
     if _json_mode(args):
