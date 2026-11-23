@@ -12,8 +12,11 @@ identity bytes), so a tampered bundle is rejected; the bundle
 expires, so a stale file cannot pair a device months later; and a
 token redeemed once cannot be redeemed again on the same node.
 
-History catch-up on first connect and ``devices revoke`` are later
-slices — this one only pairs the identity.  The registry
+History catch-up on first connect is slice 2 (#736): the bundle
+optionally carries a bounded snapshot of the primary's inbox, so
+the second device replays recent history on redeem.  ``devices
+revoke`` is a later slice — this one only pairs the identity and,
+by default, its recent history.  The registry
 (``devices.json`` in the data directory) records offers this node
 issued, tokens it redeemed, and — when this node was itself paired
 — the primary it paired from, so ``tau devices list`` can show it.
@@ -38,6 +41,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 import RNS
 
 from .identity import destination_hash, load_identity
+from .inbox import INBOX_EXPORT_FORMAT, INBOX_EXPORT_VERSION
 from .protocol import encode
 from .util import atomic_write_json
 
@@ -54,7 +58,11 @@ except ImportError:  # pragma: no cover - POSIX
     msvcrt = None  # type: ignore[assignment]
 
 PAIRING_BUNDLE_TYPE = "tau-pairing"
-PAIRING_BUNDLE_VERSION = 1
+# Version 2 adds the optional history snapshot (slice 2, #736): a
+# version-1 bundle carries no history and still verifies, so a
+# bundle minted before history existed redeems unchanged.
+PAIRING_BUNDLE_VERSION = 2
+PAIRING_BUNDLE_VERSION_1 = 1
 DEFAULT_PAIRING_TTL_SECONDS = 3600
 MAX_PAIRING_TTL_SECONDS = 86400
 # A serialized identity is a few kilobytes; anything near this bound
@@ -65,6 +73,11 @@ MAX_PAIRING_IDENTITY_B64_LENGTH = 65536
 # not a bundle, and reading it unbounded would let a hostile file
 # exhaust memory before verification (see #714).
 MAX_PAIRING_BUNDLE_BYTES = 1024 * 1024
+# A history snapshot is bounded twice: at most this many messages,
+# and at most this many serialized bytes — a snapshot must stay a
+# small part of the bundle, not a second inbox export smuggled in.
+MAX_PAIRING_HISTORY_MESSAGES = 200
+MAX_PAIRING_HISTORY_BYTES = 256 * 1024
 DEVICES_FILE_MODE = 0o600
 
 
@@ -118,8 +131,111 @@ def _identity_from_bytes(data: bytes) -> RNS.Identity:
     return identity
 
 
-def _unsigned_bundle(bundle: Dict[str, Any]) -> Dict[str, Any]:
+def _clean_history(raw: Any) -> Dict[str, Any]:
+    """Validate a pairing history snapshot, or raise :class:`DevicesError`.
+
+    A snapshot is an inbox export document (see
+    :meth:`tau.inbox.Inbox.export_document`): the format and version
+    must match, ``messages`` must be a list of records, and the
+    message and byte caps must hold.  The records themselves are
+    validated again at import — a bad record is skipped there, never
+    trusted — so this only checks the shape a signature must cover:
+    a snapshot that passes here cannot smuggle an unbounded payload
+    past verification.
+    """
+    if not isinstance(raw, dict):
+        raise DevicesError("pairing history must be a JSON object")
+    if raw.get("format") != INBOX_EXPORT_FORMAT:
+        raise DevicesError(
+            f"unsupported pairing history format: {raw.get('format')!r}"
+        )
+    if raw.get("version") != INBOX_EXPORT_VERSION:
+        raise DevicesError(
+            f"unsupported pairing history version: {raw.get('version')!r}"
+        )
+    messages = raw.get("messages")
+    if not isinstance(messages, list):
+        raise DevicesError("pairing history has no messages list")
+    if len(messages) > MAX_PAIRING_HISTORY_MESSAGES:
+        raise DevicesError(
+            "pairing history holds too many messages "
+            f"(over {MAX_PAIRING_HISTORY_MESSAGES})"
+        )
+    if any(not isinstance(entry, dict) for entry in messages):
+        raise DevicesError("pairing history holds a non-record entry")
+    try:
+        size = len(
+            json.dumps(raw, ensure_ascii=False).encode("utf-8")
+        )
+    except (TypeError, ValueError) as exc:
+        raise DevicesError(f"pairing history is not serializable: {exc}") from exc
+    if size > MAX_PAIRING_HISTORY_BYTES:
+        raise DevicesError(
+            "pairing history is too large "
+            f"(over {MAX_PAIRING_HISTORY_BYTES} bytes)"
+        )
     return {
+        "format": INBOX_EXPORT_FORMAT,
+        "version": INBOX_EXPORT_VERSION,
+        "exported_at": raw.get("exported_at"),
+        "messages": [dict(entry) for entry in messages],
+    }
+
+
+def snapshot_pairing_history(
+    document: Any,
+    *,
+    max_messages: int = MAX_PAIRING_HISTORY_MESSAGES,
+    max_bytes: int = MAX_PAIRING_HISTORY_BYTES,
+) -> Optional[Dict[str, Any]]:
+    """Bound an inbox export document into a pairing history snapshot.
+
+    The newest messages survive, oldest-first so a redeem replays
+    them in order; file records are dropped — they name files saved
+    on the primary that do not exist on the second device, so the
+    copy would point at a path that is never there.  Returns ``None``
+    when nothing survives the bounds, so the bundle carries no
+    history key at all instead of an empty snapshot.
+    """
+    if not isinstance(document, dict):
+        return None
+    messages = document.get("messages")
+    if not isinstance(messages, list):
+        return None
+    kept = []
+    for entry in messages:
+        if not isinstance(entry, dict) or entry.get("kind") == "file":
+            continue
+        record = dict(entry)
+        # The second device has not displayed these messages, so the
+        # primary's read state must not travel: a carried read_at would
+        # make the receipt sweep send receipts for unseen messages.
+        record.pop("read_at", None)
+        kept.append(record)
+    # Newest first for the caps, then back to oldest-first: the
+    # import replays in stored order, so the newest messages keep
+    # their relative order and the oldest are the ones dropped.
+    kept = kept[-max_messages:] if max_messages > 0 else []
+    exported_at = document.get("exported_at")
+    # Measure the exact document that is returned (and that
+    # _clean_history measures), metadata included, so a snapshot that
+    # passes here cannot fail the bundle's size cap.
+    while kept:
+        snapshot = {
+            "format": INBOX_EXPORT_FORMAT,
+            "version": INBOX_EXPORT_VERSION,
+            "exported_at": exported_at,
+            "messages": kept,
+        }
+        size = len(json.dumps(snapshot, ensure_ascii=False).encode("utf-8"))
+        if size <= max_bytes:
+            return snapshot
+        kept = kept[1:]
+    return None
+
+
+def _unsigned_bundle(bundle: Dict[str, Any]) -> Dict[str, Any]:
+    unsigned = {
         "v": bundle["v"],
         "type": bundle["type"],
         "token": bundle["token"],
@@ -128,6 +244,13 @@ def _unsigned_bundle(bundle: Dict[str, Any]) -> Dict[str, Any]:
         "expires_at": bundle["expires_at"],
         "identity": bundle["identity"],
     }
+    # The history snapshot rides inside the signature, so a tampered
+    # snapshot fails verification exactly like a tampered identity;
+    # a bundle without one signs exactly the version-1 payload, and
+    # a version-1 bundle never carries the key at all.
+    if bundle.get("history") is not None:
+        unsigned["history"] = bundle["history"]
+    return unsigned
 
 
 def build_pairing_bundle(
@@ -135,6 +258,7 @@ def build_pairing_bundle(
     *,
     ttl_seconds: float = DEFAULT_PAIRING_TTL_SECONDS,
     now: Optional[float] = None,
+    history: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Mint a pairing bundle for *identity* (see the module docstring).
 
@@ -153,6 +277,7 @@ def build_pairing_bundle(
             f"{MAX_PAIRING_TTL_SECONDS} seconds"
         )
     moment = time.time() if now is None else float(now)
+    history_doc = _clean_history(history) if history is not None else None
     unsigned = {
         "v": PAIRING_BUNDLE_VERSION,
         "type": PAIRING_BUNDLE_TYPE,
@@ -162,6 +287,8 @@ def build_pairing_bundle(
         "expires_at": moment + float(ttl_seconds),
         "identity": base64.b64encode(_identity_bytes(identity)).decode("ascii"),
     }
+    if history_doc is not None:
+        unsigned["history"] = history_doc
     try:
         signature = identity.sign(encode(unsigned))
     except Exception as exc:
@@ -184,10 +311,14 @@ def verify_pairing_bundle(
     against *now* (the current time by default).  Anything malformed,
     mismatched, forged or expired raises :class:`DevicesError`
     instead of returning, so callers never act on a bad bundle.
+    Version 1 bundles carry no history and still verify; a version-1
+    bundle smuggling a history key is rejected, since that key would
+    ride outside the version-1 signature.
     """
     if not isinstance(raw, dict):
         raise DevicesError("pairing bundle must be a JSON object")
-    if raw.get("v") != PAIRING_BUNDLE_VERSION:
+    version = raw.get("v")
+    if version not in (PAIRING_BUNDLE_VERSION_1, PAIRING_BUNDLE_VERSION):
         raise DevicesError("pairing bundle has an unsupported version")
     if raw.get("type") != PAIRING_BUNDLE_TYPE:
         raise DevicesError("pairing bundle has an unsupported type")
@@ -221,14 +352,24 @@ def verify_pairing_bundle(
         signature = base64.b64decode(signature_text, validate=True)
     except (binascii.Error, ValueError):
         raise DevicesError("pairing bundle signature is not valid base64")
+    history = raw.get("history")
+    if version == PAIRING_BUNDLE_VERSION_1:
+        if history is not None:
+            raise DevicesError(
+                "pairing bundle version 1 must not carry history"
+            )
+        history_doc = None
+    else:
+        history_doc = _clean_history(history) if history is not None else None
     bundle = {
-        "v": PAIRING_BUNDLE_VERSION,
+        "v": version,
         "type": PAIRING_BUNDLE_TYPE,
         "token": token,
         "primary": primary,
         "created_at": created_at,
         "expires_at": expires_at,
         "identity": identity_text,
+        "history": history_doc,
     }
     try:
         verified = identity.validate(signature, encode(_unsigned_bundle(bundle)))
