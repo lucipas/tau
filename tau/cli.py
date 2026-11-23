@@ -13705,14 +13705,16 @@ def cmd_id_import(args: argparse.Namespace) -> int:
             # abort the import — it was already tolerated when
             # deciding the reset — it only disables rollback.
             try:
-                previous, had_previous = _snapshot_previous_identity(config)
+                previous, had_previous, link_target = (
+                    _snapshot_previous_identity(config)
+                )
             except OSError as exc:
                 log.warning(
                     "Could not read the existing identity (%s); the "
                     "replacement cannot be rolled back",
                     exc,
                 )
-                previous, had_previous = None, True
+                previous, had_previous, link_target = None, True, None
             verifications_cleared = _clear_verifications_for_identity_change(
                 config, identity
             )
@@ -13729,6 +13731,7 @@ def cmd_id_import(args: argparse.Namespace) -> int:
                 reset_devices,
                 previous=previous,
                 had_previous=had_previous,
+                link_target=link_target,
             )
     finally:
         lock.release()
@@ -13754,20 +13757,30 @@ def cmd_id_import(args: argparse.Namespace) -> int:
 
 def _snapshot_previous_identity(
     config: TauConfig,
-) -> Tuple[Optional[bytes], bool]:
+) -> Tuple[Optional[bytes], bool, Optional[str]]:
     """Read the installed identity for a later rollback.
 
-    Returns ``(previous_bytes, had_previous)``: ``(None, False)``
-    when no identity is installed yet.  Raises ``OSError`` when an
-    identity file exists but cannot be read — the caller decides
-    whether that aborts the command (a redeem must fail before its
-    token is recorded, so the bundle stays retryable) or merely
-    disables rollback (an import keeps the old tolerance for
-    unreadable identities, see #716).
+    Returns ``(previous_bytes, had_previous, link_target)``:
+    ``(None, False, None)`` when no identity is installed yet.
+    ``link_target`` is the target of the identity path itself when
+    it is a symlink — including a dangling one, which has no bytes
+    to read but is still a previous state the rollback must restore
+    (see #722).  Raises ``OSError`` when an identity file exists but
+    cannot be read — the caller decides whether that aborts the
+    command (a redeem must fail before its token is recorded, so the
+    bundle stays retryable) or merely disables rollback (an import
+    keeps the old tolerance for unreadable identities, see #716).
     """
+    if config.identity_path.is_symlink():
+        link_target = os.readlink(config.identity_path)
+        if not config.identity_path.exists():
+            # Dangling: nothing readable to snapshot, but the link
+            # itself is the previous state.
+            return None, True, link_target
+        return config.identity_path.read_bytes(), True, link_target
     if not config.identity_path.exists():
-        return None, False
-    return config.identity_path.read_bytes(), True
+        return None, False, None
+    return config.identity_path.read_bytes(), True, None
 
 
 def _install_identity_and_reset(
@@ -13778,6 +13791,7 @@ def _install_identity_and_reset(
     redeemed_token: Optional[str] = None,
     previous: Optional[bytes] = None,
     had_previous: bool = False,
+    link_target: Optional[str] = None,
 ) -> None:
     """Install *identity*, then apply the pairing reset, rolling back on failure.
 
@@ -13796,7 +13810,10 @@ def _install_identity_and_reset(
     ``previous`` None: there is nothing to restore to, so a failure
     leaves the new identity in place and the token is kept — the
     bundle cannot be replayed — rather than deleting the only
-    identity on disk.
+    identity on disk.  ``link_target`` is the target of the identity
+    path itself when it was a symlink (live or dangling): the
+    rollback restores the link, not the snapshot bytes as a regular
+    file (see #722).
     """
     try:
         save_identity(identity, config.identity_path)
@@ -13805,7 +13822,55 @@ def _install_identity_and_reset(
     except (OSError, IdentityError, DevicesError):
         restored = False
         try:
-            if not had_previous:
+            if link_target is not None:
+                # The previous identity was a symlink — live or
+                # dangling.  Restore the link itself: writing the
+                # snapshot bytes as a regular file would silently
+                # un-link a shared identity, and a dangling link
+                # must not be mistaken for an absent identity and
+                # removed.  The install already replaced the link
+                # with a regular file (or failed before doing so).
+                # Build the link at a temporary path next to the
+                # identity, then atomically swap it in, so the identity
+                # path is never absent (an interruption must not make
+                # startup think the identity is missing).
+                # The staging name is unique and created exclusively
+                # (mkstemp): never unlink a pre-existing entry at a
+                # fixed staging path — that entry could be the old
+                # symlink's own target (when the identity points at
+                # ``identity.restore-tmp``) or an unrelated file, and
+                # deleting it would destroy the identity bytes the
+                # rollback is restoring a link to.  Only a staging
+                # link this attempt created is ever cleaned up.
+                tmp_link = None
+                for _attempt in range(100):
+                    fd, staging_name = tempfile.mkstemp(
+                        dir=str(config.identity_path.parent),
+                        prefix=f".{config.identity_path.name}.restore-",
+                        suffix=".tmp",
+                    )
+                    os.close(fd)
+                    candidate = Path(staging_name)
+                    candidate.unlink()
+                    try:
+                        os.symlink(link_target, candidate)
+                    except FileExistsError:
+                        continue
+                    tmp_link = candidate
+                    break
+                if tmp_link is None:
+                    raise OSError(
+                        "could not allocate a staging path to restore "
+                        f"the identity symlink at {config.identity_path}"
+                    )
+                try:
+                    os.replace(tmp_link, config.identity_path)
+                except OSError:
+                    if os.path.lexists(tmp_link):
+                        tmp_link.unlink()
+                    raise
+                restored = True
+            elif not had_previous:
                 if config.identity_path.exists():
                     config.identity_path.unlink()
                 restored = True
@@ -14218,7 +14283,9 @@ def cmd_devices_redeem(args: argparse.Namespace) -> int:
                 # snapshot read fails, the command aborts while the bundle
                 # is still unredeemed and retryable — and with the old
                 # identity's peer verifications intact (see #721).
-                previous, had_previous = _snapshot_previous_identity(config)
+                previous, had_previous, link_target = (
+                    _snapshot_previous_identity(config)
+                )
                 verifications_cleared = _clear_verifications_for_identity_change(
                     config, identity
                 )
@@ -14250,6 +14317,7 @@ def cmd_devices_redeem(args: argparse.Namespace) -> int:
                     redeemed_token=bundle["token"],
                     previous=previous,
                     had_previous=had_previous,
+                    link_target=link_target,
                 )
                 try:
                     registry.record_paired_from(bundle["token"], bundle["primary"])
