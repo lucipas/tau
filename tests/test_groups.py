@@ -694,13 +694,45 @@ def test_group_store_successor_falls_back_after_lineage_cap(tmp_path):
 
 def test_group_store_successor_falls_back_after_rename_lineage_cap(tmp_path):
     # Forty renames push the first id off the 32-entry lineage and
-    # change the name, but creator + creation time — both carried into
-    # every successor — still find it. (Qodo Warning on PR #708: the
-    # name-based fallback could not resolve an id renamed past the cap.)
+    # change the name, but the family id — minted at creation and
+    # carried into every successor — still finds it. (Qodo Warning on
+    # PR #708: the name-based fallback could not resolve an id renamed
+    # past the cap.)
     store = GroupStore(tmp_path / "groups.json")
     members = [OWN_HASH, OTHER_HASH, THIRD_HASH]
     current = store.create("place-0", members, created_by=OWN_HASH)
     first_id = current["id"]
+    for i in range(1, 41):
+        current = store.rename(current["id"], f"place-{i}", created_by=OWN_HASH)
+    assert first_id not in current["renamed_from"]
+    assert current["name"] == "place-40"
+    assert store.successor(first_id) == current
+
+
+def test_group_store_successor_fallback_ignores_same_timestamp_group(
+    tmp_path, monkeypatch
+):
+    # Qodo Warning on PR #708: the successor fallback matched a live
+    # group by creator and creation time, but two groups from one
+    # creator can share a clock tick — so an unrelated group
+    # encountered first could supply a roster that excludes a
+    # still-current recipient, and the sweep would delete their leg.
+    # The fallback now matches the family id instead, so the
+    # same-timestamp group is ignored even after the original id has
+    # left the rename lineage.
+    store = GroupStore(tmp_path / "groups.json")
+    members = [OWN_HASH, OTHER_HASH, THIRD_HASH]
+    monkeypatch.setattr("tau.groups.time.time", lambda: 1000.0)
+    current = store.create("place-0", members, created_by=OWN_HASH)
+    first_id = current["id"]
+    # Same creator, same creation timestamp, different name and
+    # roster: the old fallback's exact match.
+    other = store.create(
+        "elsewhere", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH
+    )
+    assert other["created_at"] == current["created_at"]
+    assert other.get("family_id") != current.get("family_id")
+    monkeypatch.undo()
     for i in range(1, 41):
         current = store.rename(current["id"], f"place-{i}", created_by=OWN_HASH)
     assert first_id not in current["renamed_from"]
