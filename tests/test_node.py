@@ -3029,6 +3029,133 @@ def test_send_group_retraction_records_block_before_later_legs(
     assert node.mailbox.is_sent_group_retracted(group["id"], 100.0) is False
 
 
+def test_sweep_drops_group_leg_whose_send_was_retracted(tmp_path, monkeypatch):
+    # Qodo Critical on PR #706: _cancel_queued_group_send removed
+    # only the legs present in one outbox snapshot, then recorded a
+    # marker the delivery sweep never checked — so a leg enqueued by
+    # an in-progress fan-out after the snapshot could still deliver
+    # the retracted post. The sweep now consults the sent-group
+    # retraction marker before sending a group leg, and forgets its
+    # sent record when it drops it.
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    node.reticulum = object()  # started enough to queue
+    entry = node.mailbox.enqueue(
+        to=alice.destination_hash,
+        text="crew hello",
+        message_id="leg-1",
+        group={
+            "id": group["id"],
+            "name": group["name"],
+            "creator": group["creator"],
+            "members": group["members"],
+        },
+        sent_at=100.0,
+    )
+    node.mailbox.record_sent(
+        "leg-1", to=alice.destination_hash, text="crew hello"
+    )
+    node.mailbox.record_sent_group_retraction(group["id"], 100.0)
+
+    def must_not_send(peer_arg, path, payload, timeout, deadline=None):
+        raise AssertionError("a retracted leg must never be sent")
+
+    monkeypatch.setattr(node, "_request", must_not_send)
+    assert node._deliver_entry(alice, entry, 1.0) is False
+    assert node.mailbox.outbox_list() == []
+    assert node.mailbox.sent_list() == []
+
+
+def test_moderator_retract_cancels_legs_and_late_legs_still_drop(
+    tmp_path, monkeypatch
+):
+    # The same race, end to end: a moderator retract cancels the legs
+    # queued so far (and forgets their sent records), a fan-out still
+    # in progress enqueues one more leg for the same send afterwards,
+    # and the sweep drops that late leg instead of delivering it.
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    node.reticulum = object()  # started enough to queue
+    group_kwargs = {
+        "id": group["id"],
+        "name": group["name"],
+        "creator": group["creator"],
+        "members": group["members"],
+    }
+    first = node.mailbox.enqueue(
+        to=alice.destination_hash,
+        text="crew hello",
+        message_id="leg-1",
+        group=group_kwargs,
+        sent_at=100.0,
+    )
+    node.mailbox.record_sent(
+        "leg-1", to=alice.destination_hash, text="crew hello"
+    )
+    node._cancel_queued_group_send(group["id"], 100.0)
+    assert node.mailbox.outbox_list() == []
+    assert node.mailbox.sent_list() == []
+    assert node.mailbox.is_sent_group_retracted(group["id"], 100.0) is True
+
+    # The fan-out was still running when the retract landed: it
+    # enqueues a late leg for the same send afterwards.
+    late = node.mailbox.enqueue(
+        to=bob.destination_hash,
+        text="crew hello",
+        message_id="leg-2",
+        group=group_kwargs,
+        sent_at=100.0,
+    )
+    node.mailbox.record_sent(
+        "leg-2", to=bob.destination_hash, text="crew hello"
+    )
+
+    def must_not_send(peer_arg, path, payload, timeout, deadline=None):
+        raise AssertionError("a retracted leg must never be sent")
+
+    monkeypatch.setattr(node, "_request", must_not_send)
+    assert node._deliver_entry(bob, late, 1.0) is False
+    assert node.mailbox.outbox_list() == []
+    assert node.mailbox.sent_list() == []
+
+
+def test_cancel_queued_group_send_failure_message_is_group_neutral(
+    tmp_path, monkeypatch
+):
+    # Qodo Warning on PR #706: a cancellation failure put the secret
+    # group's opaque id prefix into the DeliveryDeferredError, which
+    # held-mail consumers log verbatim. The message is now static;
+    # the cause stays chained.
+    from tau.node import DeliveryDeferredError
+
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    node.mailbox.enqueue(
+        to=alice.destination_hash,
+        text="crew hello",
+        message_id="leg-1",
+        group={
+            "id": group["id"],
+            "name": group["name"],
+            "creator": group["creator"],
+            "members": group["members"],
+        },
+        sent_at=100.0,
+    )
+
+    def fail_remove(message_id, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(node.mailbox, "remove_outbox", fail_remove)
+    with pytest.raises(DeliveryDeferredError) as excinfo:
+        node._cancel_queued_group_send(group["id"], 100.0)
+    assert str(excinfo.value) == (
+        "could not cancel queued legs for a retracted group send"
+    )
+    assert group["id"][:8] not in str(excinfo.value)
+    # Nothing was cancelled and no marker was recorded: the retry
+    # can still finish the job.
+    assert len(node.mailbox.outbox_list()) == 1
+    assert node.mailbox.is_sent_group_retracted(group["id"], 100.0) is False
+
+
 def test_send_group_retraction_rejects_unknown_and_solo_groups(tmp_path):
     node, group, _, _ = _group_reaction_node(tmp_path)
     with pytest.raises(ValueError, match="unknown group"):

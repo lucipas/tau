@@ -7692,6 +7692,59 @@ class TauNode:
             return self._deliver_queued_reaction(
                 peer, fresh, timeout, deadline=deadline
             )
+        if fresh.group_id is not None:
+            # This send was retracted after the leg was queued — by a
+            # moderator retract that snapshotted the outbox before
+            # this leg was enqueued, or by a relayed retract the sweep
+            # has not seen. The sent-group marker is the authority:
+            # drop the leg instead of delivering a retracted post,
+            # and forget its sent record so it does not linger as an
+            # undelivered message. A leg whose retraction cannot be
+            # checked (mailbox lock busy) stays queued for a later
+            # round instead of being sent on an unchecked guess.
+            try:
+                retracted = self.mailbox.is_sent_group_retracted(
+                    fresh.group_id,
+                    fresh.wire_sent_at,
+                    timeout=_remaining(deadline),
+                )
+            except TimeoutError:
+                log.warning(
+                    "Delivered queued group message %s but the mailbox "
+                    "lock stayed busy; leaving it queued for a later round",
+                    entry.id,
+                )
+                return False
+            if retracted:
+                log.info(
+                    "Dropping queued group message %s: its send was retracted",
+                    entry.id,
+                )
+                try:
+                    removed = self._remove_queued_version(
+                        entry.id,
+                        text=fresh.text,
+                        edited_at=fresh.edited_at,
+                        timeout=_remaining(deadline),
+                    )
+                except (TimeoutError, OSError):
+                    log.debug(
+                        "Could not drop retracted queued group message "
+                        "%s: mailbox lock busy or the removal could not "
+                        "be saved; leaving it for a later round",
+                        entry.id,
+                    )
+                    return False
+                if removed:
+                    try:
+                        self.mailbox.discard_sent(entry.id)
+                    except OSError:
+                        log.debug(
+                            "Could not forget the sent record for "
+                            "retracted queued group message %s",
+                            entry.id,
+                        )
+                return False
         send_text = fresh.text
         send_edited_at = fresh.edited_at
         if fresh.group_id is not None:
@@ -9382,11 +9435,18 @@ class TauNode:
                     and entry.wire_sent_at == sent_at
                 ):
                     self.mailbox.remove_outbox(entry.id)
+                    # A cancelled leg never went out: forget its sent
+                    # record too, or the retracted post lingers in
+                    # the sender's history as an undelivered message.
+                    self.mailbox.discard_sent(entry.id)
             self.mailbox.record_sent_group_retraction(group_id, sent_at)
         except Exception as exc:
+            # The message stays group-neutral: a secret group's opaque
+            # id must not reach the log through this error (see the
+            # CodeQL clear-text-logging alerts on main). The cause
+            # stays chained for debugging.
             raise DeliveryDeferredError(
-                f"could not cancel queued legs for group send "
-                f"{group_id[:8]}:{sent_at}: {exc}"
+                "could not cancel queued legs for a retracted group send"
             ) from exc
 
     def _apply_relayed_group_retract(

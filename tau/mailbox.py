@@ -3458,22 +3458,39 @@ class Mailbox:
             self.save()
 
     def is_sent_group_retracted(
-        self, group_id: str, sent_at: float, *, now: Optional[float] = None
+        self,
+        group_id: str,
+        sent_at: float,
+        *,
+        now: Optional[float] = None,
+        timeout: Optional[float] = None,
     ) -> bool:
         """True while a live sent group-retraction marker covers this send.
 
         An expired marker reads as absent even before :meth:`prune`
         sweeps it away; a non-numeric send time cannot match a
-        recorded marker.
+        recorded marker. With ``timeout`` set, the wait for the
+        in-process lock is bounded by it (a ``TimeoutError`` is raised
+        once the budget is spent), so a caller with its own deadline
+        is not held past it by a stalled lock holder.
         """
-        with self._lock:
-            timestamp = now if now is not None else time.time()
+        timestamp = now if now is not None else time.time()
+        try:
+            key = _sent_group_retraction_key(group_id, float(sent_at))
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if timeout is None:
+            with self._lock:
+                until = self._sent_group_retracted.get(key)
+        else:
+            acquired = self._lock.acquire(timeout=max(0.0, timeout))
+            if not acquired:
+                raise TimeoutError("mailbox lock is held by another thread")
             try:
-                key = _sent_group_retraction_key(group_id, float(sent_at))
-            except (TypeError, ValueError, OverflowError):
-                return False
-            until = self._sent_group_retracted.get(key)
-            return until is not None and timestamp < until
+                until = self._sent_group_retracted.get(key)
+            finally:
+                self._lock.release()
+        return until is not None and timestamp < until
 
     def _evict_sent_group_retracted(self) -> None:
         """Drop earliest-expiry sent group markers until the pool fits.
