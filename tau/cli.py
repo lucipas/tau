@@ -152,6 +152,7 @@ from .devices import (
 )
 from .doctor import all_ok, run_checks
 from .identity import (
+    IDENTITY_FILE_MODE,
     IdentityError,
     _identity_lock,
     destination_hash,
@@ -13700,10 +13701,31 @@ def cmd_id_import(args: argparse.Namespace) -> int:
             verifications_cleared = _clear_verifications_for_identity_change(
                 config, identity
             )
-            _reset_devices_for_identity_change(
-                config, DeviceRegistry(config.devices_path), identity
+            # Decide the reset while the old identity is still on
+            # disk, but apply it only after the new identity is
+            # installed: a failed write must leave the old pairing
+            # records intact (see #716).  An unreadable old identity
+            # does not abort the import — it was already tolerated
+            # when deciding the reset — it only disables rollback.
+            registry = DeviceRegistry(config.devices_path)
+            reset_devices = _devices_reset_needed(config, identity)
+            try:
+                previous, had_previous = _snapshot_previous_identity(config)
+            except OSError as exc:
+                log.warning(
+                    "Could not read the existing identity (%s); the "
+                    "replacement cannot be rolled back",
+                    exc,
+                )
+                previous, had_previous = None, True
+            _install_identity_and_reset(
+                config,
+                identity,
+                registry,
+                reset_devices,
+                previous=previous,
+                had_previous=had_previous,
             )
-            save_identity(identity, config.identity_path)
     finally:
         lock.release()
     payload = {
@@ -13724,6 +13746,93 @@ def cmd_id_import(args: argparse.Namespace) -> int:
                 "(local identity changed; re-verify peers)"
             )
     return _EXIT_OK
+
+
+def _snapshot_previous_identity(
+    config: TauConfig,
+) -> Tuple[Optional[bytes], bool]:
+    """Read the installed identity for a later rollback.
+
+    Returns ``(previous_bytes, had_previous)``: ``(None, False)``
+    when no identity is installed yet.  Raises ``OSError`` when an
+    identity file exists but cannot be read — the caller decides
+    whether that aborts the command (a redeem must fail before its
+    token is recorded, so the bundle stays retryable) or merely
+    disables rollback (an import keeps the old tolerance for
+    unreadable identities, see #716).
+    """
+    if not config.identity_path.exists():
+        return None, False
+    return config.identity_path.read_bytes(), True
+
+
+def _install_identity_and_reset(
+    config: TauConfig,
+    identity: Any,
+    registry: DeviceRegistry,
+    reset_devices: bool,
+    redeemed_token: Optional[str] = None,
+    previous: Optional[bytes] = None,
+    had_previous: bool = False,
+) -> None:
+    """Install *identity*, then apply the pairing reset, rolling back on failure.
+
+    If the identity write or the registry reset fails — ``OSError``,
+    ``IdentityError`` from the write, or ``DevicesError`` when the
+    reset reloads a corrupt registry — the previous identity file is
+    restored (or removed when there was none) so the identity and
+    pairing records stay consistent.  For a redeem, the token recorded
+    for this bundle is dropped once the previous identity is confirmed
+    restored, so the same bundle can be retried.
+
+    ``previous``/``had_previous`` are the snapshot from
+    :func:`_snapshot_previous_identity`, taken before anything is
+    written (for a redeem: before the token is recorded).  When the
+    previous identity was unreadable, ``had_previous`` is True with
+    ``previous`` None: there is nothing to restore to, so a failure
+    leaves the new identity in place and the token is kept — the
+    bundle cannot be replayed — rather than deleting the only
+    identity on disk.
+    """
+    try:
+        save_identity(identity, config.identity_path)
+        if reset_devices:
+            registry.reset()
+    except (OSError, IdentityError, DevicesError):
+        restored = False
+        try:
+            if not had_previous:
+                if config.identity_path.exists():
+                    config.identity_path.unlink()
+                restored = True
+            elif previous is not None:
+                atomic_write_bytes(
+                    config.identity_path, previous, mode=IDENTITY_FILE_MODE
+                )
+                restored = True
+            else:
+                log.warning(
+                    "Could not restore the previous identity at %s: it "
+                    "was unreadable before the replacement",
+                    config.identity_path,
+                )
+        except OSError as restore_exc:
+            log.warning(
+                "Could not restore the previous identity at %s: %s",
+                config.identity_path,
+                restore_exc,
+            )
+        if restored and redeemed_token is not None:
+            try:
+                registry.forget_redeemed(redeemed_token)
+            except (OSError, DevicesError) as forget_exc:
+                # Fail closed: a token that cannot be released stays
+                # recorded, so the bundle cannot be replayed.
+                log.warning(
+                    "Could not release the redeemed pairing token: %s",
+                    forget_exc,
+                )
+        raise
 
 
 def _clear_verifications_for_identity_change(
@@ -13770,19 +13879,21 @@ def _clear_verifications_for_identity_change(
     return cleared
 
 
-def _reset_devices_for_identity_change(
-    config: TauConfig, registry: DeviceRegistry, identity: Any
-) -> bool:
-    """Drop pairing records when a new identity replaces the old one.
+def _devices_reset_needed(config: TauConfig, identity: Any) -> bool:
+    """Decide whether an identity change drops the pairing records.
 
-    Issued offers and redeemed tokens belong to the identity that was
-    installed when they were recorded: after an identity replacement
-    they would otherwise be reported as the new identity's pairing.
-    A restore of the same identity keeps them, and a node with no
-    identity yet has nothing to drop.  An unreadable old identity
-    counts as different — records of unknown provenance must not be
-    attributed to the replacement.  Returns True when the registry
-    was reset.
+    Issued offers and the pairing itself belong to the identity that
+    was installed when they were recorded: after an identity
+    replacement they would otherwise be reported as the new
+    identity's pairing.  A restore of the same identity keeps them,
+    and a node with no identity yet has nothing to drop.  An
+    unreadable old identity counts as different — records of unknown
+    provenance must not be attributed to the replacement.
+
+    This only decides: the caller applies ``DeviceRegistry.reset()``
+    after ``save_identity`` succeeds, so a failed identity write
+    leaves the old records intact (see #716).  Returns True when the
+    registry must be reset.
     """
     if not config.identity_path.exists():
         return False
@@ -13795,7 +13906,6 @@ def _reset_devices_for_identity_change(
         old_key = None
     if old_key is not None and old_key == identity.get_public_key():
         return False
-    registry.reset()
     return True
 
 
@@ -13918,7 +14028,16 @@ def cmd_devices_redeem(args: argparse.Namespace) -> int:
             verifications_cleared = _clear_verifications_for_identity_change(
                 config, identity
             )
-            _reset_devices_for_identity_change(config, registry, identity)
+            # Decide the reset while the old identity is still on
+            # disk, but apply it only after the new identity is
+            # installed: a failed write must leave the old pairing
+            # records intact (see #716).  The reset keeps redeemed
+            # tokens, so the token recorded just below survives it.
+            reset_devices = _devices_reset_needed(config, identity)
+            # Snapshot the installed identity BEFORE recording the
+            # token: if the snapshot read fails, the command aborts
+            # while the bundle is still unredeemed and retryable.
+            previous, had_previous = _snapshot_previous_identity(config)
             # Record the token BEFORE installing the identity: if the
             # record fails, the old identity stays in place and the
             # bundle can be minted fresh — the reverse order would
@@ -13930,7 +14049,15 @@ def cmd_devices_redeem(args: argparse.Namespace) -> int:
             registry.record_redeemed(
                 bundle["token"], bundle["primary"], bundle["expires_at"]
             )
-            save_identity(identity, config.identity_path)
+            _install_identity_and_reset(
+                config,
+                identity,
+                registry,
+                reset_devices,
+                redeemed_token=bundle["token"],
+                previous=previous,
+                had_previous=had_previous,
+            )
             try:
                 registry.record_paired_from(bundle["token"], bundle["primary"])
             except OSError as exc:
