@@ -761,6 +761,86 @@ def test_devices_redeem_records_token_before_install(
     assert _destination(node_b, capsys) == destination_b
 
 
+def test_devices_redeem_retry_restores_pairing_after_failed_record(
+    tmp_path, capsys, monkeypatch
+):
+    # If the pairing-status write fails, the token is already
+    # recorded and the identity is installed, so a plain retry was
+    # rejected as "already redeemed" and `devices list` never showed
+    # the pairing (see #718).  The retry now completes the record
+    # instead of rejecting the bundle; a third redeem is still a
+    # plain duplicate.
+    node_a = _init_node(tmp_path, "a", "alice")
+    node_b = tmp_path / "b"
+    capsys.readouterr()
+    destination_a = _destination(node_a, capsys)
+    bundle_path = tmp_path / "pairing.json"
+    assert (
+        cli.main(
+            ["devices", "pair", "--to", str(bundle_path), "--data-dir", str(node_a)]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    original_record = DeviceRegistry.record_paired_from
+    calls = []
+
+    def _failing_first_record(self, *args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError("disk full")
+        return original_record(self, *args, **kwargs)
+
+    monkeypatch.setattr(DeviceRegistry, "record_paired_from", _failing_first_record)
+    code = cli.main(
+        [
+            "devices",
+            "redeem",
+            "--from",
+            str(bundle_path),
+            "--data-dir",
+            str(node_b),
+            "--json",
+        ]
+    )
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "could not record pairing" in err
+    assert "retry the same bundle" in err
+    # The identity was installed, but no pairing status landed yet.
+    assert _destination(node_b, capsys) == destination_a
+    assert cli.main(["devices", "list", "--data-dir", str(node_b)]) == 0
+    assert "paired from:" not in capsys.readouterr().out
+
+    # Retry the same bundle: the token is redeemed, but the pairing
+    # record is restored instead of rejecting the retry.
+    code = cli.main(
+        [
+            "devices",
+            "redeem",
+            "--from",
+            str(bundle_path),
+            "--data-dir",
+            str(node_b),
+            "--json",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["paired_from"] == destination_a
+    assert payload["verifications_cleared"] == 0
+    assert cli.main(["devices", "list", "--data-dir", str(node_b)]) == 0
+    assert f"paired from: {destination_a}" in capsys.readouterr().out
+
+    # A third redeem is still a plain duplicate, not a recovery.
+    code = cli.main(
+        ["devices", "redeem", "--from", str(bundle_path), "--data-dir", str(node_b)]
+    )
+    assert code == 1
+    assert "already redeemed" in capsys.readouterr().err
+
+
 def test_devices_list_after_identity_replace_resets_records(tmp_path, capsys):
     # Pairing records belong to the installed identity: replacing it
     # with an unrelated one must not leave the old pairing listed
@@ -1235,8 +1315,26 @@ def test_devices_redeem_failed_restore_keeps_token(
     assert code == 1
     assert "disk full" in capsys.readouterr().err
     # The new identity stayed installed (the restore failed), so the
-    # bundle must still be refused as already redeemed.
+    # token must be kept — releasing it would let the same bundle be
+    # redeemed again (see #716).  The retry still completes the
+    # pairing status for the identity now installed (see #718);
+    # keeping the token is what a further redeem must refuse.
     assert _destination(node_b, capsys) == _destination(node_a, capsys)
+    destination_a = _destination(node_a, capsys)
+    code = cli.main(
+        [
+            "devices",
+            "redeem",
+            "--from",
+            str(bundle_path),
+            "--data-dir",
+            str(node_b),
+            "--force",
+        ]
+    )
+    assert code == 0
+    assert cli.main(["devices", "list", "--data-dir", str(node_b)]) == 0
+    assert f"paired from: {destination_a}" in capsys.readouterr().out
     code = cli.main(
         [
             "devices",
