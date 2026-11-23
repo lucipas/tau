@@ -212,6 +212,42 @@ def test_registry_reset_keeps_redeemed_tokens(tmp_path):
     assert registry.paired_from is None
 
 
+def test_registry_reset_keeps_offers_owned_by_new_identity(tmp_path):
+    # A stranded-pairing retry completes a pending reset (#732):
+    # offers minted by the identity being installed survive; offers
+    # minted by the replaced identity go.  A plain reset with no
+    # owner still drops every offer.
+    import time
+
+    now = time.time()
+    registry = DeviceRegistry(tmp_path / "devices.json")
+    registry.record_issued("a" * 32, now - 300.0, now + 3600.0, owner="1" * 32)
+    registry.record_issued("b" * 32, now - 100.0, now + 3600.0, owner="2" * 32)
+    registry.record_issued("c" * 32, now + 60.0, now + 3600.0, owner="2" * 32)
+    registry.reset(now=now + 120.0, keep_offers_owned_by="2" * 32)
+    offers = registry.issued_offers(now=now)
+    assert [offer["token"] for offer in offers] == ["b" * 32, "c" * 32]
+    registry.reset(now=now + 120.0)
+    assert registry.issued_offers(now=now) == []
+
+
+def test_registry_reset_owner_scope_ignores_clock_rollback(tmp_path):
+    # The owner decides which offers survive, not wall-clock order: an
+    # offer minted by the new identity after the clock moved backward
+    # (so its created_at predates the failed redeem) is still kept, and
+    # an offer without a recorded owner is dropped.
+    import time
+
+    now = time.time()
+    registry = DeviceRegistry(tmp_path / "devices.json")
+    registry.record_issued("a" * 32, now - 500.0, now + 3600.0, owner="1" * 32)
+    registry.record_issued("b" * 32, now - 1000.0, now + 3600.0, owner="2" * 32)
+    registry.record_issued("c" * 32, now - 2000.0, now + 3600.0)
+    registry.reset(now=now + 120.0, keep_offers_owned_by="2" * 32)
+    offers = registry.issued_offers(now=now)
+    assert [offer["token"] for offer in offers] == ["b" * 32]
+
+
 def test_registry_prunes_expired_offers(tmp_path):
     registry = DeviceRegistry(tmp_path / "devices.json")
     registry.record_issued("a" * 32, 1000.0, 1060.0)
@@ -1293,7 +1329,7 @@ def test_devices_redeem_failed_restore_keeps_token(
     )
     capsys.readouterr()
 
-    def _fail_reset(self, *, now=None):
+    def _fail_reset(self, *, now=None, keep_offers_owned_by=None):
         raise OSError("disk full")
 
     def _fail_restore(*args, **kwargs):
@@ -1401,11 +1437,11 @@ def test_devices_redeem_retry_clears_stale_offers_after_failed_reset(
     original_reset = DeviceRegistry.reset
     calls = []
 
-    def _fail_first_reset(self, *, now=None):
+    def _fail_first_reset(self, *, now=None, keep_offers_owned_by=None):
         calls.append(1)
         if len(calls) == 1:
             raise OSError("disk full")
-        return original_reset(self, now=now)
+        return original_reset(self, now=now, keep_offers_owned_by=keep_offers_owned_by)
 
     def _fail_restore(*args, **kwargs):
         raise OSError("disk full")
@@ -1450,6 +1486,117 @@ def test_devices_redeem_retry_clears_stale_offers_after_failed_reset(
     out = capsys.readouterr().out
     assert "no pairing offers issued" in out
     assert f"paired from: {destination_a}" in out
+
+
+def test_devices_redeem_retry_keeps_offers_minted_after_failed_attempt(
+    tmp_path, capsys, monkeypatch
+):
+    # A failed reset followed by a failed identity rollback leaves
+    # the old identity's issued offers in place (see #728).  The node
+    # then serves as the new identity, so an offer minted before the
+    # retry belongs to the new identity: the pending reset the retry
+    # completes must drop only the old identity's offers and keep
+    # the new one (see #732).
+    node_a = _init_node(tmp_path, "a", "alice")
+    node_b = _init_node(tmp_path, "b", "bob")
+    capsys.readouterr()
+    destination_a = _destination(node_a, capsys)
+    # Bob issues an offer as his own identity first.
+    offer_path = tmp_path / "bob-offer.json"
+    assert (
+        cli.main(
+            ["devices", "pair", "--to", str(offer_path), "--data-dir", str(node_b)]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    bundle_path = tmp_path / "pairing.json"
+    assert (
+        cli.main(
+            ["devices", "pair", "--to", str(bundle_path), "--data-dir", str(node_a)]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    original_reset = DeviceRegistry.reset
+    calls = []
+
+    def _fail_first_reset(self, *, now=None, keep_offers_owned_by=None):
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError("disk full")
+        return original_reset(
+            self, now=now, keep_offers_owned_by=keep_offers_owned_by
+        )
+
+    def _fail_restore(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(DeviceRegistry, "reset", _fail_first_reset)
+    monkeypatch.setattr(cli, "atomic_write_bytes", _fail_restore)
+    code = cli.main(
+        [
+            "devices",
+            "redeem",
+            "--from",
+            str(bundle_path),
+            "--data-dir",
+            str(node_b),
+            "--force",
+        ]
+    )
+    assert code == 1
+    assert "disk full" in capsys.readouterr().err
+    # Alice's identity is installed, but Bob's offer is still listed.
+    assert _destination(node_b, capsys) == destination_a
+    assert cli.main(["devices", "list", "--data-dir", str(node_b)]) == 0
+    out = capsys.readouterr().out
+    assert "pairing offers issued: 1" in out
+    assert "paired from:" not in out
+
+    # Mint an offer as the new identity before retrying: the node
+    # serves as Alice now, so this offer is hers.
+    new_offer_path = tmp_path / "alice-offer.json"
+    assert (
+        cli.main(
+            ["devices", "pair", "--to", str(new_offer_path), "--data-dir", str(node_b)]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert cli.main(["devices", "list", "--data-dir", str(node_b)]) == 0
+    out = capsys.readouterr().out
+    assert "pairing offers issued: 2" in out
+
+    # Retry: the pending reset drops Bob's stale offer but keeps
+    # Alice's, and the pairing is recorded for the new identity.
+    code = cli.main(
+        [
+            "devices",
+            "redeem",
+            "--from",
+            str(bundle_path),
+            "--data-dir",
+            str(node_b),
+            "--force",
+        ]
+    )
+    assert code == 0
+    assert cli.main(["devices", "list", "--data-dir", str(node_b)]) == 0
+    out = capsys.readouterr().out
+    assert "pairing offers issued: 1" in out
+    assert f"paired from: {destination_a}" in out
+
+    # The surviving offer is Alice's (minted by the new identity), not
+    # Bob's stale one.
+    surviving = DeviceRegistry(node_b / "devices.json").issued_offers()
+    assert [offer["token"] for offer in surviving] == [
+        json.loads(new_offer_path.read_text(encoding="utf-8"))["token"]
+    ]
+    assert json.loads(offer_path.read_text(encoding="utf-8"))["token"] not in {
+        offer["token"] for offer in surviving
+    }
 
 
 def test_devices_redeem_retry_clears_stale_pairing_after_failed_reset(
@@ -1506,11 +1653,11 @@ def test_devices_redeem_retry_clears_stale_pairing_after_failed_reset(
     original_reset = DeviceRegistry.reset
     calls = []
 
-    def _fail_first_reset(self, *, now=None):
+    def _fail_first_reset(self, *, now=None, keep_offers_owned_by=None):
         calls.append(1)
         if len(calls) == 1:
             raise OSError("disk full")
-        return original_reset(self, now=now)
+        return original_reset(self, now=now, keep_offers_owned_by=keep_offers_owned_by)
 
     def _fail_restore(*args, **kwargs):
         raise OSError("disk full")
@@ -1590,7 +1737,7 @@ def test_devices_import_corrupt_registry_rolls_back_identity(
     )
     capsys.readouterr()
 
-    def _fail_reset(self, *, now=None):
+    def _fail_reset(self, *, now=None, keep_offers_owned_by=None):
         raise DevicesError("device registry corrupt")
 
     monkeypatch.setattr(cli.DeviceRegistry, "reset", _fail_reset)

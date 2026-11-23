@@ -297,6 +297,13 @@ class DeviceRegistry:
                     "token": _clean_hex(entry.get("token"), "token"),
                     "created_at": _clean_time(entry.get("created_at"), "created_at"),
                     "expires_at": _clean_time(entry.get("expires_at"), "expires_at"),
+                    # Offers recorded before owners were tracked have no
+                    # owner and are dropped by an owner-scoped reset.
+                    "owner": (
+                        None
+                        if entry.get("owner") is None
+                        else _clean_hex(entry.get("owner"), "owner")
+                    ),
                 }
             )
         return cleaned
@@ -410,7 +417,12 @@ class DeviceRegistry:
         return dict(self._paired_from) if self._paired_from is not None else None
 
     def record_issued(
-        self, token: str, created_at: float, expires_at: float
+        self,
+        token: str,
+        created_at: float,
+        expires_at: float,
+        *,
+        owner: Optional[str] = None,
     ) -> None:
         """Remember an offer this node minted; expired ones are pruned.
 
@@ -419,6 +431,10 @@ class DeviceRegistry:
         ``tau devices list`` (see #714).  Offers are rare human
         actions and each record is a few dozen bytes, so the list
         cannot grow without bound in practice.
+
+        *owner* is the primary hash of the identity that minted the
+        offer, so a later reset can tell which identity issued it
+        without relying on wall-clock timestamps (see #732).
         """
         with self._transaction():
             moment = time.time()
@@ -430,6 +446,7 @@ class DeviceRegistry:
                     "token": _clean_hex(token, "token"),
                     "created_at": float(created_at),
                     "expires_at": float(expires_at),
+                    "owner": None if owner is None else _clean_hex(owner, "owner"),
                 }
             )
 
@@ -505,7 +522,12 @@ class DeviceRegistry:
                 if entry["token"] == cleaned_token:
                     entry["paired"] = True
 
-    def reset(self, *, now: Optional[float] = None) -> None:
+    def reset(
+        self,
+        *,
+        now: Optional[float] = None,
+        keep_offers_owned_by: Optional[str] = None,
+    ) -> None:
         """Drop the pairing records tied to the replaced identity.
 
         Issued offers and the pairing itself belong to the identity
@@ -519,10 +541,30 @@ class DeviceRegistry:
         would let the same bundle be redeemed again with ``--force``
         after the swap (see #716).  Only expired tokens are pruned,
         the same rule :meth:`record_redeemed` applies.
+
+        *keep_offers_owned_by* is only for the pending reset a
+        stranded-pairing retry completes (see #732): after a failed
+        redeem the node already serves as the new identity, so offers
+        minted by that identity (matched on the recorded ``owner``)
+        are kept and every other offer is dropped.  Ownership is
+        recorded at mint time, so a clock rollback cannot move an
+        offer across the cutoff.  Offers without a recorded owner are
+        dropped.  A plain swap (``tau id import`` or a first redeem)
+        passes no owner and drops every offer.
         """
         moment = time.time() if now is None else float(now)
+        owner = (
+            None
+            if keep_offers_owned_by is None
+            else _clean_hex(keep_offers_owned_by, "keep_offers_owned_by")
+        )
         with self._transaction():
-            self._issued = []
+            if owner is None:
+                self._issued = []
+            else:
+                self._issued = [
+                    entry for entry in self._issued if entry.get("owner") == owner
+                ]
             self._redeemed = [
                 entry for entry in self._redeemed if entry["expires_at"] > moment
             ]
