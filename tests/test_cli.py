@@ -4093,6 +4093,48 @@ def test_id_import_registry_save_failure_aborts_replacement(
     assert code == 1
     assert "identity not replaced" in capsys.readouterr().err
     assert _id_destination(node_a, capsys) == destination_a
+
+
+def test_id_import_registry_reset_failure_restores_identity(
+    tmp_path, capsys, monkeypatch
+):
+    node_a = _init_node(tmp_path, "a", "alice")
+    capsys.readouterr()
+    destination_a = _id_destination(node_a, capsys)
+
+    node_b = _init_node(tmp_path, "b", "carol")
+    capsys.readouterr()
+    destination_b = _id_destination(node_b, capsys)
+    backup = tmp_path / "carol.identity"
+    assert (
+        cli.main(
+            ["id", "export", "--to", str(backup), "--data-dir", str(node_b), "--json"]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    # The pairing reset fails after the new identity was written: the
+    # previous identity must be restored rather than left mismatched
+    # with the still-present pairing records.
+    def _fail_reset(self, *, now=None):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(cli.DeviceRegistry, "reset", _fail_reset)
+    code = cli.main(
+        [
+            "id",
+            "import",
+            "--from",
+            str(backup),
+            "--data-dir",
+            str(node_a),
+            "--force",
+        ]
+    )
+    assert code != 0
+    assert _id_destination(node_a, capsys) == destination_a
+    assert destination_a != destination_b
     assert PeerRegistry(config_a.peers_path).get("bob").is_verified
 
 

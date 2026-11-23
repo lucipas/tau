@@ -152,6 +152,7 @@ from .devices import (
 )
 from .doctor import all_ok, run_checks
 from .identity import (
+    IDENTITY_FILE_MODE,
     IdentityError,
     _identity_lock,
     destination_hash,
@@ -13706,9 +13707,7 @@ def cmd_id_import(args: argparse.Namespace) -> int:
             # records intact (see #716).
             registry = DeviceRegistry(config.devices_path)
             reset_devices = _devices_reset_needed(config, identity)
-            save_identity(identity, config.identity_path)
-            if reset_devices:
-                registry.reset()
+            _install_identity_and_reset(config, identity, registry, reset_devices)
     finally:
         lock.release()
     payload = {
@@ -13729,6 +13728,56 @@ def cmd_id_import(args: argparse.Namespace) -> int:
                 "(local identity changed; re-verify peers)"
             )
     return _EXIT_OK
+
+
+def _install_identity_and_reset(
+    config: TauConfig,
+    identity: Any,
+    registry: DeviceRegistry,
+    reset_devices: bool,
+    redeemed_token: Optional[str] = None,
+) -> None:
+    """Install *identity*, then apply the pairing reset, rolling back on failure.
+
+    If either the identity write or the registry reset raises an
+    ``OSError``, the previous identity file is restored (or removed when
+    there was none) so the identity and pairing records stay consistent.
+    For a redeem, the token recorded for this bundle is also dropped so
+    the same bundle can be retried.
+    """
+    previous = (
+        config.identity_path.read_bytes()
+        if config.identity_path.exists()
+        else None
+    )
+    try:
+        save_identity(identity, config.identity_path)
+        if reset_devices:
+            registry.reset()
+    except OSError:
+        try:
+            if previous is None:
+                if config.identity_path.exists():
+                    config.identity_path.unlink()
+            else:
+                atomic_write_bytes(
+                    config.identity_path, previous, mode=IDENTITY_FILE_MODE
+                )
+        except OSError as restore_exc:
+            log.warning(
+                "Could not restore the previous identity at %s: %s",
+                config.identity_path,
+                restore_exc,
+            )
+        if redeemed_token is not None:
+            try:
+                registry.forget_redeemed(redeemed_token)
+            except OSError as forget_exc:
+                log.warning(
+                    "Could not release the redeemed pairing token: %s",
+                    forget_exc,
+                )
+        raise
 
 
 def _clear_verifications_for_identity_change(
@@ -13941,9 +13990,13 @@ def cmd_devices_redeem(args: argparse.Namespace) -> int:
             registry.record_redeemed(
                 bundle["token"], bundle["primary"], bundle["expires_at"]
             )
-            save_identity(identity, config.identity_path)
-            if reset_devices:
-                registry.reset()
+            _install_identity_and_reset(
+                config,
+                identity,
+                registry,
+                reset_devices,
+                redeemed_token=bundle["token"],
+            )
             try:
                 registry.record_paired_from(bundle["token"], bundle["primary"])
             except OSError as exc:

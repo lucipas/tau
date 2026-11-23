@@ -449,6 +449,18 @@ class DeviceRegistry:
                 }
             )
 
+    def forget_redeemed(self, token: str) -> None:
+        """Drop a redeemed-token record that was written for a redeem which then failed.
+
+        Only used to roll back :meth:`record_redeemed` when the identity
+        swap could not be completed, so the bundle can be retried.
+        """
+        wanted = token.lower()
+        with self._transaction():
+            self._redeemed = [
+                entry for entry in self._redeemed if entry["token"] != wanted
+            ]
+
     def record_paired_from(
         self, token: str, primary: str, *, now: Optional[float] = None
     ) -> None:
