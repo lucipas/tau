@@ -1,7 +1,8 @@
-"""Tests for linked-device pairing (slice 1 of #469, #713)."""
+"""Tests for linked-device pairing (slices 1–2 of #469, #713/#736)."""
 
 from __future__ import annotations
 
+import base64
 import io
 import json
 import os
@@ -16,15 +17,20 @@ from tau.config import TauConfig
 from tau.devices import (
     DEFAULT_PAIRING_TTL_SECONDS,
     MAX_PAIRING_BUNDLE_BYTES,
+    MAX_PAIRING_HISTORY_BYTES,
+    MAX_PAIRING_HISTORY_MESSAGES,
     MAX_PAIRING_TTL_SECONDS,
     DeviceRegistry,
     DevicesError,
     build_pairing_bundle,
+    snapshot_pairing_history,
     verify_pairing_bundle,
 )
 from tau.identity import IdentityError, destination_hash, load_or_create_identity
+from tau.inbox import INBOX_EXPORT_FORMAT, INBOX_EXPORT_VERSION, Inbox
 from tau.node import InstanceLock
 from tau.peers import PUBLIC_KEY_BYTES, PeerRegistry
+from tau.protocol import encode
 
 
 def _identity():
@@ -40,7 +46,7 @@ def _tampered(bundle, field, value):
 def test_pairing_bundle_roundtrip():
     identity = _identity()
     bundle = build_pairing_bundle(identity, ttl_seconds=600, now=1000.0)
-    assert bundle["v"] == 1
+    assert bundle["v"] == 2
     assert bundle["type"] == "tau-pairing"
     assert bundle["primary"] == destination_hash(identity).hex()
     assert bundle["created_at"] == 1000.0
@@ -107,7 +113,7 @@ def test_pairing_bundle_wrong_version_or_type_rejected():
     identity = _identity()
     bundle = build_pairing_bundle(identity, now=1000.0)
     with pytest.raises(DevicesError, match="version"):
-        verify_pairing_bundle(_tampered(bundle, "v", 2), now=1100.0)
+        verify_pairing_bundle(_tampered(bundle, "v", 3), now=1100.0)
     with pytest.raises(DevicesError, match="type"):
         verify_pairing_bundle(_tampered(bundle, "type", "other"), now=1100.0)
 
@@ -135,6 +141,193 @@ def test_pairing_bundle_oversize_identity_rejected():
         verify_pairing_bundle(
             _tampered(bundle, "identity", "A" * 70000), now=1100.0
         )
+
+
+def _message(text, *, msg_id, sent_at=1000.0, **extra):
+    record = {
+        "from": "peer",
+        "destination": "a" * 32,
+        "text": text,
+        "sent_at": sent_at,
+        "received_at": sent_at + 1,
+        "id": msg_id,
+        "direction": "in",
+    }
+    record.update(extra)
+    return record
+
+
+def _history_doc(messages):
+    return {
+        "format": INBOX_EXPORT_FORMAT,
+        "version": INBOX_EXPORT_VERSION,
+        "exported_at": 1000.0,
+        "messages": messages,
+    }
+
+
+def _resign(identity, bundle):
+    """Re-sign a mutated bundle, so verify judges the content, not the signature."""
+    unsigned = {key: value for key, value in bundle.items() if key != "sig"}
+    signature = identity.sign(encode(unsigned))
+    assert signature is not None
+    return {**unsigned, "sig": base64.b64encode(signature).decode("ascii")}
+
+
+def test_pairing_bundle_roundtrip_with_history():
+    identity = _identity()
+    history = _history_doc(
+        [_message("hello", msg_id="m1"), _message("again", msg_id="m2")]
+    )
+    bundle = build_pairing_bundle(
+        identity, ttl_seconds=600, now=1000.0, history=history
+    )
+    assert bundle["v"] == 2
+    _, cleaned = verify_pairing_bundle(bundle, now=1200.0)
+    assert cleaned["history"]["messages"] == history["messages"]
+    assert cleaned["history"]["format"] == INBOX_EXPORT_FORMAT
+
+
+def test_pairing_bundle_tampered_history_rejected():
+    identity = _identity()
+    history = _history_doc([_message("hello", msg_id="m1")])
+    bundle = build_pairing_bundle(identity, now=1000.0, history=history)
+    tampered = json.loads(json.dumps(bundle))
+    tampered["history"]["messages"][0]["text"] = "forged"
+    with pytest.raises(DevicesError, match="signature does not verify"):
+        verify_pairing_bundle(tampered, now=1100.0)
+
+
+def test_pairing_bundle_v1_still_verifies():
+    # A bundle minted before history existed (version 1, no history
+    # key) redeems unchanged; its signature covers the version-1
+    # payload only.
+    identity = _identity()
+    minted = build_pairing_bundle(identity, ttl_seconds=600, now=1000.0)
+    unsigned_v1 = {
+        "v": 1,
+        "type": "tau-pairing",
+        "token": minted["token"],
+        "primary": minted["primary"],
+        "created_at": 1000.0,
+        "expires_at": 1600.0,
+        "identity": minted["identity"],
+    }
+    signature = identity.sign(encode(unsigned_v1))
+    assert signature is not None
+    bundle_v1 = {
+        **unsigned_v1,
+        "sig": base64.b64encode(signature).decode("ascii"),
+    }
+    recovered, cleaned = verify_pairing_bundle(bundle_v1, now=1200.0)
+    assert cleaned["v"] == 1
+    assert cleaned["history"] is None
+    assert destination_hash(recovered).hex() == minted["primary"]
+
+
+def test_pairing_bundle_v1_with_history_rejected():
+    identity = _identity()
+    minted = build_pairing_bundle(identity, ttl_seconds=600, now=1000.0)
+    unsigned_v1 = {
+        "v": 1,
+        "type": "tau-pairing",
+        "token": minted["token"],
+        "primary": minted["primary"],
+        "created_at": 1000.0,
+        "expires_at": 1600.0,
+        "identity": minted["identity"],
+        "history": _history_doc([_message("hello", msg_id="m1")]),
+    }
+    signature = identity.sign(encode(unsigned_v1))
+    assert signature is not None
+    bundle_v1 = {
+        **unsigned_v1,
+        "sig": base64.b64encode(signature).decode("ascii"),
+    }
+    with pytest.raises(DevicesError, match="version 1 must not carry history"):
+        verify_pairing_bundle(bundle_v1, now=1200.0)
+
+
+def test_pairing_bundle_history_over_caps_rejected():
+    identity = _identity()
+    too_many = _history_doc(
+        [
+            _message(f"m{i}", msg_id=f"m{i}", sent_at=1000.0 + i)
+            for i in range(MAX_PAIRING_HISTORY_MESSAGES + 1)
+        ]
+    )
+    with pytest.raises(DevicesError, match="too many messages"):
+        build_pairing_bundle(identity, now=1000.0, history=too_many)
+    too_big = _history_doc([_message("x" * 300 * 1024, msg_id="big")])
+    with pytest.raises(DevicesError, match="too large"):
+        build_pairing_bundle(identity, now=1000.0, history=too_big)
+    # The same caps hold at verify time for a bundle signed by hand:
+    # a valid signature over an over-cap snapshot must not redeem.
+    bundle = build_pairing_bundle(
+        identity,
+        now=1000.0,
+        history=_history_doc([_message("hello", msg_id="m1")]),
+    )
+    oversize = _resign(identity, _tampered(bundle, "history", too_many))
+    with pytest.raises(DevicesError, match="too many messages"):
+        verify_pairing_bundle(oversize, now=1100.0)
+
+
+def test_snapshot_pairing_history_drops_files_and_caps():
+    file_record = {
+        "kind": "file",
+        "from": "peer",
+        "destination": "a" * 32,
+        "name": "photo.jpg",
+        "size": 10,
+        "sha256": "e" * 64,
+        "path": "/tmp/photo.jpg",
+        "sent_at": 1001.0,
+        "received_at": 1002.0,
+        "id": "f1",
+    }
+    messages = [
+        _message("old", msg_id="m1", sent_at=1000.0),
+        file_record,
+        _message("new", msg_id="m2", sent_at=1002.0),
+    ]
+    snapshot = snapshot_pairing_history(_history_doc(messages))
+    assert snapshot is not None
+    assert [entry["id"] for entry in snapshot["messages"]] == ["m1", "m2"]
+    # The message cap keeps the newest; the file record never counts.
+    snapshot = snapshot_pairing_history(_history_doc(messages), max_messages=1)
+    assert [entry["id"] for entry in snapshot["messages"]] == ["m2"]
+    # The byte cap drops the oldest until the snapshot fits: one
+    # record serializes to ~150 bytes, so a 200-byte budget keeps
+    # only the small one.
+    big = _message("x" * 1000, msg_id="big", sent_at=1000.0)
+    small = _message("y", msg_id="small", sent_at=1001.0)
+    snapshot = snapshot_pairing_history(
+        _history_doc([big, small]), max_bytes=200
+    )
+    assert [entry["id"] for entry in snapshot["messages"]] == ["small"]
+
+
+def test_snapshot_pairing_history_empty_is_none():
+    assert snapshot_pairing_history(None) is None
+    assert snapshot_pairing_history(_history_doc([])) is None
+    file_only = _history_doc(
+        [
+            {
+                "kind": "file",
+                "from": "peer",
+                "destination": "a" * 32,
+                "name": "photo.jpg",
+                "size": 10,
+                "sha256": "e" * 64,
+                "path": "/tmp/photo.jpg",
+                "sent_at": 1001.0,
+                "received_at": 1002.0,
+                "id": "f1",
+            }
+        ]
+    )
+    assert snapshot_pairing_history(file_only) is None
 
 
 def test_registry_records_issued_and_redeemed(tmp_path):
@@ -271,6 +464,12 @@ def test_parser_devices_subcommands():
     assert str(pair.to) == "/tmp/bundle"
     assert pair.ttl == DEFAULT_PAIRING_TTL_SECONDS
     assert pair.force is False
+    assert pair.no_history is False
+
+    no_history = parser.parse_args(
+        ["devices", "pair", "--to", "/tmp/bundle", "--no-history"]
+    )
+    assert no_history.no_history is True
 
     redeem = parser.parse_args(
         ["devices", "redeem", "--from", "/tmp/bundle", "--force"]
@@ -359,6 +558,162 @@ def test_devices_pair_redeem_round_trip(tmp_path, capsys):
     assert "pairing offers issued: 1" in capsys.readouterr().out
     assert cli.main(["devices", "list", "--data-dir", str(node_b)]) == 0
     assert f"paired from: {destination_a}" in capsys.readouterr().out
+
+
+def _seed_history(node):
+    """Three messages and a file record in *node*'s inbox."""
+    inbox = Inbox(node / "inbox.json")
+    inbox.append(
+        {
+            "from": "peer",
+            "destination": "a" * 32,
+            "text": "hello from a peer",
+            "sent_at": 1000.0,
+            "received_at": 1001.0,
+            "id": "msg-1",
+            "direction": "in",
+        }
+    )
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": "b" * 32,
+            "text": "my reply",
+            "sent_at": 1002.0,
+            "received_at": 1003.0,
+            "id": "msg-2",
+            "direction": "out",
+        }
+    )
+    inbox.append(
+        {
+            "from": "peer",
+            "destination": "c" * 32,
+            "text": "group hello",
+            "sent_at": 1004.0,
+            "received_at": 1005.0,
+            "id": "msg-3",
+            "direction": "in",
+            "kind": "group",
+            "group": "d" * 32,
+            "group_name": "test group",
+        }
+    )
+    inbox.append(
+        {
+            "kind": "file",
+            "from": "peer",
+            "destination": "a" * 32,
+            "name": "photo.jpg",
+            "size": 10,
+            "sha256": "e" * 64,
+            "path": "/tmp/photo.jpg",
+            "sent_at": 1006.0,
+            "received_at": 1007.0,
+            "id": "msg-4",
+            "direction": "in",
+        }
+    )
+
+
+def test_devices_pair_redeem_carries_history(tmp_path, capsys):
+    node_a = _init_node(tmp_path, "a", "alice")
+    _seed_history(node_a)
+    capsys.readouterr()
+
+    bundle_path = tmp_path / "pairing.json"
+    assert (
+        cli.main(
+            [
+                "devices",
+                "pair",
+                "--to",
+                str(bundle_path),
+                "--data-dir",
+                str(node_a),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    # Three messages ride the bundle; the file record does not.
+    assert payload["history_messages"] == 3
+
+    node_b = tmp_path / "b"
+    assert (
+        cli.main(
+            [
+                "devices",
+                "redeem",
+                "--from",
+                str(bundle_path),
+                "--data-dir",
+                str(node_b),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["history"] == {
+        "imported": 3,
+        "present": 0,
+        "skipped": 0,
+        "errors": [],
+    }
+    inbox_b = Inbox(node_b / "inbox.json")
+    stored = inbox_b.list_messages(direction=None)
+    assert [entry["text"] for entry in stored] == [
+        "group hello",
+        "my reply",
+        "hello from a peer",
+    ]
+    assert all(entry.get("kind") != "file" for entry in stored)
+
+
+def test_devices_pair_no_history_mints_identity_only(tmp_path, capsys):
+    node_a = _init_node(tmp_path, "a", "alice")
+    _seed_history(node_a)
+    capsys.readouterr()
+
+    bundle_path = tmp_path / "pairing.json"
+    assert (
+        cli.main(
+            [
+                "devices",
+                "pair",
+                "--to",
+                str(bundle_path),
+                "--no-history",
+                "--data-dir",
+                str(node_a),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["history_messages"] == 0
+
+    node_b = tmp_path / "b"
+    assert (
+        cli.main(
+            [
+                "devices",
+                "redeem",
+                "--from",
+                str(bundle_path),
+                "--data-dir",
+                str(node_b),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert "history" not in payload
+    assert len(Inbox(node_b / "inbox.json")) == 0
 
 
 def test_devices_pair_refuses_existing_bundle_without_force(tmp_path, capsys):

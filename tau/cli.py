@@ -148,6 +148,7 @@ from .devices import (
     DeviceRegistry,
     DevicesError,
     build_pairing_bundle,
+    snapshot_pairing_history,
     verify_pairing_bundle,
 )
 from .doctor import all_ok, run_checks
@@ -1784,6 +1785,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help="overwrite an existing bundle file",
+    )
+    devices_pair.add_argument(
+        "--no-history",
+        action="store_true",
+        help="mint the bundle without a history snapshot",
     )
     devices_pair.set_defaults(func=cmd_devices_pair)
     devices_redeem = devices_sub.add_parser(
@@ -13979,12 +13985,14 @@ def _devices_reset_needed(config: TauConfig, identity: Any) -> bool:
 
 
 def cmd_devices_pair(args: argparse.Namespace) -> int:
-    """Mint a pairing bundle for a second device (slice 1 of #469, #713).
+    """Mint a pairing bundle for a second device (slices 1–2 of #469, #713/#736).
 
     The bundle carries the private identity, so it is written
     owner-only and the user is told to treat it like an identity
     backup: anyone holding it can adopt this identity until it
-    expires.
+    expires.  By default it also carries a bounded snapshot of the
+    inbox, so the second device catches up history on redeem
+    (slice 2, #736); ``--no-history`` mints an identity-only bundle.
     """
     config = _make_config(args)
     # Only the data directory (which holds the instance-lock file) is
@@ -14036,7 +14044,20 @@ def cmd_devices_pair(args: argparse.Namespace) -> int:
             raise NodeError(
                 f"pairing bundle already exists at {target}; pass --force to overwrite it"
             )
-        bundle = build_pairing_bundle(identity, ttl_seconds=float(args.ttl))
+        # Snapshot the inbox while the instance lock is held, so no
+        # serving node can append mid-export: the snapshot is the
+        # newest messages up to the pairing caps, oldest-first so
+        # the redeem replays them in order (see #736).  A missing or
+        # empty inbox snapshots to nothing, and --no-history skips
+        # the read entirely.
+        history = None
+        if not getattr(args, "no_history", False):
+            history = snapshot_pairing_history(
+                Inbox(config.inbox_path).export_document()
+            )
+        bundle = build_pairing_bundle(
+            identity, ttl_seconds=float(args.ttl), history=history
+        )
         # Load the registry before publishing the bundle: a corrupt
         # registry must fail the command while no file exists, not leave a
         # redeemable bundle on disk that `tau devices list` cannot see.
@@ -14104,6 +14125,9 @@ def cmd_devices_pair(args: argparse.Namespace) -> int:
         "destination": destination_hash(identity).hex(),
         "identity": identity.hexhash,
         "expires_at": bundle["expires_at"],
+        "history_messages": (
+            len(history["messages"]) if history is not None else 0
+        ),
         "path": str(target),
     }
     if _json_mode(args):
@@ -14112,6 +14136,7 @@ def cmd_devices_pair(args: argparse.Namespace) -> int:
         print(f"identity:    {payload['identity']}")
         print(f"destination: {payload['destination']}")
         print(f"bundle:      {payload['path']}")
+        print(f"history:     {payload['history_messages']} messages")
         print(f"expires:     {expires}")
         print(
             "keep this file private: anyone holding it can adopt this "
@@ -14212,7 +14237,12 @@ def _recover_stranded_pairing(
 
 
 def cmd_devices_redeem(args: argparse.Namespace) -> int:
-    """Adopt the identity in a pairing bundle (slice 1 of #469, #713)."""
+    """Adopt the identity in a pairing bundle (slices 1–2 of #469, #713/#736).
+
+    A bundle carrying a history snapshot imports it into this
+    device's inbox after the identity is installed, so the second
+    device catches up recent history on first connect (slice 2).
+    """
     config = _make_config(args)
     source = Path(args.from_path).expanduser()
     if not source.exists():
@@ -14331,6 +14361,29 @@ def cmd_devices_redeem(args: argparse.Namespace) -> int:
                     ) from exc
     finally:
         lock.release()
+    # Import the history snapshot, if the bundle carries one: the
+    # import dedupes against what is already stored and skips
+    # invalid records with their errors recorded, and it never fails
+    # the redeem — the identity is already installed, so a history
+    # failure is a warning plus a count, not a rolled-back pairing
+    # (see #736).  This runs for a fresh redeem and for a stranded
+    # retry alike, so a pairing whose record failed to persist the
+    # first time still catches up its history.
+    history_result = None
+    history = bundle.get("history")
+    if history is not None:
+        try:
+            history_result = Inbox(config.inbox_path).import_messages(history)
+        except Exception as exc:
+            log.warning("Could not import pairing history: %s", exc)
+            history_result = {
+                "imported": 0,
+                "present": 0,
+                "skipped": 0,
+                "errors": [
+                    {"id": None, "error": f"history import failed: {exc}"}
+                ],
+            }
     payload = {
         "destination": destination_hash(identity).hex(),
         "identity": identity.hexhash,
@@ -14338,6 +14391,8 @@ def cmd_devices_redeem(args: argparse.Namespace) -> int:
         "data_dir": str(config.data_dir),
         "verifications_cleared": verifications_cleared,
     }
+    if history_result is not None:
+        payload["history"] = history_result
     if _json_mode(args):
         _emit(payload, True)
     else:
@@ -14345,6 +14400,13 @@ def cmd_devices_redeem(args: argparse.Namespace) -> int:
         print(f"destination: {payload['destination']}")
         print(f"paired from: {payload['paired_from']}")
         print(f"data dir:    {payload['data_dir']}")
+        if history_result is not None:
+            print(
+                "history:     "
+                f"imported {history_result['imported']} messages "
+                f"({history_result['present']} already present, "
+                f"{history_result['skipped']} skipped)"
+            )
         if verifications_cleared:
             print(
                 f"verifications cleared: {verifications_cleared} "
