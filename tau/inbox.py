@@ -72,6 +72,11 @@ MAX_REACTIONS = 1000
 MAX_INBOX_SENT = 500
 
 
+def direction_capacity(direction: Any) -> int:
+    """How many records of *direction* the inbox retains."""
+    return MAX_INBOX_SENT if direction == "out" else MAX_INBOX
+
+
 def _retain(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Keep the newest ``MAX_INBOX`` received and ``MAX_INBOX_SENT`` sent records."""
     limits = {"in": MAX_INBOX, "out": MAX_INBOX_SENT}
@@ -2465,6 +2470,7 @@ class Inbox:
         is_retracted: Optional[Any] = None,
         is_group_retracted: Optional[Any] = None,
         pending_group_edit: Optional[Any] = None,
+        keep_existing: bool = False,
     ) -> Dict[str, Any]:
         """Merge every message in an export document into the inbox.
 
@@ -2519,6 +2525,14 @@ class Inbox:
         with self._transaction():
             previous = list(self._messages)
             seen = {_dedupe_key(item) for item in self._messages}
+            # With keep_existing, an entry that would push its direction
+            # past the cap is skipped instead of stored, so the retention
+            # pass (which keeps the newest by insertion order) can never
+            # evict a record that was already in the inbox.
+            used: Dict[Any, int] = {}
+            for item in self._messages:
+                direction = item.get("direction")
+                used[direction] = used.get(direction, 0) + 1
             for entry in entries:
                 record = _valid_record(entry)
                 if record is None:
@@ -2608,6 +2622,19 @@ class Inbox:
                         }
                     )
                     continue
+                direction = record.get("direction")
+                if keep_existing and used.get(direction, 0) >= direction_capacity(
+                    direction
+                ):
+                    skipped += 1
+                    errors.append(
+                        {
+                            "id": record.get("id"),
+                            "error": "inbox is full; newer messages were kept",
+                        }
+                    )
+                    continue
+                used[direction] = used.get(direction, 0) + 1
                 seen.add(key)
                 self._messages.append(record)
                 added.append(record)

@@ -298,10 +298,9 @@ def test_snapshot_pairing_history_drops_files_and_caps():
     # The message cap keeps the newest; the file record never counts.
     snapshot = snapshot_pairing_history(_history_doc(messages), max_messages=1)
     assert [entry["id"] for entry in snapshot["messages"]] == ["m2"]
-    # The byte cap drops the oldest until the snapshot fits: the
-    # measurement covers the whole document (metadata included, as
-    # _clean_history measures it), so one small record serializes to
-    # ~240 bytes and a 300-byte budget keeps only the small one.
+    # The byte cap drops the oldest until the snapshot fits.  The cap
+    # measures the whole document, envelope included, so one small
+    # record rides in ~240 bytes: a 300-byte budget keeps only it.
     big = _message("x" * 1000, msg_id="big", sent_at=1000.0)
     small = _message("y", msg_id="small", sent_at=1001.0)
     snapshot = snapshot_pairing_history(
@@ -672,6 +671,88 @@ def test_devices_pair_redeem_carries_history(tmp_path, capsys):
         "hello from a peer",
     ]
     assert all(entry.get("kind") != "file" for entry in stored)
+
+
+def test_devices_redeem_retry_reimports_missing_history(tmp_path, capsys):
+    # A pairing can complete with its history missing — the import
+    # never fails the redeem — so a retry of the same bundle must be
+    # allowed to re-import the snapshot instead of failing as a plain
+    # duplicate (see #736).  Once every snapshot record is stored,
+    # the next redeem is a duplicate again.
+    node_a = _init_node(tmp_path, "a", "alice")
+    _seed_history(node_a)
+    capsys.readouterr()
+
+    bundle_path = tmp_path / "pairing.json"
+    assert (
+        cli.main(
+            [
+                "devices",
+                "pair",
+                "--to",
+                str(bundle_path),
+                "--data-dir",
+                str(node_a),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    node_b = tmp_path / "b"
+    assert (
+        cli.main(
+            [
+                "devices",
+                "redeem",
+                "--from",
+                str(bundle_path),
+                "--data-dir",
+                str(node_b),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["history"]["imported"] == 3
+
+    # The history is lost on the second device; the same bundle must
+    # still redeem, importing only the missing snapshot.
+    inbox_b = Inbox(node_b / "inbox.json")
+    for msg_id in ("msg-1", "msg-2", "msg-3"):
+        inbox_b.delete(msg_id)
+    assert len(Inbox(node_b / "inbox.json")) == 0
+    assert (
+        cli.main(
+            [
+                "devices",
+                "redeem",
+                "--from",
+                str(bundle_path),
+                "--data-dir",
+                str(node_b),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["history"] == {
+        "imported": 3,
+        "present": 0,
+        "skipped": 0,
+        "errors": [],
+    }
+    assert payload["verifications_cleared"] == 0
+
+    # With the history back in place, the bundle is spent again.
+    code = cli.main(
+        ["devices", "redeem", "--from", str(bundle_path), "--data-dir", str(node_b)]
+    )
+    assert code == 1
+    assert "already redeemed" in capsys.readouterr().err
 
 
 def test_devices_pair_redeem_skips_retracted_history(tmp_path, capsys):
