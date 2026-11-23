@@ -1316,11 +1316,29 @@ def test_devices_redeem_failed_restore_keeps_token(
     assert "disk full" in capsys.readouterr().err
     # The new identity stayed installed (the restore failed), so the
     # token must be kept — releasing it would let the same bundle be
-    # redeemed again (see #716).  The retry still completes the
-    # pairing status for the identity now installed (see #718);
-    # keeping the token is what a further redeem must refuse.
+    # redeemed again (see #716).
     assert _destination(node_b, capsys) == _destination(node_a, capsys)
     destination_a = _destination(node_a, capsys)
+    # The retry cannot complete while the reset still fails: the
+    # recovery completes the pending reset before recording the
+    # pairing (see #718), and must not report success with the old
+    # identity's records still in place.
+    code = cli.main(
+        [
+            "devices",
+            "redeem",
+            "--from",
+            str(bundle_path),
+            "--data-dir",
+            str(node_b),
+            "--force",
+        ]
+    )
+    assert code == 1
+    assert "could not complete the pairing reset" in capsys.readouterr().err
+    # Once the failure clears, the retry completes the pairing; the
+    # token was kept throughout, so a further redeem is refused.
+    monkeypatch.undo()
     code = cli.main(
         [
             "devices",
@@ -1348,6 +1366,90 @@ def test_devices_redeem_failed_restore_keeps_token(
     )
     assert code == 1
     assert "already redeemed" in capsys.readouterr().err
+
+
+def test_devices_redeem_retry_clears_stale_offers_after_failed_reset(
+    tmp_path, capsys, monkeypatch
+):
+    # A failed reset followed by a failed identity rollback leaves
+    # the old identity's issued offers in place (Qodo Warning on
+    # #728): the retry must complete the pending reset before
+    # recording the pairing, or `devices list` would attribute the
+    # old offers to the new identity.
+    node_a = _init_node(tmp_path, "a", "alice")
+    node_b = _init_node(tmp_path, "b", "bob")
+    capsys.readouterr()
+    destination_a = _destination(node_a, capsys)
+    # Bob issues an offer as his own identity first.
+    offer_path = tmp_path / "bob-offer.json"
+    assert (
+        cli.main(
+            ["devices", "pair", "--to", str(offer_path), "--data-dir", str(node_b)]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    bundle_path = tmp_path / "pairing.json"
+    assert (
+        cli.main(
+            ["devices", "pair", "--to", str(bundle_path), "--data-dir", str(node_a)]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    original_reset = DeviceRegistry.reset
+    calls = []
+
+    def _fail_first_reset(self, *, now=None):
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError("disk full")
+        return original_reset(self, now=now)
+
+    def _fail_restore(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(DeviceRegistry, "reset", _fail_first_reset)
+    monkeypatch.setattr(cli, "atomic_write_bytes", _fail_restore)
+    code = cli.main(
+        [
+            "devices",
+            "redeem",
+            "--from",
+            str(bundle_path),
+            "--data-dir",
+            str(node_b),
+            "--force",
+        ]
+    )
+    assert code == 1
+    assert "disk full" in capsys.readouterr().err
+    # Alice's identity is installed, but Bob's offer is still listed.
+    assert _destination(node_b, capsys) == destination_a
+    assert cli.main(["devices", "list", "--data-dir", str(node_b)]) == 0
+    out = capsys.readouterr().out
+    assert "pairing offers issued: 1" in out
+    assert "paired from:" not in out
+
+    # Retry: the pending reset runs first, so the stale offer is
+    # gone and the pairing is recorded for the new identity.
+    code = cli.main(
+        [
+            "devices",
+            "redeem",
+            "--from",
+            str(bundle_path),
+            "--data-dir",
+            str(node_b),
+            "--force",
+        ]
+    )
+    assert code == 0
+    assert cli.main(["devices", "list", "--data-dir", str(node_b)]) == 0
+    out = capsys.readouterr().out
+    assert "no pairing offers issued" in out
+    assert f"paired from: {destination_a}" in out
 
 
 def test_devices_import_corrupt_registry_rolls_back_identity(
