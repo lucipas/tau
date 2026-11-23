@@ -709,6 +709,34 @@ def test_group_store_successor_falls_back_after_rename_lineage_cap(tmp_path):
     assert store.successor(first_id) == current
 
 
+def test_group_store_successor_walks_legacy_chain_past_lineage_cap(tmp_path):
+    # Qodo Warning on PR #710: a group renamed more than 32 times
+    # before family ids existed leaves no family id on its retired
+    # records, so the family fallback cannot link them — but the
+    # chain is still recoverable by walking renamed_from forward
+    # through the retired records, one link at a time.
+    store = GroupStore(tmp_path / "groups.json")
+    members = [OWN_HASH, OTHER_HASH, THIRD_HASH]
+    current = store.create("place-0", members, created_by=OWN_HASH)
+    first_id = current["id"]
+    for i in range(1, 41):
+        current = store.rename(current["id"], f"place-{i}", created_by=OWN_HASH)
+    assert first_id not in current["renamed_from"]
+    # Strip every family id, as if the whole chain predated them,
+    # then reload from disk.
+    path = tmp_path / "groups.json"
+    raw = json.loads(path.read_text())
+    for entry in raw["groups"] + raw["retired_groups"]:
+        entry.pop("family_id", None)
+    path.write_text(json.dumps(raw))
+    legacy = GroupStore(path)
+    assert legacy._groups[current["id"]].get("family_id") is None
+    found = legacy.successor(first_id)
+    assert found is not None
+    assert found["id"] == current["id"]
+    assert found["name"] == "place-40"
+
+
 def test_group_store_successor_fallback_ignores_same_timestamp_group(
     tmp_path, monkeypatch
 ):
