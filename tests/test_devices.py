@@ -1554,6 +1554,22 @@ def test_devices_redeem_retry_clears_stale_pairing_after_failed_reset(
     out = capsys.readouterr().out
     assert f"paired from: {destination_a}" in out
 
+    # A replay of the same bundle now carries the same token as the
+    # recorded pairing, so it must still be refused.
+    code = cli.main(
+        [
+            "devices",
+            "redeem",
+            "--from",
+            str(bundle_path),
+            "--data-dir",
+            str(node_b),
+            "--force",
+        ]
+    )
+    assert code == 1
+    assert "already redeemed" in capsys.readouterr().err
+
 
 def test_devices_import_corrupt_registry_rolls_back_identity(
     tmp_path, capsys, monkeypatch
