@@ -56,6 +56,7 @@ from .config import (
     ARCHIVED_FILE_NAME,
     AWAY_FILE_NAME,
     CHANNELS_DB_FILE_NAME,
+    DEVICES_FILE_NAME,
     DISAPPEARING_FILE_NAME,
     DM_REQUESTS_FILE_NAME,
     DRAFTS_FILE_NAME,
@@ -109,6 +110,7 @@ BACKUP_FILES = (
     SCHEDULED_FILES_FILE_NAME,
     "groups.json",
     "blocklist.json",
+    DEVICES_FILE_NAME,
     RNS_CONFIG_MEMBER,
 )
 
