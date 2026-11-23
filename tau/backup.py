@@ -109,6 +109,7 @@ BACKUP_FILES = (
     SCHEDULED_FILES_FILE_NAME,
     "groups.json",
     "blocklist.json",
+    DEVICES_FILE_NAME,
     RNS_CONFIG_MEMBER,
 )
 
