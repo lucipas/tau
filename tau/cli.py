@@ -13740,10 +13740,11 @@ def _install_identity_and_reset(
     """Install *identity*, then apply the pairing reset, rolling back on failure.
 
     If either the identity write or the registry reset raises an
-    ``OSError``, the previous identity file is restored (or removed when
-    there was none) so the identity and pairing records stay consistent.
-    For a redeem, the token recorded for this bundle is also dropped so
-    the same bundle can be retried.
+    ``OSError`` — or the identity write fails with an
+    ``IdentityError`` — the previous identity file is restored (or
+    removed when there was none) so the identity and pairing records
+    stay consistent.  For a redeem, the token recorded for this bundle
+    is also dropped so the same bundle can be retried.
     """
     previous = (
         config.identity_path.read_bytes()
@@ -13754,7 +13755,7 @@ def _install_identity_and_reset(
         save_identity(identity, config.identity_path)
         if reset_devices:
             registry.reset()
-    except OSError:
+    except (OSError, IdentityError):
         try:
             if previous is None:
                 if config.identity_path.exists():

@@ -19,7 +19,7 @@ from tau.devices import (
     build_pairing_bundle,
     verify_pairing_bundle,
 )
-from tau.identity import destination_hash, load_or_create_identity
+from tau.identity import IdentityError, destination_hash, load_or_create_identity
 
 
 def _identity():
@@ -777,6 +777,71 @@ def test_devices_import_failure_keeps_pairing_records(
     out = capsys.readouterr().out
     assert "pairing offers issued: 1" in out
     assert "paired from:" in out
+
+
+def test_devices_redeem_retry_after_failed_identity_write(
+    tmp_path, capsys, monkeypatch
+):
+    # A redeem whose identity write fails must not burn the bundle:
+    # the recorded token is released, so the same bundle can be
+    # retried once the write works (see #716).  `save_identity`
+    # raises IdentityError (not OSError) when the write itself fails,
+    # so the rollback must cover that too.
+    node_a = _init_node(tmp_path, "a", "alice")
+    node_b = _init_node(tmp_path, "b", "bob")
+    capsys.readouterr()
+    destination_b = _destination(node_b, capsys)
+    bundle_path = tmp_path / "pairing.json"
+    assert (
+        cli.main(
+            ["devices", "pair", "--to", str(bundle_path), "--data-dir", str(node_a)]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    real_save = cli.save_identity
+    calls = {"n": 0}
+
+    def _flaky_save(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise IdentityError("could not write identity")
+        return real_save(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "save_identity", _flaky_save)
+    code = cli.main(
+        [
+            "devices",
+            "redeem",
+            "--from",
+            str(bundle_path),
+            "--data-dir",
+            str(node_b),
+            "--force",
+        ]
+    )
+    assert code == 1
+    assert "could not write identity" in capsys.readouterr().err
+    assert _destination(node_b, capsys) == destination_b
+    # The failed attempt left no redeemed-token record behind: the
+    # same bundle redeems cleanly on retry.
+    assert (
+        cli.main(
+            [
+                "devices",
+                "redeem",
+                "--from",
+                str(bundle_path),
+                "--data-dir",
+                str(node_b),
+                "--force",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert _destination(node_b, capsys) == _destination(node_a, capsys)
 
 
 def test_devices_redeem_rejects_oversize_bundle_file(tmp_path, capsys):
