@@ -2548,6 +2548,7 @@ class Inbox:
             # stays in document order across the two phases.
             errors_by_index: Dict[int, Dict[str, Any]] = {}
             candidates: List[Tuple[int, Dict[str, Any], Any]] = []
+            candidate_slots: set = set()
             for index, entry in enumerate(entries):
                 record = _valid_record(entry)
                 if record is None:
@@ -2590,7 +2591,13 @@ class Inbox:
                         record["text"] = pending["text"]
                         record["edited_at"] = pending["edited_at"]
                 key = _dedupe_key(record)
-                if key in seen:
+                # Duplicates are only reserved per direction here. A
+                # candidate may still be dropped for capacity, and it
+                # must not hide a same-ID record bound for a direction
+                # with room; cross-direction dedupe happens below, once
+                # the survivors are known.
+                slot = (record.get("direction"), key)
+                if key in seen or slot in candidate_slots:
                     present += 1
                     continue
                 if (
@@ -2633,7 +2640,7 @@ class Inbox:
                         "error": "message was retracted by its sender",
                     }
                     continue
-                seen.add(key)
+                candidate_slots.add(slot)
                 candidates.append((index, record, key))
             if keep_existing:
                 by_direction: Dict[
@@ -2658,7 +2665,13 @@ class Inbox:
                         group = group[len(group) - free :]
                     survivors.extend(group)
                 candidates = sorted(survivors, key=lambda item: item[0])
-            for _index, record, _key in candidates:
+            for _index, record, key in candidates:
+                if key in seen:
+                    # A same-ID record already stored or kept above
+                    # (possibly in another direction) wins.
+                    present += 1
+                    continue
+                seen.add(key)
                 direction = record.get("direction")
                 used[direction] = used.get(direction, 0) + 1
                 self._messages.append(record)

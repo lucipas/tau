@@ -1028,6 +1028,43 @@ def test_import_keep_existing_prefers_newest_when_one_slot_free(tmp_path):
     assert "old-0" in ids
 
 
+def test_import_keep_existing_full_direction_does_not_hide_same_id(tmp_path):
+    # A same-ID record dropped because its direction is full must not
+    # reserve the dedupe key against a record in a direction with room.
+    inbox = Inbox(tmp_path / "inbox.json")
+    seed = {
+        "format": "tau-messages-export",
+        "version": 1,
+        "messages": [
+            _record(id=f"old-{i}", destination="aa" * 32, text=f"old {i}")
+            for i in range(500)
+        ],
+    }
+    assert inbox.import_messages(seed)["imported"] == 500
+    document = {
+        "format": "tau-messages-export",
+        "version": 1,
+        "messages": [
+            _record(id="shared", destination="aa" * 32, text="inbound"),
+            _record(
+                id="shared",
+                destination="aa" * 32,
+                text="inbound",
+                direction="out",
+            ),
+        ],
+    }
+    result = inbox.import_messages(document, keep_existing=True)
+    assert result["imported"] == 1
+    assert result["skipped"] == 1
+    sent = [
+        entry
+        for entry in inbox.list_messages(direction="out")
+        if entry["id"] == "shared"
+    ]
+    assert len(sent) == 1
+
+
 def test_import_skips_retracted_group_messages(tmp_path):
     # Regression test (CodeRabbit Major on PR #322): group messages
     # are retractable, so an import must check a received group record
