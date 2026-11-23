@@ -28,6 +28,7 @@ from tau.devices import (
 )
 from tau.identity import IdentityError, destination_hash, load_or_create_identity
 from tau.inbox import INBOX_EXPORT_FORMAT, INBOX_EXPORT_VERSION, Inbox
+from tau.mailbox import Mailbox
 from tau.node import InstanceLock
 from tau.peers import PUBLIC_KEY_BYTES, PeerRegistry
 from tau.protocol import encode
@@ -297,9 +298,10 @@ def test_snapshot_pairing_history_drops_files_and_caps():
     # The message cap keeps the newest; the file record never counts.
     snapshot = snapshot_pairing_history(_history_doc(messages), max_messages=1)
     assert [entry["id"] for entry in snapshot["messages"]] == ["m2"]
-    # The byte cap drops the oldest until the snapshot fits.  The cap
-    # measures the whole document, envelope included, so one small
-    # record rides in ~240 bytes: a 300-byte budget keeps only it.
+    # The byte cap drops the oldest until the snapshot fits: the
+    # measurement covers the whole document (metadata included, as
+    # _clean_history measures it), so one small record serializes to
+    # ~240 bytes and a 300-byte budget keeps only the small one.
     big = _message("x" * 1000, msg_id="big", sent_at=1000.0)
     small = _message("y", msg_id="small", sent_at=1001.0)
     snapshot = snapshot_pairing_history(
@@ -672,12 +674,10 @@ def test_devices_pair_redeem_carries_history(tmp_path, capsys):
     assert all(entry.get("kind") != "file" for entry in stored)
 
 
-def test_devices_redeem_retry_reimports_missing_history(tmp_path, capsys):
-    # A pairing can complete with its history missing — the import
-    # never fails the redeem — so a retry of the same bundle must be
-    # allowed to re-import the snapshot instead of failing as a plain
-    # duplicate (see #736).  Once every snapshot record is stored,
-    # the next redeem is a duplicate again.
+def test_devices_pair_redeem_skips_retracted_history(tmp_path, capsys):
+    # A message the sender retracted after the bundle was minted must
+    # not be resurrected by the stale snapshot: the redeem passes this
+    # node's retraction markers into the history import (see #736).
     node_a = _init_node(tmp_path, "a", "alice")
     _seed_history(node_a)
     capsys.readouterr()
@@ -699,30 +699,11 @@ def test_devices_redeem_retry_reimports_missing_history(tmp_path, capsys):
     )
     capsys.readouterr()
 
+    # The second device learned of the retract before redeeming: its
+    # own mailbox already carries the marker for the peer's message.
     node_b = tmp_path / "b"
-    assert (
-        cli.main(
-            [
-                "devices",
-                "redeem",
-                "--from",
-                str(bundle_path),
-                "--data-dir",
-                str(node_b),
-                "--json",
-            ]
-        )
-        == 0
-    )
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["history"]["imported"] == 3
-
-    # The history is lost on the second device; the same bundle must
-    # still redeem, importing only the missing snapshot.
-    inbox_b = Inbox(node_b / "inbox.json")
-    for msg_id in ("msg-1", "msg-2", "msg-3"):
-        inbox_b.delete(msg_id)
-    assert len(Inbox(node_b / "inbox.json")) == 0
+    node_b.mkdir(parents=True)
+    Mailbox(node_b / "mailbox.json").record_retraction("a" * 32, "msg-1")
     assert (
         cli.main(
             [
@@ -739,19 +720,16 @@ def test_devices_redeem_retry_reimports_missing_history(tmp_path, capsys):
     )
     payload = json.loads(capsys.readouterr().out)
     assert payload["history"] == {
-        "imported": 3,
+        "imported": 2,
         "present": 0,
-        "skipped": 0,
-        "errors": [],
+        "skipped": 1,
+        "errors": [
+            {"id": "msg-1", "error": "message was retracted by its sender"}
+        ],
     }
-    assert payload["verifications_cleared"] == 0
-
-    # With the history back in place, the bundle is spent again.
-    code = cli.main(
-        ["devices", "redeem", "--from", str(bundle_path), "--data-dir", str(node_b)]
-    )
-    assert code == 1
-    assert "already redeemed" in capsys.readouterr().err
+    inbox_b = Inbox(node_b / "inbox.json")
+    stored = inbox_b.list_messages(direction=None)
+    assert [entry["text"] for entry in stored] == ["group hello", "my reply"]
 
 
 def test_devices_pair_no_history_mints_identity_only(tmp_path, capsys):

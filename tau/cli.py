@@ -204,7 +204,7 @@ from .ignored_groups import (
     load_ignored_groups,
     save_ignored_groups,
 )
-from .inbox import Inbox, InboxError, _conversation_key, _dedupe_key, _valid_record
+from .inbox import Inbox, InboxError, _conversation_key
 from .lxmf import lxmf_delivery_hash
 from .mailbox import Mailbox, MailboxError
 from .node import (
@@ -14236,65 +14236,6 @@ def _recover_stranded_pairing(
     return True
 
 
-def _history_retry_allowed(
-    config: TauConfig,
-    registry: DeviceRegistry,
-    identity: Any,
-    bundle: Dict[str, Any],
-) -> bool:
-    """Allow a completed pairing's history import to be retried (see #736).
-
-    A redeem imports the bundle's history snapshot after the identity
-    is installed, and the import never fails the redeem — so a pairing
-    can complete with its history missing (the import raised, or the
-    inbox was pruned since).  A plain replay of that bundle must still
-    fail as \"already redeemed\", so a retry qualifies only when the
-    pairing is recorded for this bundle, the installed identity is the
-    bundle's, and at least one snapshot record is not yet in the inbox.
-    Records are matched the way the import dedupes them, so a retry
-    whose import would only count records as present does not qualify.
-    """
-    history = bundle.get("history")
-    if not isinstance(history, dict):
-        return False
-    messages = history.get("messages")
-    if not isinstance(messages, list) or not messages:
-        return False
-    try:
-        installed = load_identity(config.identity_path)
-    except (OSError, IdentityError):
-        return False
-    if installed is None:
-        return False
-    if installed.get_public_key() != identity.get_public_key():
-        return False
-    entry = registry.redeemed_entry(bundle["token"])
-    if entry is None:
-        return False
-    if entry.get("primary") != str(bundle["primary"]).lower():
-        return False
-    # Only a pairing recorded for THIS bundle qualifies: anything else
-    # is a stranded pairing (handled above) or a later pairing that
-    # must not be replayed.
-    paired = registry.paired_from
-    if paired is None or paired.get("token") != entry.get("token"):
-        return False
-    try:
-        stored = Inbox(config.inbox_path).export_document()["messages"]
-    except (OSError, ValueError):
-        return False
-    present = {
-        _dedupe_key(record) for record in stored if isinstance(record, dict)
-    }
-    for raw in messages:
-        record = _valid_record(raw)
-        if record is None:
-            continue
-        if _dedupe_key(record) not in present:
-            return True
-    return False
-
-
 def cmd_devices_redeem(args: argparse.Namespace) -> int:
     """Adopt the identity in a pairing bundle (slices 1–2 of #469, #713/#736).
 
@@ -14356,11 +14297,6 @@ def cmd_devices_redeem(args: argparse.Namespace) -> int:
                     # The identity was already installed by the
                     # first attempt, so no verifications were
                     # cleared by this retry.
-                    verifications_cleared = 0
-                elif _history_retry_allowed(config, registry, identity, bundle):
-                    # The pairing completed on an earlier attempt, so
-                    # only its history import needs retrying below.
-                    # The identity install and reset are not repeated.
                     verifications_cleared = 0
                 else:
                     raise NodeError(
@@ -14437,18 +14373,17 @@ def cmd_devices_redeem(args: argparse.Namespace) -> int:
     history = bundle.get("history")
     if history is not None:
         try:
-            # Like `messages import`: a record its sender retracted
-            # must not be resurrected by a snapshot made before the
-            # retract, so the local mailbox's markers guard the merge.
-            inbox = Inbox(config.inbox_path)
+            # Pass this node's retraction markers into the import: a
+            # message the sender retracted after the bundle was minted
+            # must not be resurrected by the stale snapshot (see #736).
+            # The mailbox may not exist yet on a fresh data dir; a
+            # missing one simply reports nothing retracted.
             mailbox = Mailbox(config.mailbox_path)
-            with mailbox.transaction():
-                history_result = inbox.import_messages(
-                    history,
-                    is_retracted=mailbox.is_retracted,
-                    is_group_retracted=mailbox.is_group_retracted,
-                    pending_group_edit=mailbox.pending_group_edit,
-                )
+            history_result = Inbox(config.inbox_path).import_messages(
+                history,
+                is_retracted=mailbox.is_retracted,
+                is_group_retracted=mailbox.is_group_retracted,
+            )
         except Exception as exc:
             log.warning("Could not import pairing history: %s", exc)
             history_result = {
