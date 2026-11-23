@@ -352,6 +352,65 @@ def test_devices_pair_refuses_existing_bundle_without_force(tmp_path, capsys):
     )
 
 
+def test_devices_pair_failed_repair_keeps_previous_bundle(
+    tmp_path, capsys, monkeypatch
+):
+    # A failed --force re-pair must not destroy the previous bundle:
+    # the new bundle is staged until its offer is recorded, so a
+    # registry-write failure removes only the staged file and the old
+    # bundle stays redeemable (see #717).
+    node_a = _init_node(tmp_path, "a", "alice")
+    capsys.readouterr()
+    bundle_path = tmp_path / "pairing.json"
+    assert (
+        cli.main(
+            ["devices", "pair", "--to", str(bundle_path), "--data-dir", str(node_a)]
+        )
+        == 0
+    )
+    original = bundle_path.read_bytes()
+    capsys.readouterr()
+
+    def _failing_record_issued(*args, **kwargs):
+        raise OSError("registry write failed")
+
+    monkeypatch.setattr(DeviceRegistry, "record_issued", _failing_record_issued)
+    code = cli.main(
+        [
+            "devices",
+            "pair",
+            "--to",
+            str(bundle_path),
+            "--data-dir",
+            str(node_a),
+            "--force",
+        ]
+    )
+    assert code == 1
+    assert "registry write failed" in capsys.readouterr().err
+    # The previous bundle is byte-identical, no staged file is left
+    # behind, no orphan offer was recorded, and the old bundle still
+    # redeems on a fresh device.
+    assert bundle_path.read_bytes() == original
+    assert list(tmp_path.glob(".pairing.json.*.tmp")) == []
+    assert cli.main(["devices", "list", "--data-dir", str(node_a)]) == 0
+    assert "pairing offers issued: 1" in capsys.readouterr().out
+    assert (
+        cli.main(
+            [
+                "devices",
+                "redeem",
+                "--from",
+                str(bundle_path),
+                "--data-dir",
+                str(tmp_path / "b"),
+                "--json",
+            ]
+        )
+        == 0
+    )
+
+
 def test_devices_pair_without_identity_returns_error(tmp_path, capsys):
     code = cli.main(
         [

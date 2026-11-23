@@ -13945,15 +13945,35 @@ def cmd_devices_pair(args: argparse.Namespace) -> int:
     # The bundle goes into a caller-selected folder: never change that
     # folder's permissions, only the bundle file itself is private —
     # the same rule `tau id export` applies.
-    atomic_write_json(target, bundle, mode=0o600, restrict_parent=False)
+    #
+    # Stage the new bundle beside the target and only replace the
+    # target once the offer is recorded.  Writing straight to the
+    # target first destroys a previous bundle when --force overwrites
+    # one and the registry write then fails: the unlink in the
+    # failure path removes the only remaining copy (see #717).  Until
+    # the replacement is finalised the old target is untouched, so a
+    # failed recording removes only the staged file.
+    staging = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    atomic_write_json(staging, bundle, mode=0o600, restrict_parent=False)
     try:
         registry.record_issued(
             bundle["token"], bundle["created_at"], bundle["expires_at"]
         )
     except OSError:
         # The command failed, so the bundle must not stay behind as
-        # an untracked redeemable offer.
-        target.unlink(missing_ok=True)
+        # an untracked redeemable offer — but only the staged file
+        # goes: the previous bundle at the target is still the live
+        # one.
+        staging.unlink(missing_ok=True)
+        raise
+    try:
+        os.replace(staging, target)
+    except OSError:
+        # The offer is recorded but the new bundle never landed: the
+        # old bundle is still at the target and still redeemable, so
+        # drop the staged file and report the failure rather than
+        # leaving a second copy behind.
+        staging.unlink(missing_ok=True)
         raise
     expires = datetime.fromtimestamp(bundle["expires_at"]).strftime(
         "%Y-%m-%d %H:%M:%S"
