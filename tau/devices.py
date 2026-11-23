@@ -202,30 +202,36 @@ def snapshot_pairing_history(
     messages = document.get("messages")
     if not isinstance(messages, list):
         return None
-    kept = [
-        dict(entry)
-        for entry in messages
-        if isinstance(entry, dict) and entry.get("kind") != "file"
-    ]
+    kept = []
+    for entry in messages:
+        if not isinstance(entry, dict) or entry.get("kind") == "file":
+            continue
+        record = dict(entry)
+        # The second device has not displayed these messages, so the
+        # primary's read state must not travel: a carried read_at would
+        # make the receipt sweep send receipts for unseen messages.
+        record.pop("read_at", None)
+        kept.append(record)
     # Newest first for the caps, then back to oldest-first: the
     # import replays in stored order, so the newest messages keep
     # their relative order and the oldest are the ones dropped.
     kept = kept[-max_messages:] if max_messages > 0 else []
+    exported_at = document.get("exported_at")
+    # Measure the exact document that is returned (and that
+    # _clean_history measures), metadata included, so a snapshot that
+    # passes here cannot fail the bundle's size cap.
     while kept:
-        size = len(
-            json.dumps({"messages": kept}, ensure_ascii=False).encode("utf-8")
-        )
+        snapshot = {
+            "format": INBOX_EXPORT_FORMAT,
+            "version": INBOX_EXPORT_VERSION,
+            "exported_at": exported_at,
+            "messages": kept,
+        }
+        size = len(json.dumps(snapshot, ensure_ascii=False).encode("utf-8"))
         if size <= max_bytes:
-            break
+            return snapshot
         kept = kept[1:]
-    if not kept:
-        return None
-    return {
-        "format": INBOX_EXPORT_FORMAT,
-        "version": INBOX_EXPORT_VERSION,
-        "exported_at": document.get("exported_at"),
-        "messages": kept,
-    }
+    return None
 
 
 def _unsigned_bundle(bundle: Dict[str, Any]) -> Dict[str, Any]:
