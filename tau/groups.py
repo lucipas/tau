@@ -1904,24 +1904,31 @@ class GroupStore:
 
         The id itself when it is still live; otherwise the live group
         whose rename lineage names it, falling back to the retired
-        record's family id.  A lineage candidate only counts when its
-        creator matches the id's own creator — from the retired
-        record, or the creator evidence kept when it was retired — so
-        a member's unrelated group cannot claim this id as its
-        predecessor and hijack the lookup.  The fallback needs the
+        record's family id, and then to walking the rename chain
+        forward through the retired records.  A lineage candidate only
+        counts when its creator matches the id's own creator — from
+        the retired record, or the creator evidence kept when it was
+        retired — so a member's unrelated group cannot claim this id as
+        its predecessor and hijack the lookup.  The fallback needs the
         same creator match plus the same family id, a random token
         minted at creation and carried into every successor: the
         creation timestamp it replaces is not unique — two groups
         from one creator can share a clock tick — and matching on it
         could return an unrelated group whose roster excludes a
-        still-current recipient.  Reloads from disk first, so a
-        roster change in another process is seen.  ``None`` means no
-        live successor is known: the group may have been deleted, its
-        successor never learned, or its record may predate family
-        ids — callers must fail open on it, never treat it as a
-        removal.  A retired record evicted after many roster changes
-        leaves only the lineage scan, whose creator evidence survives
-        eviction.
+        still-current recipient.  The walk covers groups renamed
+        more than 32 times before family ids existed, whose retired
+        records carry no family id: each successor names its
+        predecessor in ``renamed_from``, and each retired record is a
+        frozen copy of the group it replaced, so following those
+        links forward reaches the live group.  Reloads from disk
+        first, so a roster change in another process is seen.
+        ``None`` means no live successor is known: the group may have
+        been deleted, its successor never learned, its chain may have
+        outgrown the retired store, or its record may predate family
+        ids with a broken chain — callers must fail open on it, never
+        treat it as a removal.  A retired record evicted after many
+        roster changes leaves only the lineage scan, whose creator
+        evidence survives eviction.
         """
         with self._transaction():
             wanted = str(group_id).lower()
@@ -1955,6 +1962,45 @@ class GroupStore:
                             and (candidate.get("creator") or "") == creator
                         ):
                             return dict(candidate)
+            # Legacy chains: a group renamed past the lineage cap
+            # before family ids existed leaves no family id on its
+            # retired records, so the fallback above cannot link
+            # them — but the chain is still recoverable step by step.
+            # Each successor names its predecessor in renamed_from,
+            # and each retired record is a frozen copy of the group
+            # it replaced, so following those links forward from the
+            # wanted id reaches the live group.  Each step needs the
+            # same creator match as the lineage scan: the walk trusts
+            # renamed_from no further than the scan already does.
+            # It runs last because a family-id match is stronger
+            # evidence than a walked link, and it only fires when
+            # both earlier lookups missed.  The walk is bounded by
+            # the retired store, and a visited set stops a cycle (a
+            # rename back to an earlier name can re-link an id).
+            seen = {wanted}
+            current = wanted
+            while True:
+                nxt = None
+                for candidate in list(self._groups.values()) + list(
+                    self._retired_groups.values()
+                ):
+                    if (candidate.get("creator") or "") != creator:
+                        continue
+                    if current in [
+                        str(entry).lower()
+                        for entry in (candidate.get("renamed_from") or [])
+                    ]:
+                        nxt = candidate
+                        break
+                if nxt is None:
+                    break
+                nxt_id = str(nxt["id"]).lower()
+                if nxt_id in self._groups:
+                    return dict(self._groups[nxt_id])
+                if nxt_id in seen:
+                    break
+                seen.add(nxt_id)
+                current = nxt_id
             return None
 
     def find(self, query: str) -> Optional[Dict[str, Any]]:
