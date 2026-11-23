@@ -20,6 +20,7 @@ from tau.devices import (
     verify_pairing_bundle,
 )
 from tau.identity import IdentityError, destination_hash, load_or_create_identity
+from tau.peers import PUBLIC_KEY_BYTES, PeerRegistry
 
 
 def _identity():
@@ -1092,6 +1093,65 @@ def test_devices_redeem_snapshot_failure_keeps_bundle_retryable(
     )
     capsys.readouterr()
     assert _destination(node_b, capsys) == _destination(node_a, capsys)
+
+
+def test_devices_redeem_snapshot_failure_keeps_verifications(
+    tmp_path, capsys, monkeypatch
+):
+    # The snapshot is taken before verifications are cleared: if the
+    # old identity cannot be read, the redeem fails while the old
+    # identity's peer verifications are still intact (see #721).
+    node_a = _init_node(tmp_path, "a", "alice")
+    node_b = _init_node(tmp_path, "b", "bob")
+    capsys.readouterr()
+    destination_a = _destination(node_a, capsys)
+    destination_b = _destination(node_b, capsys)
+    # Bob verified Alice's safety number under Bob's identity; a
+    # failed redeem must not throw that trust away.
+    registry = PeerRegistry(node_b / "peers.json")
+    peer = registry.upsert(
+        bytes.fromhex(destination_a),
+        bytes([7]) * PUBLIC_KEY_BYTES,
+        name="alice",
+        now=100.0,
+    )
+    registry.mark_verified(peer.destination_hash, "00001 00002", now=150.0)
+    assert registry.save()
+    bundle_path = tmp_path / "pairing.json"
+    assert (
+        cli.main(
+            ["devices", "pair", "--to", str(bundle_path), "--data-dir", str(node_a)]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    def _failing_snapshot(config):
+        raise OSError("cannot read identity")
+
+    monkeypatch.setattr(cli, "_snapshot_previous_identity", _failing_snapshot)
+    code = cli.main(
+        [
+            "devices",
+            "redeem",
+            "--from",
+            str(bundle_path),
+            "--data-dir",
+            str(node_b),
+            "--force",
+        ]
+    )
+    assert code == 1
+    assert "cannot read identity" in capsys.readouterr().err
+    # The old identity is still installed and its verification of
+    # Alice survived the failed redeem.
+    assert _destination(node_b, capsys) == destination_b
+    reloaded = PeerRegistry(node_b / "peers.json")
+    reloaded_peer = reloaded.get(peer.destination_hash)
+    assert reloaded_peer is not None
+    assert reloaded_peer.is_verified
+    assert reloaded_peer.verified_fingerprint == "00001 00002"
+    assert reloaded_peer.verified_at == 150.0
 
 
 def test_devices_redeem_failed_restore_keeps_token(
