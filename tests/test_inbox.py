@@ -953,6 +953,46 @@ def test_import_skips_retracted_messages(tmp_path):
     assert len(inbox) == 2  # the sent record was imported, not skipped
 
 
+def test_import_keep_existing_skips_when_direction_at_cap(tmp_path):
+    # Regression test (Qodo Fixer on PR #739): a pairing-history retry
+    # must not evict messages already in the inbox when the import
+    # would push a direction past its retention cap.
+    inbox = Inbox(tmp_path / "inbox.json")
+    seed = {
+        "format": "tau-messages-export",
+        "version": 1,
+        "messages": [
+            _record(id=f"old-{i}", destination="aa" * 32, text=f"old {i}")
+            for i in range(500)
+        ],
+    }
+    result = inbox.import_messages(seed)
+    assert result["imported"] == 500
+    assert len(inbox) == 500
+
+    newcomer = {
+        "format": "tau-messages-export",
+        "version": 1,
+        "messages": [_record(id="new", destination="aa" * 32, text="new")],
+    }
+    kept = inbox.import_messages(newcomer, keep_existing=True)
+    assert kept["imported"] == 0
+    assert kept["skipped"] == 1
+    assert kept["errors"] == [
+        {"id": "new", "error": "inbox is full; newer messages were kept"}
+    ]
+    assert len(inbox) == 500
+    assert "old-0" in {entry["id"] for entry in inbox.list_messages()}
+
+    # Without the flag the same import proceeds and the retention pass
+    # evicts the oldest existing record instead.
+    plain = inbox.import_messages(newcomer)
+    assert plain["imported"] == 1
+    assert len(inbox) == 500
+    assert "old-0" not in {entry["id"] for entry in inbox.list_messages()}
+    assert "new" in {entry["id"] for entry in inbox.list_messages()}
+
+
 def test_import_skips_retracted_group_messages(tmp_path):
     # Regression test (CodeRabbit Major on PR #322): group messages
     # are retractable, so an import must check a received group record
