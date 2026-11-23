@@ -481,12 +481,18 @@ class DeviceRegistry:
     ) -> None:
         """Remember that this node paired from *primary* with *token*."""
         moment = time.time() if now is None else float(now)
+        cleaned_token = _clean_hex(token, "token")
         with self._transaction():
             self._paired_from = {
                 "primary": _clean_hex(primary, "primary"),
-                "token": _clean_hex(token, "token"),
+                "token": cleaned_token,
                 "paired_at": moment,
             }
+            # The pairing is complete: a later retry must not treat
+            # this token as pending again (see #718).
+            for entry in self._redeemed:
+                if entry["token"] == cleaned_token:
+                    entry["paired"] = True
 
     def reset(self, *, now: Optional[float] = None) -> None:
         """Drop the pairing records tied to the replaced identity.
@@ -509,5 +515,4 @@ class DeviceRegistry:
             self._redeemed = [
                 entry for entry in self._redeemed if entry["expires_at"] > moment
             ]
-            self._paired_from = None
             self._paired_from = None

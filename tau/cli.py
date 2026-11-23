@@ -14098,6 +14098,23 @@ def _recover_stranded_pairing(
     # The token must have been redeemed for this bundle's primary.
     if entry["primary"] != str(bundle["primary"]).lower():
         return False
+    # The reset that should have cleared the old identity's records
+    # may itself have failed on the first attempt (Qodo Warning on
+    # #728): a failed reset followed by a failed rollback leaves the
+    # old identity's issued offers in place, and reporting success
+    # would attribute them to the new identity.  The reset is
+    # idempotent — when it already ran there is nothing to drop — so
+    # complete it here before recording the pairing; if it still
+    # cannot run, fail instead of returning success with stale
+    # records.  No durable marker is needed: the stranded state
+    # itself is the pending reset.
+    try:
+        registry.reset()
+    except (OSError, DevicesError) as exc:
+        raise NodeError(
+            f"could not complete the pairing reset ({exc}); "
+            "retry the same bundle once the failure clears"
+        ) from exc
     try:
         registry.record_paired_from(bundle["token"], bundle["primary"])
     except (OSError, DevicesError) as exc:
