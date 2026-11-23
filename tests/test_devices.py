@@ -362,6 +362,8 @@ def test_devices_pair_refuses_while_node_serving(tmp_path, capsys):
     # replacement identity's registry (see #715).  When the lock is
     # held — this process stands in for the serving node — pair fails
     # before minting anything: no bundle file and no recorded offer.
+    # The refusal names the lock holder as another tau process, not
+    # necessarily a serving node: a backup holds the same lock.
     node = _init_node(tmp_path, "node", "alice")
     capsys.readouterr()
     config = TauConfig.resolve(data_dir=node)
@@ -382,7 +384,9 @@ def test_devices_pair_refuses_while_node_serving(tmp_path, capsys):
     finally:
         lock.release()
     assert code == 1
-    assert "already serving" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "is in use by another tau process" in err
+    assert f"(pid {os.getpid()})" in err
     assert not bundle_path.exists()
     assert not list(tmp_path.glob(".pairing.json.*.tmp"))
     assert cli.main(["devices", "list", "--data-dir", str(node)]) == 0

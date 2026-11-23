@@ -13937,7 +13937,20 @@ def cmd_devices_pair(args: argparse.Namespace) -> int:
     # Note the instance lock is a no-op on a platform with neither
     # fcntl nor msvcrt, the same limitation `tau serve` itself accepts.
     lock = InstanceLock(config.instance_lock_path, config.data_dir)
-    lock.acquire()
+    try:
+        lock.acquire()
+    except InstanceAlreadyRunning:
+        # The holder need not be a serving node: a backup holds the
+        # same lock while it archives, so report the conflict as
+        # another tau process using the data directory rather than
+        # telling the user to stop a node that may not be running.
+        holder = instance_lock_holder(config.instance_lock_path)
+        detail = f" (pid {holder})" if holder not in (None, -1) else ""
+        raise NodeError(
+            "cannot mint a pairing bundle: data directory "
+            f"{config.data_dir} is in use by another tau process"
+            f"{detail}; wait for it to finish or stop it first"
+        ) from None
     try:
         identity = load_identity(config.identity_path)
         if identity is None:
