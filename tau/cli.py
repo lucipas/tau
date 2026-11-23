@@ -14448,6 +14448,7 @@ def cmd_devices_redeem(args: argparse.Namespace) -> int:
                     is_retracted=mailbox.is_retracted,
                     is_group_retracted=mailbox.is_group_retracted,
                     pending_group_edit=mailbox.pending_group_edit,
+                    keep_existing=True,
                 )
         except Exception as exc:
             log.warning("Could not import pairing history: %s", exc)
