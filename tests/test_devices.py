@@ -212,23 +212,40 @@ def test_registry_reset_keeps_redeemed_tokens(tmp_path):
     assert registry.paired_from is None
 
 
-def test_registry_reset_keeps_offers_minted_after_threshold(tmp_path):
+def test_registry_reset_keeps_offers_owned_by_new_identity(tmp_path):
     # A stranded-pairing retry completes a pending reset (#732):
-    # offers minted at or after the failed redemption belong to the
-    # new identity and survive; only the old identity's offers go.
-    # A plain reset with no threshold still drops every offer.
+    # offers minted by the identity being installed survive; offers
+    # minted by the replaced identity go.  A plain reset with no
+    # owner still drops every offer.
     import time
 
     now = time.time()
     registry = DeviceRegistry(tmp_path / "devices.json")
-    registry.record_issued("a" * 32, now - 300.0, now + 3600.0)
-    registry.record_issued("b" * 32, now - 100.0, now + 3600.0)
-    registry.record_issued("c" * 32, now + 60.0, now + 3600.0)
-    registry.reset(now=now + 120.0, keep_offers_from=now - 100.0)
+    registry.record_issued("a" * 32, now - 300.0, now + 3600.0, owner="1" * 32)
+    registry.record_issued("b" * 32, now - 100.0, now + 3600.0, owner="2" * 32)
+    registry.record_issued("c" * 32, now + 60.0, now + 3600.0, owner="2" * 32)
+    registry.reset(now=now + 120.0, keep_offers_owned_by="2" * 32)
     offers = registry.issued_offers(now=now)
     assert [offer["token"] for offer in offers] == ["b" * 32, "c" * 32]
     registry.reset(now=now + 120.0)
     assert registry.issued_offers(now=now) == []
+
+
+def test_registry_reset_owner_scope_ignores_clock_rollback(tmp_path):
+    # The owner decides which offers survive, not wall-clock order: an
+    # offer minted by the new identity after the clock moved backward
+    # (so its created_at predates the failed redeem) is still kept, and
+    # an offer without a recorded owner is dropped.
+    import time
+
+    now = time.time()
+    registry = DeviceRegistry(tmp_path / "devices.json")
+    registry.record_issued("a" * 32, now - 500.0, now + 3600.0, owner="1" * 32)
+    registry.record_issued("b" * 32, now - 1000.0, now + 3600.0, owner="2" * 32)
+    registry.record_issued("c" * 32, now - 2000.0, now + 3600.0)
+    registry.reset(now=now + 120.0, keep_offers_owned_by="2" * 32)
+    offers = registry.issued_offers(now=now)
+    assert [offer["token"] for offer in offers] == ["b" * 32]
 
 
 def test_registry_prunes_expired_offers(tmp_path):
@@ -1312,7 +1329,7 @@ def test_devices_redeem_failed_restore_keeps_token(
     )
     capsys.readouterr()
 
-    def _fail_reset(self, *, now=None, keep_offers_from=None):
+    def _fail_reset(self, *, now=None, keep_offers_owned_by=None):
         raise OSError("disk full")
 
     def _fail_restore(*args, **kwargs):
@@ -1505,11 +1522,13 @@ def test_devices_redeem_retry_keeps_offers_minted_after_failed_attempt(
     original_reset = DeviceRegistry.reset
     calls = []
 
-    def _fail_first_reset(self, *, now=None, keep_offers_from=None):
+    def _fail_first_reset(self, *, now=None, keep_offers_owned_by=None):
         calls.append(1)
         if len(calls) == 1:
             raise OSError("disk full")
-        return original_reset(self, now=now, keep_offers_from=keep_offers_from)
+        return original_reset(
+            self, now=now, keep_offers_owned_by=keep_offers_owned_by
+        )
 
     def _fail_restore(*args, **kwargs):
         raise OSError("disk full")
@@ -1568,6 +1587,16 @@ def test_devices_redeem_retry_keeps_offers_minted_after_failed_attempt(
     out = capsys.readouterr().out
     assert "pairing offers issued: 1" in out
     assert f"paired from: {destination_a}" in out
+
+    # The surviving offer is Alice's (minted by the new identity), not
+    # Bob's stale one.
+    surviving = DeviceRegistry(node_b / "devices.json").issued_offers()
+    assert [offer["token"] for offer in surviving] == [
+        json.loads(new_offer_path.read_text(encoding="utf-8"))["token"]
+    ]
+    assert json.loads(offer_path.read_text(encoding="utf-8"))["token"] not in {
+        offer["token"] for offer in surviving
+    }
 
 
 def test_devices_redeem_retry_clears_stale_pairing_after_failed_reset(
@@ -1708,7 +1737,7 @@ def test_devices_import_corrupt_registry_rolls_back_identity(
     )
     capsys.readouterr()
 
-    def _fail_reset(self, *, now=None, keep_offers_from=None):
+    def _fail_reset(self, *, now=None, keep_offers_owned_by=None):
         raise DevicesError("device registry corrupt")
 
     monkeypatch.setattr(cli.DeviceRegistry, "reset", _fail_reset)
@@ -1781,4 +1810,6 @@ def test_backup_preserves_device_registry(tmp_path, capsys):
         ["devices", "redeem", "--from", str(bundle_path), "--data-dir", str(node_c)]
     )
     assert code == 1
+    assert "already redeemed" in capsys.readouterr().err
+e == 1
     assert "already redeemed" in capsys.readouterr().err
