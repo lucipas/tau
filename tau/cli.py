@@ -204,7 +204,7 @@ from .ignored_groups import (
     load_ignored_groups,
     save_ignored_groups,
 )
-from .inbox import Inbox, InboxError, _conversation_key, _dedupe_key, _valid_record
+from .inbox import Inbox, InboxError, _conversation_key, _dedupe_key, _valid_record, direction_capacity
 from .lxmf import lxmf_delivery_hash
 from .mailbox import Mailbox, MailboxError
 from .node import (
@@ -14286,12 +14286,25 @@ def _history_retry_allowed(
     present = {
         _dedupe_key(record) for record in stored if isinstance(record, dict)
     }
+    # A missing record only makes a retry worthwhile when the import
+    # could actually store it: with keep_existing, a direction at its
+    # retention cap skips the record, so a full inbox would otherwise
+    # keep the bundle replayable forever, each replay "succeeding"
+    # without importing anything.  A retry stays allowed when space
+    # frees up later.
+    stored_counts: Dict[Any, int] = {}
+    for item in stored:
+        if isinstance(item, dict):
+            direction = item.get("direction")
+            stored_counts[direction] = stored_counts.get(direction, 0) + 1
     for raw in messages:
         record = _valid_record(raw)
         if record is None:
             continue
         if _dedupe_key(record) not in present:
-            return True
+            direction = record.get("direction")
+            if stored_counts.get(direction, 0) < direction_capacity(direction):
+                return True
     return False
 
 
