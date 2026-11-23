@@ -14052,6 +14052,61 @@ def cmd_devices_pair(args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
+def _recover_stranded_pairing(
+    config: TauConfig,
+    registry: DeviceRegistry,
+    identity: Any,
+    bundle: Dict[str, Any],
+) -> bool:
+    """Complete a pairing whose status write failed (see #718).
+
+    A redeem records the token before installing the identity and
+    writes the pairing record only after the install succeeds.  When
+    that second write fails, the retry was rejected as "already
+    redeemed" even though the identity is installed and `devices
+    list` shows no pairing.  The redeemed-token record already
+    carries the pairing metadata (the primary), so the retry can
+    complete the record instead of stranding the bundle.
+
+    Returns True when the token was redeemed for the identity now
+    installed but no pairing is recorded yet, and the record has
+    now been written.  Returns False for a plain replay: a different
+    identity is installed, or a pairing is already recorded (for
+    this bundle or a later one).  Raises NodeError when the record
+    still cannot be written, so the retry reports the failure
+    instead of silently leaving the status missing.
+    """
+    try:
+        installed = load_identity(config.identity_path)
+    except (OSError, IdentityError) as exc:
+        raise NodeError(
+            f"could not inspect the installed identity at {config.identity_path} "
+            f"to recover the pairing ({exc})"
+        ) from exc
+    if installed is None:
+        return False
+    if installed.get_public_key() != identity.get_public_key():
+        return False
+    if registry.paired_from is not None:
+        return False
+    # Only a token whose pairing record is still pending qualifies.  A
+    # completed pairing stays completed even if an identity swap has
+    # since cleared the pairing record, so it cannot be replayed.
+    entry = registry.redeemed_entry(bundle["token"])
+    if entry is None or entry.get("paired", True):
+        return False
+    # The token must have been redeemed for this bundle's primary.
+    if entry["primary"] != str(bundle["primary"]).lower():
+        return False
+    try:
+        registry.record_paired_from(bundle["token"], bundle["primary"])
+    except (OSError, DevicesError) as exc:
+        raise NodeError(
+            f"could not record pairing ({exc}); identity was installed"
+        ) from exc
+    return True
+
+
 def cmd_devices_redeem(args: argparse.Namespace) -> int:
     """Adopt the identity in a pairing bundle (slice 1 of #469, #713)."""
     config = _make_config(args)
@@ -14089,58 +14144,75 @@ def cmd_devices_redeem(args: argparse.Namespace) -> int:
         with _identity_lock(config.identity_path):
             registry = DeviceRegistry(config.devices_path)
             if registry.is_redeemed(bundle["token"]):
-                raise NodeError(
-                    "pairing bundle was already redeemed on this node"
+                # A redeem whose pairing record failed to persist
+                # leaves the token recorded and the identity installed
+                # but no pairing status (see #718): the retry was
+                # rejected here before it could repair the status
+                # `devices list` displays.  Complete the record
+                # instead when this bundle is the one installed; a
+                # plain replay of a completed pairing still fails.
+                if _recover_stranded_pairing(
+                    config, registry, identity, bundle
+                ):
+                    # The identity was already installed by the
+                    # first attempt, so no verifications were
+                    # cleared by this retry.
+                    verifications_cleared = 0
+                else:
+                    raise NodeError(
+                        "pairing bundle was already redeemed on this node"
+                    )
+            else:
+                if config.identity_path.exists() and not getattr(args, "force", False):
+                    raise NodeError(
+                        f"an identity already exists at {config.identity_path}; "
+                        "pass --force to replace it"
+                    )
+                # Snapshot the installed identity BEFORE clearing
+                # verifications and BEFORE recording the token: if the
+                # snapshot read fails, the command aborts while the bundle
+                # is still unredeemed and retryable — and with the old
+                # identity's peer verifications intact (see #721).
+                previous, had_previous = _snapshot_previous_identity(config)
+                verifications_cleared = _clear_verifications_for_identity_change(
+                    config, identity
                 )
-            if config.identity_path.exists() and not getattr(args, "force", False):
-                raise NodeError(
-                    f"an identity already exists at {config.identity_path}; "
-                    "pass --force to replace it"
+                # Decide the reset while the old identity is still on
+                # disk, but apply it only after the new identity is
+                # installed: a failed write must leave the old pairing
+                # records intact (see #716).  The reset keeps redeemed
+                # tokens, so the token recorded just below survives it.
+                reset_devices = _devices_reset_needed(config, identity)
+                # Record the token BEFORE installing the identity: if the
+                # record fails, the old identity stays in place and the
+                # bundle can be minted fresh — the reverse order would
+                # leave an installed identity with no redeemed-token
+                # record, so a later --force redeem would accept the same
+                # bundle again (see #714).  The pairing itself is only
+                # recorded after the install succeeds, so a failed install
+                # never claims a pairing that did not happen.
+                registry.record_redeemed(
+                    bundle["token"], bundle["primary"], bundle["expires_at"]
                 )
-            # Snapshot the installed identity BEFORE clearing
-            # verifications and BEFORE recording the token: if the
-            # snapshot read fails, the command aborts while the bundle
-            # is still unredeemed and retryable — and with the old
-            # identity's peer verifications intact (see #721).
-            previous, had_previous = _snapshot_previous_identity(config)
-            verifications_cleared = _clear_verifications_for_identity_change(
-                config, identity
-            )
-            # Decide the reset while the old identity is still on
-            # disk, but apply it only after the new identity is
-            # installed: a failed write must leave the old pairing
-            # records intact (see #716).  The reset keeps redeemed
-            # tokens, so the token recorded just below survives it.
-            reset_devices = _devices_reset_needed(config, identity)
-            # Record the token BEFORE installing the identity: if the
-            # record fails, the old identity stays in place and the
-            # bundle can be minted fresh — the reverse order would
-            # leave an installed identity with no redeemed-token
-            # record, so a later --force redeem would accept the same
-            # bundle again (see #714).  The pairing itself is only
-            # recorded after the install succeeds, so a failed install
-            # never claims a pairing that did not happen.
-            registry.record_redeemed(
-                bundle["token"], bundle["primary"], bundle["expires_at"]
-            )
-            _install_identity_and_reset(
-                config,
-                identity,
-                registry,
-                reset_devices,
-                redeemed_token=bundle["token"],
-                previous=previous,
-                had_previous=had_previous,
-            )
-            try:
-                registry.record_paired_from(bundle["token"], bundle["primary"])
-            except OSError as exc:
-                # The identity is already installed; the pairing
-                # record is bookkeeping, so say so rather than
-                # reporting the redeem as failed.
-                raise NodeError(
-                    f"could not record pairing ({exc}); identity was installed"
-                ) from exc
+                _install_identity_and_reset(
+                    config,
+                    identity,
+                    registry,
+                    reset_devices,
+                    redeemed_token=bundle["token"],
+                    previous=previous,
+                    had_previous=had_previous,
+                )
+                try:
+                    registry.record_paired_from(bundle["token"], bundle["primary"])
+                except OSError as exc:
+                    # The identity is already installed; the pairing
+                    # record is bookkeeping, so say so rather than
+                    # reporting the redeem as failed.
+                    raise NodeError(
+                        f"could not record pairing ({exc}); identity was installed — "
+                        "retry the same bundle to record the pairing"
+                    ) from exc
     finally:
         lock.release()
     payload = {
