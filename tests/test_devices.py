@@ -824,6 +824,23 @@ def test_devices_redeem_retry_refused_when_inbox_full(tmp_path, capsys):
     assert code == 1
     assert "already redeemed" in capsys.readouterr().err
 
+    # Freeing a received slot makes the same bundle retryable again.
+    assert Inbox(node_b / "inbox.json").delete("fill-0")
+    code = cli.main(
+        [
+            "devices",
+            "redeem",
+            "--from",
+            str(bundle_path),
+            "--data-dir",
+            str(node_b),
+            "--json",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["history"]["imported"] >= 1
+
 
 def test_devices_pair_redeem_skips_retracted_history(tmp_path, capsys):
     # A message the sender retracted after the bundle was minted must
