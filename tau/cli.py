@@ -13698,17 +13698,12 @@ def cmd_id_import(args: argparse.Namespace) -> int:
                     f"an identity already exists at {config.identity_path}; "
                     "pass --force to replace it"
                 )
-            verifications_cleared = _clear_verifications_for_identity_change(
-                config, identity
-            )
-            # Decide the reset while the old identity is still on
-            # disk, but apply it only after the new identity is
-            # installed: a failed write must leave the old pairing
-            # records intact (see #716).  An unreadable old identity
-            # does not abort the import — it was already tolerated
-            # when deciding the reset — it only disables rollback.
-            registry = DeviceRegistry(config.devices_path)
-            reset_devices = _devices_reset_needed(config, identity)
+            # Snapshot the installed identity BEFORE clearing
+            # verifications, the same ordering as a redeem (see
+            # #721) — a failed snapshot must be known before any
+            # state is cleared.  An unreadable old identity does not
+            # abort the import — it was already tolerated when
+            # deciding the reset — it only disables rollback.
             try:
                 previous, had_previous = _snapshot_previous_identity(config)
             except OSError as exc:
@@ -13718,6 +13713,15 @@ def cmd_id_import(args: argparse.Namespace) -> int:
                     exc,
                 )
                 previous, had_previous = None, True
+            verifications_cleared = _clear_verifications_for_identity_change(
+                config, identity
+            )
+            # Decide the reset while the old identity is still on
+            # disk, but apply it only after the new identity is
+            # installed: a failed write must leave the old pairing
+            # records intact (see #716).
+            registry = DeviceRegistry(config.devices_path)
+            reset_devices = _devices_reset_needed(config, identity)
             _install_identity_and_reset(
                 config,
                 identity,
@@ -14061,6 +14065,12 @@ def cmd_devices_redeem(args: argparse.Namespace) -> int:
                     f"an identity already exists at {config.identity_path}; "
                     "pass --force to replace it"
                 )
+            # Snapshot the installed identity BEFORE clearing
+            # verifications and BEFORE recording the token: if the
+            # snapshot read fails, the command aborts while the bundle
+            # is still unredeemed and retryable — and with the old
+            # identity's peer verifications intact (see #721).
+            previous, had_previous = _snapshot_previous_identity(config)
             verifications_cleared = _clear_verifications_for_identity_change(
                 config, identity
             )
@@ -14070,10 +14080,6 @@ def cmd_devices_redeem(args: argparse.Namespace) -> int:
             # records intact (see #716).  The reset keeps redeemed
             # tokens, so the token recorded just below survives it.
             reset_devices = _devices_reset_needed(config, identity)
-            # Snapshot the installed identity BEFORE recording the
-            # token: if the snapshot read fails, the command aborts
-            # while the bundle is still unredeemed and retryable.
-            previous, had_previous = _snapshot_previous_identity(config)
             # Record the token BEFORE installing the identity: if the
             # record fails, the old identity stays in place and the
             # bundle can be minted fresh — the reverse order would
