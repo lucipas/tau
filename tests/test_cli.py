@@ -7014,6 +7014,59 @@ def test_outbox_cancel_drops_sibling_group_edit_legs(tmp_path, capsys):
     ]
 
 
+def test_outbox_cancel_of_group_retract_leg_blocks_sweep_cleanup(
+    tmp_path, capsys
+):
+    # Qodo Warning on PR #706: cancelling a queued group-retract leg
+    # removed it without recording that the fan-out can never
+    # complete, so a sibling leg's later delivery deleted the
+    # sender's local copies while the cancelled member still held
+    # the message. Cancelling now records the cleanup block.
+    import base64
+
+    from tau.mailbox import Mailbox
+
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir)
+    box = Mailbox(config.mailbox_path)
+    group = {
+        "id": "aa" * 16,
+        "name": "crew",
+        "creator": "bb" * 16,
+        "members": ["cc" * 16, "dd" * 16, "ee" * 16],
+    }
+    retract = {
+        "target": "leg-1",
+        "retract_id": "retract-1",
+        "sent_at": 100.0,
+        "target_author": "bb" * 16,
+        "target_sent_at": 100.0,
+        "payload_b64": base64.b64encode(b"payload").decode("ascii"),
+    }
+    first = box.enqueue(
+        to=b"\xcc" * 16,
+        text="retraction",
+        group=group,
+        retract=dict(retract),
+        message_id="aa" + "11" * 15,
+    )
+    box.enqueue(
+        to=b"\xdd" * 16,
+        text="retraction",
+        group=group,
+        retract=dict(retract),
+        message_id="aa" + "22" * 15,
+    )
+
+    code = cli.main(
+        ["outbox", "cancel", "--data-dir", str(data_dir), first.id[:8]]
+    )
+    assert code == 0
+    reloaded = Mailbox(config.mailbox_path)
+    assert [e.id for e in reloaded.outbox_list()] == ["aa" + "22" * 15]
+    assert reloaded.is_retract_cleanup_blocked("retract-1") is True
+
+
 def test_outbox_cancel_json_and_unknown(tmp_path, capsys):
     from tau.mailbox import Mailbox
 

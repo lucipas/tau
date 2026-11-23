@@ -23420,6 +23420,16 @@ def cmd_outbox_cancel(args: argparse.Namespace) -> int:
             raise NodeError(
                 f"queued message {args.target!r} is no longer queued"
             )
+        if (
+            entry.kind == "retract"
+            and entry.group_id is not None
+            and entry.group_retract_id is not None
+        ):
+            # Cancelling a queued group-retract leg ends the fan-out
+            # the same way a refusal does: the member keeps the
+            # message, so a sibling leg's later delivery must not drop
+            # the sender's local copies.
+            mailbox.record_retract_cleanup_blocked(entry.group_retract_id)
     peer = registry.get(entry.to)
     name = peer.display_name if peer is not None else entry.to_name
     if _json_mode(args):

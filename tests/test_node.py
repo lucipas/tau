@@ -2834,6 +2834,201 @@ def test_send_group_retraction_peer_rejection_is_final(tmp_path, monkeypatch):
     assert by_to[bob.hexhash].get("queued") is True
 
 
+def test_deliver_queued_group_retract_corrupt_sibling_keeps_local_copies(
+    tmp_path, monkeypatch
+):
+    # Qodo Warning on PR #706: a group-retract leg whose stored
+    # payload did not survive carried no retract id, so dropping it
+    # recorded no block and a valid sibling's delivery deleted the
+    # sender's copies. The id now survives as a hint (see
+    # OutboxEntry.group_retract_id), so the corrupt leg still blocks
+    # the cleanup — and still counts as a sibling until it drops.
+    import json
+
+    from tau.protocol import REQUEST_RETRACT
+
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    node.reticulum = object()  # started enough to queue
+    node.inbox.append(
+        {
+            "from": "bob",
+            "destination": "",
+            "text": "crew hello",
+            "sent_at": 100.0,
+            "received_at": 110.0,
+            "id": "leg-1",
+            "direction": "out",
+            "kind": "group",
+            "group": group["id"],
+            "group_name": "crew",
+            "leg_ids": ["leg-1"],
+            "leg_sent_at": 100.0,
+        }
+    )
+    node.mailbox.record_sent(
+        "leg-1", to=alice.destination_hash, text="crew hello"
+    )
+
+    def unreachable(peer_arg, path, payload, timeout, deadline=None):
+        raise NodeError("no route to peer")
+
+    monkeypatch.setattr(node, "_request", unreachable)
+    response = node.send_group_retraction("crew", "leg-1", target_sent_at=100.0)
+    assert response["ok"] is False
+    entries = {e.to_hex: e for e in node.mailbox.outbox_list()}
+    assert set(entries) == {alice.hexhash, bob.hexhash}
+
+    # Corrupt Bob's stored leg on disk: the signed bytes are gone,
+    # but the retract id survives in the stored record.
+    data = json.loads(node.mailbox.path.read_text())
+    [stored] = [
+        e for e in data["outbox"] if e["id"] == entries[bob.hexhash].id
+    ]
+    stored["retract"] = {"retract_id": response["id"]}
+    node.mailbox.path.write_text(json.dumps(data))
+
+    def reachable(peer_arg, path, payload, timeout, deadline=None):
+        assert path == REQUEST_RETRACT
+        return {"ok": True, "deleted": True, "group_retract": True, "_rtt": 0.004}
+
+    monkeypatch.setattr(node, "_request", reachable)
+    # Bob's corrupt leg drops — and the block is recorded from the
+    # hint, so Alice's later delivery keeps the local copies.
+    assert node._deliver_entry(bob, entries[bob.hexhash], 1.0) is False
+    assert node.mailbox.is_retract_cleanup_blocked(response["id"]) is True
+    assert node._deliver_entry(alice, entries[alice.hexhash], 1.0) is True
+    assert node.inbox.resolve("leg-1")["text"] == "crew hello"
+    assert node.mailbox.outbox_list() == []
+    assert node.mailbox.is_sent_group_retracted(group["id"], 100.0) is False
+
+
+def test_deliver_queued_group_retract_keeps_leg_when_marker_write_fails(
+    tmp_path, monkeypatch
+):
+    # Qodo Warning on PR #706: the sweep removed a finally-failed leg
+    # before writing its cleanup block, so a failed marker write (or
+    # a stop between the two steps) left neither the leg nor the
+    # failure record. The marker is now written in the same
+    # transaction as the removal: a write failure keeps the leg queued
+    # for a later round.
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    node.reticulum = object()  # started enough to queue
+    node.inbox.append(
+        {
+            "from": "bob",
+            "destination": "",
+            "text": "crew hello",
+            "sent_at": 100.0,
+            "received_at": 110.0,
+            "id": "leg-1",
+            "direction": "out",
+            "kind": "group",
+            "group": group["id"],
+            "group_name": "crew",
+            "leg_ids": ["leg-1"],
+            "leg_sent_at": 100.0,
+        }
+    )
+    node.mailbox.record_sent(
+        "leg-1", to=alice.destination_hash, text="crew hello"
+    )
+
+    def unreachable(peer_arg, path, payload, timeout, deadline=None):
+        raise NodeError("no route to peer")
+
+    monkeypatch.setattr(node, "_request", unreachable)
+    response = node.send_group_retraction("crew", "leg-1", target_sent_at=100.0)
+    assert response["ok"] is False
+    entries = {e.to_hex: e for e in node.mailbox.outbox_list()}
+    assert set(entries) == {alice.hexhash, bob.hexhash}
+
+    def refuse_bob(peer_arg, path, payload, timeout, deadline=None):
+        if peer_arg.hexhash == bob.hexhash:
+            raise NotAllowedError("peer rejected the request: not allowed")
+        return {"ok": True, "deleted": True, "group_retract": True, "_rtt": 0.004}
+
+    monkeypatch.setattr(node, "_request", refuse_bob)
+
+    def fail_marker(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(
+        node.mailbox, "_record_retract_cleanup_blocked_locked", fail_marker
+    )
+    # The refusal is final, but the marker could not be recorded: the
+    # leg stays queued for a later round instead of being lost.
+    assert node._deliver_entry(bob, entries[bob.hexhash], 1.0) is False
+    assert {e.id for e in node.mailbox.outbox_list()} == {
+        entries[alice.hexhash].id,
+        entries[bob.hexhash].id,
+    }
+    assert node.mailbox.is_retract_cleanup_blocked(response["id"]) is False
+
+
+def test_send_group_retraction_records_block_before_later_legs(
+    tmp_path, monkeypatch
+):
+    # Qodo Informational on PR #706: the live fan-out queued legs
+    # before every member's result was known, so a concurrent sweep
+    # delivering an early leg could drop the sender's local copies
+    # before a later member's refusal was recorded. The block is now
+    # recorded as soon as a leg fails finally, inside the loop.
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    node.reticulum = object()  # started enough to queue
+    node.inbox.append(
+        {
+            "from": "bob",
+            "destination": "",
+            "text": "crew hello",
+            "sent_at": 100.0,
+            "received_at": 110.0,
+            "id": "leg-1",
+            "direction": "out",
+            "kind": "group",
+            "group": group["id"],
+            "group_name": "crew",
+            "leg_ids": ["leg-1"],
+            "leg_sent_at": 100.0,
+        }
+    )
+    node.mailbox.record_sent(
+        "leg-1", to=alice.destination_hash, text="crew hello"
+    )
+
+    seen = {"calls": 0, "blocked_during_second": None}
+
+    def refuse_then_unreachable(peer_arg, path, payload, timeout, deadline=None):
+        seen["calls"] += 1
+        if seen["calls"] == 1:
+            raise NotAllowedError("peer rejected the request: not allowed")
+        # Second member: the first member's refusal must already be
+        # recorded — a sweep delivering this leg now must keep the
+        # local copies.
+        seen["blocked_during_second"] = bool(
+            node.mailbox._retract_cleanup_blocked
+        )
+        raise NodeError("no route to peer")
+
+    monkeypatch.setattr(node, "_request", refuse_then_unreachable)
+    response = node.send_group_retraction("crew", "leg-1", target_sent_at=100.0)
+    assert response["ok"] is False
+    assert seen["calls"] == 2
+    assert seen["blocked_during_second"] is True
+    assert node.mailbox.is_retract_cleanup_blocked(response["id"]) is True
+    # The second member's leg is queued; when it later delivers, the
+    # local copies stay.
+    [entry] = node.mailbox.outbox_list()
+    peer = alice if entry.to == alice.destination_hash else bob
+
+    def reachable(peer_arg, path, payload, timeout, deadline=None):
+        return {"ok": True, "deleted": True, "group_retract": True, "_rtt": 0.004}
+
+    monkeypatch.setattr(node, "_request", reachable)
+    assert node._deliver_entry(peer, entry, 1.0) is True
+    assert node.inbox.resolve("leg-1")["text"] == "crew hello"
+    assert node.mailbox.is_sent_group_retracted(group["id"], 100.0) is False
+
+
 def test_send_group_retraction_rejects_unknown_and_solo_groups(tmp_path):
     node, group, _, _ = _group_reaction_node(tmp_path)
     with pytest.raises(ValueError, match="unknown group"):

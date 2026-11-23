@@ -8984,6 +8984,18 @@ class WebBridge:
                 raise MailboxError(
                     f"queued message {target.strip()!r} is no longer queued"
                 )
+            if (
+                entry.kind == "retract"
+                and entry.group_id is not None
+                and entry.group_retract_id is not None
+            ):
+                # Cancelling a queued group-retract leg ends the
+                # fan-out the same way a refusal does: the member
+                # keeps the message, so a sibling leg's later delivery
+                # must not drop the sender's local copies.
+                self.node.mailbox.record_retract_cleanup_blocked(
+                    entry.group_retract_id
+                )
             described = self._describe_outbox_entry(entry)
         self._clear_scheduled_mark(entry.id)
         return described

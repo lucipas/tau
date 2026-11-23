@@ -446,6 +446,21 @@ def _raw_edit_id(raw: Any) -> Optional[str]:
     return None
 
 
+def _raw_retract_id(raw: Any) -> Optional[str]:
+    """The retract id of a stored retract payload that failed validation.
+
+    ``clean_queued_retract`` drops the whole payload; the signed
+    retract id is still needed to tell which group retract the leg
+    belongs to.
+    """
+    if not isinstance(raw, dict):
+        return None
+    retract_id = raw.get("retract_id")
+    if isinstance(retract_id, str) and retract_id:
+        return retract_id
+    return None
+
+
 def clean_queued_reaction(raw: Any) -> Optional[Dict[str, Any]]:
     """Validate one queued reaction, or ``None`` when it is unusable.
 
@@ -699,6 +714,11 @@ class OutboxEntry:
     # location, beacon or reply fields.  Shape: {"target",
     # "retract_id", "sent_at", "payload_b64"}.
     retract: Optional[Dict[str, Any]] = None
+    # Group-retract identity kept when the stored ``retract`` payload
+    # fails validation (``retract`` is then ``None``).  A corrupt leg
+    # still belongs to its retract, so pruning it can block the
+    # fan-out's local cleanup and the sweep can find its siblings.
+    retract_id_hint: Optional[str] = None
 
     @property
     def to_hex(self) -> str:
@@ -716,6 +736,19 @@ class OutboxEntry:
             if isinstance(edit_id, str) and edit_id:
                 return edit_id
         return self.edit_id_hint
+
+    @property
+    def group_retract_id(self) -> Optional[str]:
+        """The retract id this entry is a leg of, or ``None``.
+
+        Read from the validated ``retract`` payload, else from the id
+        kept for a corrupt payload.
+        """
+        if isinstance(self.retract, dict):
+            retract_id = self.retract.get("retract_id")
+            if isinstance(retract_id, str) and retract_id:
+                return retract_id
+        return self.retract_id_hint
 
     @property
     def wire_sent_at(self) -> float:
@@ -816,6 +849,10 @@ class OutboxEntry:
             payload["reaction"] = dict(self.reaction)
         if self.retract is not None:
             payload["retract"] = dict(self.retract)
+        elif self.retract_id_hint is not None:
+            # Keep the identity of a corrupt leg across a save, so a
+            # reload still knows which retract it belongs to.
+            payload["retract"] = {"retract_id": self.retract_id_hint}
         return payload
 
     @classmethod
@@ -1026,6 +1063,11 @@ class OutboxEntry:
             edit_id_hint=None if edit is not None else _raw_edit_id(raw.get("edit")),
             reaction=reaction,
             retract=retract,
+            retract_id_hint=(
+                None
+                if retract is not None
+                else _raw_retract_id(raw.get("retract"))
+            ),
         )
 
 
@@ -3445,7 +3487,11 @@ class Mailbox:
             del self._sent_group_retracted[oldest[0]]
 
     def record_retract_cleanup_blocked(
-        self, retract_id: str, *, now: Optional[float] = None
+        self,
+        retract_id: str,
+        *,
+        now: Optional[float] = None,
+        timeout: Optional[float] = None,
     ) -> None:
         """Remember that a group retract's fan-out can never complete.
 
@@ -3453,38 +3499,88 @@ class Mailbox:
         so a member still holds the message: the sender's local copies
         must survive even after the last queued leg delivers (see
         :meth:`tau.node.TauNode._deliver_queued_retract`). Recording the
-        same retract again refreshes the marker.
+        same retract again refreshes the marker. With ``timeout`` set,
+        the wait for the mailbox lock is bounded by it (a
+        ``TimeoutError`` is raised once the budget is spent), so a
+        caller with its own deadline — a delivery sweep, say — is not
+        held past it by a stalled lock holder.
         """
-        timestamp = now if now is not None else time.time()
-        with self._transaction():
-            self._retract_cleanup_blocked[retract_id] = (
-                timestamp + SENT_RETRACTED_RETENTION
+        with self._transaction(timeout=timeout):
+            self._record_retract_cleanup_blocked_locked(
+                retract_id, now=now
             )
-            self._evict_retract_cleanup_blocked()
             self.save()
 
-    def is_retract_cleanup_blocked(
+    def _record_retract_cleanup_blocked_locked(
         self, retract_id: str, *, now: Optional[float] = None
+    ) -> None:
+        """Record a cleanup block; call with the transaction held.
+
+        The caller saves: this only mutates the in-memory marker pool,
+        so a removal in the same transaction (see
+        :meth:`tau.node.TauNode._remove_queued_version`) is persisted
+        with it atomically.
+        """
+        timestamp = now if now is not None else time.time()
+        self._retract_cleanup_blocked[retract_id] = (
+            timestamp + SENT_RETRACTED_RETENTION
+        )
+        self._evict_retract_cleanup_blocked()
+
+    def is_retract_cleanup_blocked(
+        self,
+        retract_id: str,
+        *,
+        now: Optional[float] = None,
+        timeout: Optional[float] = None,
     ) -> bool:
         """True while a live cleanup-blocked marker covers this retract.
 
         An expired marker reads as absent even before :meth:`prune`
-        sweeps it away.
+        sweeps it away. With ``timeout`` set, the wait for the
+        in-process lock is bounded by it (a ``TimeoutError`` is raised
+        once the budget is spent), so a caller with its own deadline
+        is not held past it by a stalled lock holder; with no timeout
+        the wait is unbounded, as before.
         """
-        with self._lock:
-            timestamp = now if now is not None else time.time()
-            until = self._retract_cleanup_blocked.get(retract_id)
-            return until is not None and timestamp < until
+        timestamp = now if now is not None else time.time()
+        if timeout is None:
+            with self._lock:
+                until = self._retract_cleanup_blocked.get(retract_id)
+        else:
+            acquired = self._lock.acquire(timeout=max(0.0, timeout))
+            if not acquired:
+                raise TimeoutError("mailbox lock is held by another thread")
+            try:
+                until = self._retract_cleanup_blocked.get(retract_id)
+            finally:
+                self._lock.release()
+        return until is not None and timestamp < until
 
     def _evict_retract_cleanup_blocked(self) -> None:
         """Drop earliest-expiry cleanup-blocked markers until the pool fits.
 
-        Call with the transaction held.
+        Call with the transaction held. A marker whose retract still
+        has a queued leg is never evicted: evicting it would let the
+        surviving leg's delivery delete the sender's copies while a
+        member still holds the message. The pool can grow past the cap
+        while legs are outstanding — at most one marker per queued leg,
+        and the outbox itself is capped.
         """
+        live = {
+            entry.group_retract_id
+            for entry in self._outbox.values()
+            if entry.group_retract_id is not None
+        }
         while len(self._retract_cleanup_blocked) > MAX_RETRACT_CLEANUP_BLOCKED:
-            oldest = min(
-                self._retract_cleanup_blocked.items(), key=lambda kv: kv[1]
-            )
+            candidates = [
+                (retract_id, until)
+                for retract_id, until in self._retract_cleanup_blocked.items()
+                if retract_id not in live
+            ]
+            if not candidates:
+                break
+            oldest = min(candidates, key=lambda kv: kv[1])
             del self._retract_cleanup_blocked[oldest[0]]
 
     # -- pending fetch acknowledgements --------------------------------------
@@ -3574,11 +3670,11 @@ class Mailbox:
                     continue
                 if getattr(entry, "group_id", None) is None:
                     continue
-                retract = getattr(entry, "retract", None)
-                if not isinstance(retract, dict):
-                    continue
-                retract_id = retract.get("retract_id")
-                if not isinstance(retract_id, str) or not retract_id:
+                # The retract id survives a corrupt payload as a hint
+                # (see OutboxEntry.group_retract_id), so a damaged leg
+                # still blocks the cleanup its fan-out can never finish.
+                retract_id = entry.group_retract_id
+                if not retract_id:
                     continue
                 self._retract_cleanup_blocked[retract_id] = (
                     timestamp + SENT_RETRACTED_RETENTION
