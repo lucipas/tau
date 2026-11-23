@@ -1452,6 +1452,125 @@ def test_devices_redeem_retry_clears_stale_offers_after_failed_reset(
     assert f"paired from: {destination_a}" in out
 
 
+def test_devices_redeem_retry_clears_stale_pairing_after_failed_reset(
+    tmp_path, capsys, monkeypatch
+):
+    # A node that was already paired, then suffers a failed reset
+    # plus a failed identity rollback, keeps the previous identity's
+    # pairing record (Qodo Warning on #729): the retry must be
+    # allowed to clear that stale pairing via the pending reset
+    # instead of being rejected as already redeemed.
+    node_a = _init_node(tmp_path, "a", "alice")
+    node_b = _init_node(tmp_path, "b", "bob")
+    node_c = _init_node(tmp_path, "c", "carol")
+    capsys.readouterr()
+    destination_a = _destination(node_a, capsys)
+    destination_c = _destination(node_c, capsys)
+    # Bob pairs from Carol first.
+    bundle_c_path = tmp_path / "carol-pairing.json"
+    assert (
+        cli.main(
+            ["devices", "pair", "--to", str(bundle_c_path), "--data-dir", str(node_c)]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert (
+        cli.main(
+            [
+                "devices",
+                "redeem",
+                "--from",
+                str(bundle_c_path),
+                "--data-dir",
+                str(node_b),
+                "--force",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert cli.main(["devices", "list", "--data-dir", str(node_b)]) == 0
+    assert f"paired from: {destination_c}" in capsys.readouterr().out
+    # Now Alice's bundle for Bob, with the reset and the rollback
+    # both failing.
+    bundle_path = tmp_path / "pairing.json"
+    assert (
+        cli.main(
+            ["devices", "pair", "--to", str(bundle_path), "--data-dir", str(node_a)]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    original_reset = DeviceRegistry.reset
+    calls = []
+
+    def _fail_first_reset(self, *, now=None):
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError("disk full")
+        return original_reset(self, now=now)
+
+    def _fail_restore(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(DeviceRegistry, "reset", _fail_first_reset)
+    monkeypatch.setattr(cli, "atomic_write_bytes", _fail_restore)
+    code = cli.main(
+        [
+            "devices",
+            "redeem",
+            "--from",
+            str(bundle_path),
+            "--data-dir",
+            str(node_b),
+            "--force",
+        ]
+    )
+    assert code == 1
+    assert "disk full" in capsys.readouterr().err
+    # Alice's identity is installed, but Carol's pairing is still listed.
+    assert _destination(node_b, capsys) == destination_a
+    assert cli.main(["devices", "list", "--data-dir", str(node_b)]) == 0
+    out = capsys.readouterr().out
+    assert f"paired from: {destination_c}" in out
+
+    # Retry: the pending reset clears the stale pairing, and the new
+    # pairing is recorded for Alice.
+    code = cli.main(
+        [
+            "devices",
+            "redeem",
+            "--from",
+            str(bundle_path),
+            "--data-dir",
+            str(node_b),
+            "--force",
+        ]
+    )
+    assert code == 0
+    assert cli.main(["devices", "list", "--data-dir", str(node_b)]) == 0
+    out = capsys.readouterr().out
+    assert f"paired from: {destination_a}" in out
+
+    # A replay of the same bundle now carries the same token as the
+    # recorded pairing, so it must still be refused.
+    code = cli.main(
+        [
+            "devices",
+            "redeem",
+            "--from",
+            str(bundle_path),
+            "--data-dir",
+            str(node_b),
+            "--force",
+        ]
+    )
+    assert code == 1
+    assert "already redeemed" in capsys.readouterr().err
+
+
 def test_devices_import_corrupt_registry_rolls_back_identity(
     tmp_path, capsys, monkeypatch
 ):
