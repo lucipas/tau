@@ -1437,11 +1437,11 @@ def test_devices_redeem_retry_clears_stale_offers_after_failed_reset(
     original_reset = DeviceRegistry.reset
     calls = []
 
-    def _fail_first_reset(self, *, now=None, keep_offers_from=None):
+    def _fail_first_reset(self, *, now=None, keep_offers_owned_by=None):
         calls.append(1)
         if len(calls) == 1:
             raise OSError("disk full")
-        return original_reset(self, now=now, keep_offers_from=keep_offers_from)
+        return original_reset(self, now=now, keep_offers_owned_by=keep_offers_owned_by)
 
     def _fail_restore(*args, **kwargs):
         raise OSError("disk full")
@@ -1653,11 +1653,11 @@ def test_devices_redeem_retry_clears_stale_pairing_after_failed_reset(
     original_reset = DeviceRegistry.reset
     calls = []
 
-    def _fail_first_reset(self, *, now=None, keep_offers_from=None):
+    def _fail_first_reset(self, *, now=None, keep_offers_owned_by=None):
         calls.append(1)
         if len(calls) == 1:
             raise OSError("disk full")
-        return original_reset(self, now=now, keep_offers_from=keep_offers_from)
+        return original_reset(self, now=now, keep_offers_owned_by=keep_offers_owned_by)
 
     def _fail_restore(*args, **kwargs):
         raise OSError("disk full")
@@ -1810,6 +1810,4 @@ def test_backup_preserves_device_registry(tmp_path, capsys):
         ["devices", "redeem", "--from", str(bundle_path), "--data-dir", str(node_c)]
     )
     assert code == 1
-    assert "already redeemed" in capsys.readouterr().err
-e == 1
     assert "already redeemed" in capsys.readouterr().err

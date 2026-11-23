@@ -297,6 +297,13 @@ class DeviceRegistry:
                     "token": _clean_hex(entry.get("token"), "token"),
                     "created_at": _clean_time(entry.get("created_at"), "created_at"),
                     "expires_at": _clean_time(entry.get("expires_at"), "expires_at"),
+                    # Offers recorded before owners were tracked have no
+                    # owner and are dropped by an owner-scoped reset.
+                    "owner": (
+                        None
+                        if entry.get("owner") is None
+                        else _clean_hex(entry.get("owner"), "owner")
+                    ),
                 }
             )
         return cleaned
@@ -556,7 +563,7 @@ class DeviceRegistry:
                 self._issued = []
             else:
                 self._issued = [
-                    entry for entry in self._issued if entry["owner"] == owner
+                    entry for entry in self._issued if entry.get("owner") == owner
                 ]
             self._redeemed = [
                 entry for entry in self._redeemed if entry["expires_at"] > moment
@@ -567,4 +574,3 @@ class DeviceRegistry:
             for entry in self._redeemed:
                 entry["reset_pending"] = False
             self._paired_from = None
-= None
