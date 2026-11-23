@@ -14120,10 +14120,13 @@ def _recover_stranded_pairing(
     # atomically).  If the reset already ran, offers issued since must
     # not be dropped by a retry; if it never ran, complete it here
     # before recording the pairing, and fail instead of returning
-    # success with stale records if it still cannot run.
+    # success with stale records if it still cannot run.  The node
+    # has served as the new identity since the failed attempt, so
+    # offers minted at or after the failed redemption belong to it:
+    # keep those, drop only the old identity's offers (see #732).
     if entry.get("reset_pending"):
         try:
-            registry.reset()
+            registry.reset(keep_offers_from=entry["redeemed_at"])
         except (OSError, DevicesError) as exc:
             raise NodeError(
                 f"could not complete the pairing reset ({exc}); "

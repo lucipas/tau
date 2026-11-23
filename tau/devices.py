@@ -505,7 +505,12 @@ class DeviceRegistry:
                 if entry["token"] == cleaned_token:
                     entry["paired"] = True
 
-    def reset(self, *, now: Optional[float] = None) -> None:
+    def reset(
+        self,
+        *,
+        now: Optional[float] = None,
+        keep_offers_from: Optional[float] = None,
+    ) -> None:
         """Drop the pairing records tied to the replaced identity.
 
         Issued offers and the pairing itself belong to the identity
@@ -519,10 +524,30 @@ class DeviceRegistry:
         would let the same bundle be redeemed again with ``--force``
         after the swap (see #716).  Only expired tokens are pruned,
         the same rule :meth:`record_redeemed` applies.
+
+        *keep_offers_from* is only for the pending reset a
+        stranded-pairing retry completes (see #732): after a failed
+        redeem the node already serves as the new identity, so offers
+        minted at or after the failed redemption's ``redeemed_at``
+        belong to the new identity and are kept — only offers
+        predating it are dropped.  A plain swap (``tau id import``
+        or a first redeem) passes no threshold and drops every offer.
         """
         moment = time.time() if now is None else float(now)
+        threshold = (
+            None
+            if keep_offers_from is None
+            else _clean_time(keep_offers_from, "keep_offers_from")
+        )
         with self._transaction():
-            self._issued = []
+            if threshold is None:
+                self._issued = []
+            else:
+                self._issued = [
+                    entry
+                    for entry in self._issued
+                    if entry["created_at"] >= threshold
+                ]
             self._redeemed = [
                 entry for entry in self._redeemed if entry["expires_at"] > moment
             ]
