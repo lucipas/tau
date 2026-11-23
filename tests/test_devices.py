@@ -10,6 +10,7 @@ import pytest
 import RNS
 
 from tau import cli
+from tau.config import TauConfig
 from tau.devices import (
     DEFAULT_PAIRING_TTL_SECONDS,
     MAX_PAIRING_BUNDLE_BYTES,
@@ -20,6 +21,7 @@ from tau.devices import (
     verify_pairing_bundle,
 )
 from tau.identity import IdentityError, destination_hash, load_or_create_identity
+from tau.node import InstanceLock
 from tau.peers import PUBLIC_KEY_BYTES, PeerRegistry
 
 
@@ -351,6 +353,40 @@ def test_devices_pair_refuses_existing_bundle_without_force(tmp_path, capsys):
         )
         == 0
     )
+
+
+def test_devices_pair_refuses_while_node_serving(tmp_path, capsys):
+    # Minting under the instance lock: a concurrent `tau id import
+    # --force` cannot slip between the bundle creation and
+    # record_issued() and land the old identity's offer in the
+    # replacement identity's registry (see #715).  When the lock is
+    # held — this process stands in for the serving node — pair fails
+    # before minting anything: no bundle file and no recorded offer.
+    node = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()
+    config = TauConfig.resolve(data_dir=node)
+    lock = InstanceLock(config.instance_lock_path, config.data_dir)
+    lock.acquire()
+    try:
+        bundle_path = tmp_path / "pairing.json"
+        code = cli.main(
+            [
+                "devices",
+                "pair",
+                "--to",
+                str(bundle_path),
+                "--data-dir",
+                str(node),
+            ]
+        )
+    finally:
+        lock.release()
+    assert code == 1
+    assert "already serving" in capsys.readouterr().err
+    assert not bundle_path.exists()
+    assert not list(tmp_path.glob(".pairing.json.*.tmp"))
+    assert cli.main(["devices", "list", "--data-dir", str(node)]) == 0
+    assert "no pairing offers issued" in capsys.readouterr().out
 
 
 def test_devices_pair_failed_repair_keeps_previous_bundle(
