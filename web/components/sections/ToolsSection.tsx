@@ -203,13 +203,21 @@ export default function ToolsSection() {
             disabled={busy}
             onClick={() => {
               setBackupVerify(null);
-              void run(
-                async () => {
+              setBackupVerifyError(null);
+              void (async () => {
+                setBusy(true);
+                try {
                   const result = await verifyLatestAutoBackup();
                   setBackupVerify(result);
-                },
-                "Latest automatic backup verified — it would restore.",
-              );
+                  setNotice("Latest automatic backup verified — it would restore.");
+                } catch (err) {
+                  // Kept separate from `error` so a concurrent doctor
+                  // refresh cannot clear the failed check's result.
+                  setBackupVerifyError(err instanceof Error ? err.message : String(err));
+                } finally {
+                  setBusy(false);
+                }
+              })();
             }}
             className="rounded-full border border-zinc-700 px-4 py-1.5 text-sm font-semibold text-zinc-200 hover:bg-zinc-900 disabled:opacity-50"
           >
@@ -262,6 +270,11 @@ export default function ToolsSection() {
             />
           </label>
         </div>
+        {backupVerifyError !== null && (
+          <p role="alert" className="mt-3 text-sm text-red-400">
+            {backupVerifyError}
+          </p>
+        )}
         {backupVerify !== null && (
           <div className="mt-3 rounded-lg border border-zinc-800 bg-zinc-900/50 px-3 py-2">
             <p className="text-sm font-semibold text-emerald-300">
