@@ -1012,13 +1012,17 @@ class PeerRegistry:
     def save(self) -> bool:
         if self.path is None:
             return False
+        # Snapshot and write under the same lock: two concurrent saves
+        # must not write snapshots in a different order from when they
+        # were taken, or an older snapshot can overwrite a peer added
+        # by the later save (see #762).
         with self._lock:
             payload = {
                 "version": REGISTRY_VERSION,
                 "saved_at": time.time(),
                 "peers": [peer.to_dict() for peer in self._peers.values()],
             }
-        atomic_write_json(self.path, payload, mode=0o600)
+            atomic_write_json(self.path, payload, mode=0o600)
         return True
 
     def public_peers(

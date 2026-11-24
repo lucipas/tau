@@ -179,6 +179,16 @@ export interface VerifyResult {
   fingerprint_changed: boolean;
 }
 
+/** Result of adding a peer from a shared contact card. */
+export interface AddPeerResult {
+  /** 32-char lowercase hex destination hash of the added peer. */
+  peer: string;
+  name: string;
+  /** True when the peer was already in the registry. */
+  known: boolean;
+  verified: boolean;
+}
+
 export interface BlockResult {
   peer: { destination: string; name: string };
   blocked: boolean;
@@ -393,6 +403,8 @@ export interface ChatMessage {
   reactions: MessageReaction[];
   in_reply_to?: ReplyRef;
   location?: LocationPin;
+  /** Shared contact card on a top-level message, if any. */
+  contact?: { name: string; destination_hash: string };
   beacon?: LiveBeacon;
   /** Group or DM poll question carried on the message itself. */
   poll_options?: string[];

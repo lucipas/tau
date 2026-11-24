@@ -70,6 +70,7 @@ from .protocol import (
     _clean_group_poll_target_or_none,
     _clean_group_poll_vote_or_none,
     clean_beacon,
+    clean_contact,
     clean_group_poll_target,
     clean_group_poll_vote,
     clean_group_topic,
@@ -682,6 +683,10 @@ class OutboxEntry:
     # a retry or a sealed relay copy re-sends the same pin, exactly
     # like the quote above.  ``None`` means no pin — the common case.
     location: Optional[Dict[str, Any]] = None
+    # Shared contact card this entry carries (``tau send --contact``):
+    # a retry or a sealed relay copy re-sends the same card, exactly
+    # like the pin above.  ``None`` means no card — the common case.
+    contact: Optional[Dict[str, Any]] = None
     # Live-beacon marker this entry carries (``tau beacon``): the
     # beacon id, its expiry and the update sequence (see
     # ``tau.protocol.clean_beacon``).  A retry or a sealed relay copy
@@ -714,7 +719,7 @@ class OutboxEntry:
     # ``/tau/dm/edit`` bytes (see ``TauNode.send_edit``), so the edit
     # id and signed send time never change across retries.  The
     # entry's ``text`` is the replacement text; ``kind`` is "edit",
-    # and an edit entry never carries poll, location, beacon or reply
+    # and an edit entry never carries poll, location, contact, beacon or reply
     # fields.  Shape: {"target", "text", "edit_id", "sent_at",
     # "target_author"?, "target_sent_at"?, "payload_b64"}.
     edit: Optional[Dict[str, Any]] = None
@@ -728,7 +733,7 @@ class OutboxEntry:
     # so the reaction id and signed send time never change across
     # retries.  The entry's ``text`` is only a display string (the
     # token, or "reaction cleared"); ``kind`` is "reaction", and a
-    # reaction entry never carries poll, location, beacon or reply
+    # reaction entry never carries poll, location, contact, beacon or reply
     # fields.  Shape: {"target", "token", "reaction_id", "sent_at",
     # "target_author"?, "target_sent_at"?, "payload_b64"}.
     reaction: Optional[Dict[str, Any]] = None
@@ -738,7 +743,7 @@ class OutboxEntry:
     # retract id and signed send time never change across retries.
     # The entry's ``text`` is only a display string ("retraction");
     # ``kind`` is "retract", and a retract entry never carries poll,
-    # location, beacon or reply fields.  Shape: {"target",
+    # location, contact, beacon or reply fields.  Shape: {"target",
     # "retract_id", "sent_at", "payload_b64"}.
     retract: Optional[Dict[str, Any]] = None
     # Group-retract identity kept when the stored ``retract`` payload
@@ -860,6 +865,8 @@ class OutboxEntry:
             payload["in_reply_to"] = dict(self.in_reply_to)
         if self.location is not None:
             payload["location"] = dict(self.location)
+        if self.contact is not None:
+            payload["contact"] = dict(self.contact)
         if self.beacon is not None:
             payload["beacon"] = dict(self.beacon)
         if self.poll_options is not None:
@@ -1052,6 +1059,9 @@ class OutboxEntry:
         # A corrupt pin on an already-queued entry must not make the
         # outbox unreadable; the message still delivers, just without it.
         location = clean_location(raw.get("location"))
+        # Same for a corrupt contact card: the message still delivers
+        # as plain text instead of breaking the outbox read.
+        contact = clean_contact(raw.get("contact"))
         # Same for a corrupt beacon marker: the update still delivers
         # as a plain pin instead of breaking the outbox read.
         beacon = clean_beacon(raw.get("beacon"))
@@ -1089,6 +1099,7 @@ class OutboxEntry:
             edited_at=edited_at,
             in_reply_to=in_reply_to,
             location=location,
+            contact=contact,
             beacon=beacon,
             poll_options=poll_options,
             poll_vote=poll_vote,
@@ -1889,6 +1900,7 @@ class Mailbox:
         in_reply_to: Optional[Dict[str, Any]] = None,
         location: Optional[Dict[str, Any]] = None,
         beacon: Optional[Dict[str, Any]] = None,
+        contact: Optional[Dict[str, Any]] = None,
         send_after: Optional[float] = None,
         sent_at: Optional[float] = None,
         edited_at: Optional[float] = None,
@@ -1929,19 +1941,19 @@ class Mailbox:
         ``edit`` marks this entry as a queued edit (see
         ``OutboxEntry.edit``): a retry re-sends the same pre-signed
         ``/tau/dm/edit`` bytes.  An edit entry carries no poll,
-        location, beacon or reply fields, and its kind is forced to
+        location, contact, beacon or reply fields, and its kind is forced to
         "edit" however the caller tagged it.
 
         ``reaction`` marks this entry as a queued reaction (see
         ``OutboxEntry.reaction``): a retry re-sends the same pre-signed
         ``/tau/react`` bytes.  A reaction entry carries no poll,
-        location, beacon or reply fields, and its kind is forced to
+        location, contact, beacon or reply fields, and its kind is forced to
         "reaction" however the caller tagged it.
 
         ``retract`` marks this entry as a queued retract (see
         ``OutboxEntry.retract``): a retry re-sends the same pre-signed
         ``/tau/retract`` bytes.  A retract entry carries no poll,
-        location, beacon or reply fields, and its kind is forced to
+        location, contact, beacon or reply fields, and its kind is forced to
         "retract" however the caller tagged it.
         """
         if sum(
@@ -1962,12 +1974,13 @@ class Mailbox:
                 or poll_vote is not None
                 or poll_close is not None
                 or location is not None
+                or contact is not None
                 or beacon is not None
                 or in_reply_to is not None
             ):
                 raise MailboxError(
                     "a queued edit cannot carry poll, location, "
-                    "beacon or reply fields"
+                    "contact, beacon or reply fields"
                 )
         clean_reaction: Optional[Dict[str, Any]] = None
         if reaction is not None:
@@ -1979,12 +1992,13 @@ class Mailbox:
                 or poll_vote is not None
                 or poll_close is not None
                 or location is not None
+                or contact is not None
                 or beacon is not None
                 or in_reply_to is not None
             ):
                 raise MailboxError(
                     "a queued reaction cannot carry poll, location, "
-                    "beacon or reply fields"
+                    "contact, beacon or reply fields"
                 )
         clean_retract: Optional[Dict[str, Any]] = None
         if retract is not None:
@@ -1996,12 +2010,13 @@ class Mailbox:
                 or poll_vote is not None
                 or poll_close is not None
                 or location is not None
+                or contact is not None
                 or beacon is not None
                 or in_reply_to is not None
             ):
                 raise MailboxError(
                     "a queued retract cannot carry poll, location, "
-                    "beacon or reply fields"
+                    "contact, beacon or reply fields"
                 )
         clean_options: Optional[List[str]] = None
         if poll_options is not None:
@@ -2092,6 +2107,11 @@ class Mailbox:
         if location is not None and cleaned_location is None:
             raise MailboxError(
                 "location must have a latitude -90..90 and a longitude -180..180"
+            )
+        cleaned_contact = clean_contact(contact)
+        if contact is not None and cleaned_contact is None:
+            raise MailboxError(
+                "contact must have a name and a 32 character hex destination hash"
             )
         cleaned_beacon = clean_beacon(beacon)
         if beacon is not None and cleaned_beacon is None:
@@ -2185,6 +2205,7 @@ class Mailbox:
                 edited_at=edited_at_value,
                 in_reply_to=reply_to,
                 location=cleaned_location,
+                contact=cleaned_contact,
                 beacon=cleaned_beacon,
                 poll_options=clean_options,
                 poll_vote=clean_vote,
@@ -3914,6 +3935,7 @@ def seal_message(
     expires_at: Optional[float] = None,
     in_reply_to: Optional[Dict[str, Any]] = None,
     location: Optional[Dict[str, Any]] = None,
+    contact: Optional[Dict[str, Any]] = None,
     beacon: Optional[Dict[str, Any]] = None,
     kind: Optional[str] = None,
     edited_at: Optional[float] = None,
@@ -3942,6 +3964,11 @@ def seal_message(
     travels inside the same signed envelope, so a relayed copy still
     recognises the update as live — and a beacon without a pin is
     rejected, like a direct one.
+    ``contact`` (when given) is a shared contact card — the peer's
+    name and destination hash — travelling inside the same signed
+    envelope, so a relayed copy still renders as a card exactly
+    like a direct one; a malformed card is refused to seal, like a
+    malformed pin.
     ``poll_options`` / ``poll_vote`` / ``poll_close`` (at most one)
     mark the envelope as a poll, a vote, or a close; they travel
     inside the same signed envelope, so a relayed vote still counts
@@ -4191,6 +4218,14 @@ def seal_message(
         )
     if cleaned_location is not None:
         inner["location"] = cleaned_location
+    cleaned_contact = clean_contact(contact)
+    if contact is not None and cleaned_contact is None:
+        raise MailboxError(
+            "contact must have a name and a 32 character hex "
+            "destination hash"
+        )
+    if cleaned_contact is not None:
+        inner["contact"] = cleaned_contact
     cleaned_beacon = clean_beacon(beacon)
     if beacon is not None and cleaned_beacon is None:
         raise MailboxError(
@@ -4451,6 +4486,7 @@ def _validated_sealed_message(payload: Dict[str, Any]) -> Dict[str, Any]:
         "edited_at": edited_at,
         "in_reply_to": in_reply_to,
         "location": clean_location(payload.get("location")),
+        "contact": clean_contact(payload.get("contact")),
         "beacon": clean_beacon(payload.get("beacon")),
     }
     # Poll fields ride the same way: a sealed vote that lost them

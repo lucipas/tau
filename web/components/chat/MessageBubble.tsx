@@ -1,6 +1,7 @@
 // MessageBubble.tsx — one chat message: bubble, reply quote, reactions,
-// file attachment, location pin, group poll + vote, disappearing countdown,
-// and the reply / edit / delete / retract / react / pin / forward actions.
+// file attachment, location pin, contact card, group poll + vote,
+// disappearing countdown, and the reply / edit / delete / retract / react /
+// pin / forward actions.
 
 "use client";
 
@@ -37,6 +38,8 @@ export interface MessageBubbleProps {
   onSnooze?: (message: ChatMessage, inSeconds: number) => void;
   onVotePoll?: (message: ChatMessage, option: number) => void;
   onClosePoll?: (message: ChatMessage) => void;
+  /** Add the peer from a received contact card to the registry. */
+  onAddPeer?: (message: ChatMessage) => Promise<void> | void;
 }
 
 const REACTION_CHOICES = ["👍", "❤️", "😂", "😮", "😢", "🔥"];
@@ -81,6 +84,7 @@ export default function MessageBubble({
   onSnooze,
   onVotePoll,
   onClosePoll,
+  onAddPeer,
 }: MessageBubbleProps) {
   const liveNow = useNow(1000);
   const now = nowProp ?? liveNow;
@@ -89,6 +93,8 @@ export default function MessageBubble({
   const [forwardOpen, setForwardOpen] = useState(false);
   const [snoozeOpen, setSnoozeOpen] = useState(false);
   const [forwardTarget, setForwardTarget] = useState("");
+  const [peerAdded, setPeerAdded] = useState(false);
+  const [addPeerError, setAddPeerError] = useState<string | null>(null);
 
   const own = message.direction === "out";
   const reactions = groupReactions(message);
@@ -155,6 +161,36 @@ export default function MessageBubble({
                 📍 {message.location.name ?? `${message.location.lat.toFixed(5)}, ${message.location.lon.toFixed(5)}`}
               </a>
             </p>
+          )}
+
+          {message.contact && (
+            <div className="mt-1 rounded-lg border border-zinc-600/60 bg-zinc-900/60 px-2 py-1.5 text-sm">
+              <p className="font-semibold">👤 {message.contact.name}</p>
+              <p className="text-xs text-zinc-400">tau:{message.contact.destination_hash.slice(0, 8)}…</p>
+              {!own && onAddPeer && !peerAdded && (
+                <button
+                  type="button"
+                  onClick={async () => {
+                    setAddPeerError(null);
+                    try {
+                      await onAddPeer(message);
+                      setPeerAdded(true);
+                    } catch (err) {
+                      setAddPeerError(err instanceof Error ? err.message : String(err));
+                    }
+                  }}
+                  className={`mt-1 underline ${own ? "text-cyan-100" : "text-cyan-300"} hover:text-zinc-200`}
+                >
+                  Add peer
+                </button>
+              )}
+              {peerAdded && <p className="mt-1 text-xs text-zinc-400">Added — you can message them now.</p>}
+              {addPeerError && (
+                <p role="alert" className="mt-1 text-xs text-red-300">
+                  {addPeerError}
+                </p>
+              )}
+            </div>
           )}
 
           {message.beacon && (

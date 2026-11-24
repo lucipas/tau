@@ -41,6 +41,41 @@ def test_upsert_and_lookup(tmp_path):
     assert registry.resolve(peer.hexhash[:6]) is peer
 
 
+def test_concurrent_saves_keep_every_peer(tmp_path):
+    # Overlapping upsert+save pairs (concurrent Add peer requests, or
+    # an add racing the periodic save) must not lose a peer: a save
+    # that snapshots before another peer lands must not write its
+    # older snapshot over the newer one.
+    import threading
+
+    registry = PeerRegistry(tmp_path / "peers.json")
+    barrier = threading.Barrier(8)
+    errors = []
+
+    def _add(index):
+        try:
+            barrier.wait(timeout=10)
+            make_peer(registry, index, f"peer{index}", now=100.0 + index)
+            registry.save()
+        except Exception as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=_add, args=(index,)) for index in range(1, 9)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+    assert not errors
+    assert not any(thread.is_alive() for thread in threads)
+
+    reloaded = PeerRegistry(tmp_path / "peers.json")
+    assert len(reloaded) == 8
+    for index in range(1, 9):
+        assert reloaded.get(f"peer{index}") is not None
+
+
 def test_remove_drops_peer_and_persists(tmp_path):
     registry = PeerRegistry(tmp_path / "peers.json")
     peer = make_peer(registry, 1, "alice", now=100.0)

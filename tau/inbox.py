@@ -48,6 +48,7 @@ from .protocol import (
     clean_forwarded_from_or_none,
     clean_in_reply_to,
     clean_beacon,
+    clean_contact,
     clean_location,
     excerpt_hash,
     generate_message_id,
@@ -188,6 +189,10 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
     # pin drops instead of the record — the message is still
     # readable, just without its map link.
     location = clean_location(raw.get("location"))
+    # A shared contact card rides the same way: a malformed card
+    # drops instead of the record — the message is still readable,
+    # just without its card.
+    contact = clean_contact(raw.get("contact"))
     # A live-beacon marker rides the same way: a malformed marker
     # drops instead of the record — the update is still readable as
     # a plain pin.
@@ -217,6 +222,8 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
         record["in_reply_to"] = in_reply_to
     if location is not None:
         record["location"] = location
+    if contact is not None:
+        record["contact"] = contact
     if beacon is not None:
         record["beacon"] = beacon
     leg_ids = raw.get("leg_ids")
@@ -1290,6 +1297,7 @@ class Inbox:
         expires_at: Optional[float] = None,
         in_reply_to: Optional[str] = None,
         location: Optional[Dict[str, Any]] = None,
+        contact: Optional[Dict[str, Any]] = None,
         beacon: Optional[Dict[str, Any]] = None,
         poll_options: Optional[Any] = None,
         poll_vote: Optional[str] = None,
@@ -1323,6 +1331,7 @@ class Inbox:
             "expires_at": expires_at,
             "in_reply_to": in_reply_to,
             "location": location,
+            "contact": contact,
             "beacon": beacon,
             "poll_options": poll_options,
             "poll_vote": poll_vote,

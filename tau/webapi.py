@@ -73,7 +73,9 @@ script) can read what arrives from the mesh and send messages back:
                            ``"expires_in"`` and ``"send_in"`` work for DM and group sends;
                            ``"poll_options"`` posts the text as a poll question;
                            ``"location": {"lat": .., "lon": .., "name": ..}`` pins a place —
-                           a pin without text reads as the place name or the coordinates)
+                           a pin without text reads as the place name or the coordinates;
+                           ``"contact": {"name": .., "destination_hash": ..}`` shares a peer's
+                           contact card — a card without text reads as the card line)
     GET  /api/messages/export export stored DMs as the CLI's JSON document (loopback only)
     POST /api/messages/import import a DM export document (loopback only)
     GET  /api/files/<sender>/<name>
@@ -472,9 +474,11 @@ from .protocol import (
     _clean_group_poll_vote_or_none,
     clean_in_reply_to,
     clean_beacon,
+    clean_contact,
     clean_forwarded_from_or_none,
     clean_location,
     clean_reaction,
+    contact_default_text,
     excerpt_hash,
     location_default_text,
     normalize_message,
@@ -1101,6 +1105,12 @@ def _clean_stored_message(entry: Any) -> Optional[Dict[str, Any]]:
     location = clean_location(entry.get("location"))
     if location is not None:
         message["location"] = location
+    # A shared contact card rides the same way, so the feed can
+    # render it with an Add-peer action; a malformed card drops
+    # instead of the entry, and a hand-edited entry keeps its text.
+    contact = clean_contact(entry.get("contact"))
+    if contact is not None:
+        message["contact"] = contact
     # A live-beacon marker rides the same way, so the console can
     # tell a live update from a one-off pin; a malformed marker
     # drops instead of the entry.
@@ -2238,6 +2248,10 @@ class WebBridge:
         location = clean_location(record.get("location"))
         if location is not None and message.get("location") != location:
             message["location"] = location
+            attached = True
+        contact = clean_contact(record.get("contact"))
+        if contact is not None and message.get("contact") != contact:
+            message["contact"] = contact
             attached = True
         marker = clean_beacon(record.get("beacon"))
         if marker is not None and message.get("beacon") != marker:
@@ -6205,6 +6219,7 @@ class WebBridge:
         poll_vote: Optional[Dict[str, Any]] = None,
         poll_close: Optional[Dict[str, Any]] = None,
         location: Optional[Dict[str, Any]] = None,
+        contact: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
         """Send a DM from the console.
 
@@ -6224,6 +6239,11 @@ class WebBridge:
         "lon": .., "name": ..}``); a pin sent without its own text
         reads as the place name (or the coordinates), exactly like
         the CLI's ``--location``.
+
+        ``contact`` shares a peer's contact card on the message
+        (``{"name": .., "destination_hash": ..}``); a card sent
+        without its own text reads as the card line, exactly like
+        the CLI's ``--contact``.
         """
         if not isinstance(target, str) or not target.strip():
             raise ValueError("target peer is required")
@@ -6235,8 +6255,36 @@ class WebBridge:
                     "location must have a latitude -90..90 and a "
                     "longitude -180..180"
                 )
+        cleaned_contact: Optional[Dict[str, Any]] = None
+        if contact is not None:
+            cleaned_contact = clean_contact(contact)
+            if cleaned_contact is None:
+                raise ValueError(
+                    "contact must have a name and a 32 character hex "
+                    "destination hash"
+                )
+            # Sharing yourself is pointless — the recipient already has
+            # your hash — and a blocked peer must not be amplified to
+            # a third party, mirroring the CLI's --contact refusals.
+            if cleaned_contact["destination_hash"] == getattr(
+                self.node, "destination_hexhash", ""
+            ):
+                raise ValueError(
+                    "cannot share your own contact: the recipient "
+                    "already has your hash"
+                )
+            blocklist = getattr(self.node, "blocklist", None)
+            if blocklist is None:
+                raise ValueError(
+                    "cannot share a contact: the block-list could not "
+                    "be read"
+                )
+            if blocklist.is_blocked(cleaned_contact["destination_hash"]):
+                raise ValueError("cannot share a contact for a blocked peer")
         if not isinstance(text, str) or not text.strip():
-            if cleaned_location is not None:
+            if cleaned_contact is not None:
+                text = contact_default_text(cleaned_contact)
+            elif cleaned_location is not None:
                 text = location_default_text(cleaned_location)
             else:
                 raise ValueError("message text is required")
@@ -6314,6 +6362,7 @@ class WebBridge:
             poll_vote=poll_vote,
             poll_close=poll_close,
             location=cleaned_location,
+            contact=cleaned_contact,
         )
         queued = bool(response.get("queued"))
         # Record the effective expiry (explicit or per-conversation
@@ -6347,6 +6396,7 @@ class WebBridge:
                 poll_vote=poll_vote,
                 poll_close=poll_close,
                 location=cleaned_location,
+                contact=cleaned_contact,
             )
             if message is None:
                 # The send was retracted while its console record was
@@ -6407,6 +6457,7 @@ class WebBridge:
         poll_vote: Optional[Dict[str, Any]] = None,
         poll_close: Optional[Dict[str, Any]] = None,
         location: Optional[Dict[str, Any]] = None,
+        contact: Optional[Dict[str, Any]] = None,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """Send a message to every member of a group from the console.
 
@@ -6440,6 +6491,11 @@ class WebBridge:
         reads as the place name (or the coordinates), exactly like
         the CLI's ``--location``.
 
+        ``contact`` shares a peer's contact card on every leg
+        (``{"name": .., "destination_hash": ..}``); a card sent
+        without its own text reads as the card line, exactly like
+        the CLI's ``--contact``.
+
         The group is resolved by id, id prefix, or exact name through
         ``GroupStore.find`` (unknown or ambiguous queries raise
         ``ValueError``).  One outbound feed entry is recorded per leg,
@@ -6465,8 +6521,36 @@ class WebBridge:
                     "location must have a latitude -90..90 and a "
                     "longitude -180..180"
                 )
+        cleaned_contact: Optional[Dict[str, Any]] = None
+        if contact is not None:
+            cleaned_contact = clean_contact(contact)
+            if cleaned_contact is None:
+                raise ValueError(
+                    "contact must have a name and a 32 character hex "
+                    "destination hash"
+                )
+            # Sharing yourself is pointless — the recipient already has
+            # your hash — and a blocked peer must not be amplified to
+            # a third party, mirroring the CLI's --contact refusals.
+            if cleaned_contact["destination_hash"] == getattr(
+                self.node, "destination_hexhash", ""
+            ):
+                raise ValueError(
+                    "cannot share your own contact: the recipient "
+                    "already has your hash"
+                )
+            blocklist = getattr(self.node, "blocklist", None)
+            if blocklist is None:
+                raise ValueError(
+                    "cannot share a contact: the block-list could not "
+                    "be read"
+                )
+            if blocklist.is_blocked(cleaned_contact["destination_hash"]):
+                raise ValueError("cannot share a contact for a blocked peer")
         if not isinstance(text, str) or not text.strip():
-            if cleaned_location is not None:
+            if cleaned_contact is not None:
+                text = contact_default_text(cleaned_contact)
+            elif cleaned_location is not None:
                 text = location_default_text(cleaned_location)
             else:
                 raise ValueError("message text is required")
@@ -6542,6 +6626,7 @@ class WebBridge:
             poll_vote=poll_vote,
             poll_close=poll_close,
             location=cleaned_location,
+            contact=cleaned_contact,
         )
         # Every leg shares one wire send time (the node's send_group_
         # message returns it): record that on each outbound entry, not
@@ -6597,6 +6682,7 @@ class WebBridge:
                     poll_vote=poll_vote,
                     poll_close=poll_close,
                     location=cleaned_location,
+                    contact=cleaned_contact,
                 )
                 if message is None:
                     # This leg was retracted while its console record
@@ -10163,6 +10249,67 @@ class WebBridge:
             and previous_fingerprint != number,
         }
 
+    def add_peer(self, destination_hash: str, *, timeout: float = 10.0) -> Dict[str, Any]:
+        """Resolve a shared contact's hash into the registry.
+
+        A contact card names a peer by destination hash, which is
+        not enough to message them until their announce is heard:
+        this resolves the hash the way a send does (waiting up to
+        *timeout* for the announce) and returns the peer the
+        registry now holds — name, hash, and whether they were
+        already known.  The card's name is the sender's claim; the
+        name returned here is the peer's own announced name, which
+        is the source of truth.  A peer that is not announcing
+        raises, so the console can say so instead of adding a
+        contact it cannot reach.
+        """
+        if not isinstance(destination_hash, str) or not destination_hash.strip():
+            raise ValueError("field 'destination_hash' is required")
+        target = destination_hash.strip().lower()
+        if len(target) != 32:
+            raise ValueError("destination_hash must be a 32 character hex hash")
+        try:
+            bytes.fromhex(target)
+        except ValueError as exc:
+            raise ValueError(
+                "destination_hash must be a 32 character hex hash"
+            ) from exc
+        known = self.node.registry.get(target) is not None
+        peer = self.node.resolve_peer(target, timeout=timeout)
+        # Persist on every successful add, not only when the peer was
+        # unknown at the start of the request: a failed save leaves
+        # the discovered peer in memory, and a retry would otherwise
+        # treat it as known and report success without ever saving
+        # it.  The save runs under the node's save lock, like the
+        # periodic save, so a concurrent Add peer or periodic save
+        # cannot write a stale snapshot over this one.
+        lock = getattr(self.node, "_save_lock", None) or nullcontext()
+        with lock:
+            # Pick up aliases and notes a one-shot command saved since
+            # the last refresh, so this save does not write back stale
+            # ones — the same reason the verify path refreshes first.
+            # (Without it, adding an already-known contact silently
+            # erased a `tau peers alias`/`note` change made on disk.)
+            self.node.registry.refresh_aliases()
+            try:
+                saved = self.node.registry.save()
+            except OSError as exc:
+                raise WebBridgeError(
+                    "could not save the peer registry; the contact "
+                    "was not added"
+                ) from exc
+            if not saved:
+                raise WebBridgeError(
+                    "could not save the peer registry; the contact "
+                    "was not added"
+                )
+        return {
+            "peer": peer.hexhash,
+            "name": peer.display_name,
+            "known": known,
+            "verified": peer.is_verified,
+        }
+
     def _resolve_block_target(self, target: str) -> str:
         """Resolve a block/unblock target the way the CLI does.
 
@@ -13288,6 +13435,7 @@ class WebBridge:
         poll_vote: Optional[Dict[str, Any]] = None,
         poll_close: Optional[Dict[str, Any]] = None,
         location: Optional[Dict[str, Any]] = None,
+        contact: Optional[Dict[str, Any]] = None,
         save: bool = True,
         reject_removed_wire_id: bool = False,
     ) -> Optional[Dict[str, Any]]:
@@ -13378,6 +13526,14 @@ class WebBridge:
             )
             if cleaned_location is not None:
                 message["location"] = cleaned_location
+            # A shared contact card rides on the console entry so the
+            # feed can render it; a malformed card drops instead of
+            # the entry, like a malformed pin above.
+            cleaned_contact = (
+                clean_contact(contact) if contact is not None else None
+            )
+            if cleaned_contact is not None:
+                message["contact"] = cleaned_contact
             self._next_message_id += 1
             self._messages.append(message)
         # A bulk caller (import mirroring) passes save=False and saves
@@ -15853,6 +16009,28 @@ class _WebHandler(BaseHTTPRequestHandler):
                     return
                 self._send_json({"ok": True, "verify": result}, head_only)
                 return
+            if path == "/api/peers/add":
+                destination_hash = body.get("destination_hash")
+                if not isinstance(destination_hash, str) or not destination_hash.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'destination_hash' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    result = self.bridge.add_peer(destination_hash.strip())
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                except (ValueError, PeerError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except NodeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 502)
+                    return
+                self._send_json({"ok": True, "peer": result}, head_only)
+                return
             if path in ("/api/peers/block", "/api/peers/unblock"):
                 target = body.get("target")
                 if not isinstance(target, str) or not target.strip():
@@ -17611,9 +17789,13 @@ class _WebHandler(BaseHTTPRequestHandler):
                 {"error": {"message": "field 'to' is required"}}, head_only, 400
             )
             return
-        if text is None and body.get("location") is not None:
+        if text is None and (
+            body.get("location") is not None or body.get("contact") is not None
+        ):
             # A pin without its own text: the bridge defaults it to
-            # the place name (or the coordinates), like the CLI.
+            # the place name (or the coordinates), like the CLI.  A
+            # card without its own text defaults the same way, to the
+            # card line.
             text = ""
         if not isinstance(text, str):
             self._send_json(
@@ -17692,6 +17874,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                 reply_to=reply_to,
                 poll_options=body.get("poll_options"),
                 location=body.get("location"),
+                contact=body.get("contact"),
             )
         except (ValueError, ProtocolError) as exc:
             self._send_json({"error": {"message": str(exc)}}, head_only, 400)
@@ -17743,9 +17926,13 @@ class _WebHandler(BaseHTTPRequestHandler):
                 400,
             )
             return
-        if text is None and body.get("location") is not None:
+        if text is None and (
+            body.get("location") is not None or body.get("contact") is not None
+        ):
             # A pin without its own text: the bridge defaults it to
-            # the place name (or the coordinates), like the CLI.
+            # the place name (or the coordinates), like the CLI.  A
+            # card without its own text defaults the same way, to the
+            # card line.
             text = ""
         if not isinstance(text, str):
             self._send_json(
@@ -17826,6 +18013,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                 reply_to=reply_to,
                 poll_options=body.get("poll_options"),
                 location=body.get("location"),
+                contact=body.get("contact"),
             )
         except ValueError as exc:
             # GroupStore.find raises ValueError for both an unknown

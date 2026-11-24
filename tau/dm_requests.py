@@ -56,7 +56,13 @@ from .allowlist import (
 )
 from .blocklist import BlockListError, load_blocked_set, load_blocklist, save_blocklist
 from .inbox import InboxError
-from .protocol import ProtocolError, clean_beacon, clean_in_reply_to, clean_location
+from .protocol import (
+    ProtocolError,
+    clean_beacon,
+    clean_contact,
+    clean_in_reply_to,
+    clean_location,
+)
 from .util import atomic_write_json
 
 log = logging.getLogger(__name__)
@@ -120,6 +126,9 @@ class DmRequest:
     # Static location pin the held message carried, so an accepted
     # request delivers the pin with the message, like its quote.
     location: Optional[Dict[str, Any]] = None
+    # Shared contact card the held message carried, so an accepted
+    # request delivers the card with the message, like its pin.
+    contact: Optional[Dict[str, Any]] = None
     # Live-beacon marker the held message carried, so an accepted
     # request delivers the update as live, like its pin.
     beacon: Optional[Dict[str, Any]] = None
@@ -140,6 +149,8 @@ class DmRequest:
             data["in_reply_to"] = self.in_reply_to
         if self.location is not None:
             data["location"] = self.location
+        if self.contact is not None:
+            data["contact"] = self.contact
         if self.beacon is not None:
             data["beacon"] = self.beacon
         return data
@@ -167,6 +178,9 @@ class DmRequest:
         # A malformed pin drops instead of the request — the held
         # message is still reviewable, just without its map link.
         location = clean_location(data.get("location"))
+        # Same for a malformed contact card: the message is still
+        # reviewable, just without its card.
+        contact = clean_contact(data.get("contact"))
         # Same for a malformed beacon marker: the update still
         # delivers as a plain pin.
         beacon = clean_beacon(data.get("beacon"))
@@ -183,6 +197,7 @@ class DmRequest:
             expires_at=_clean_optional_timestamp(data.get("expires_at"), "expires_at"),
             in_reply_to=in_reply_to,
             location=location,
+            contact=contact,
             beacon=beacon,
         )
 
@@ -587,6 +602,8 @@ def accept_dm_request(
                     record["in_reply_to"] = request.in_reply_to
                 if request.location is not None:
                     record["location"] = request.location
+                if request.contact is not None:
+                    record["contact"] = request.contact
                 if request.beacon is not None:
                     record["beacon"] = request.beacon
                 # A copy the inbox holds only in memory — a live

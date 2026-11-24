@@ -229,6 +229,37 @@ def test_send_message_sends_location_on_the_wire(tmp_path, monkeypatch):
     assert parse_message(sent["payload"])["kind"] == "chat"
 
 
+def test_send_message_sends_contact_on_the_wire(tmp_path, monkeypatch):
+    node = make_node(tmp_path)
+    peer = make_peer()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name=peer.name, now=1.0
+    )
+    sent = {}
+
+    def fake_request(peer_arg, path, payload, timeout):
+        sent["payload"] = payload
+        return {"ok": True, "delivered": True}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+    card = {"name": "carol", "destination_hash": "cc" * 16}
+    node.send_message("alice", "meet carol", contact=card)
+    parsed = parse_message(sent["payload"])
+    assert parsed["contact"] == card
+    # A card without an explicit kind is a contact message, so the
+    # receiver can filter on it; an explicit kind wins; and the card
+    # wins over a pin on the same message, which rides along.
+    assert parsed["kind"] == "contact"
+    node.send_message("alice", "meet carol", kind="chat", contact=card)
+    assert parse_message(sent["payload"])["kind"] == "chat"
+    pin = {"lat": 34.05, "lon": -83.88, "name": "Rock Springs Park"}
+    node.send_message("alice", "meet carol", contact=card, location=pin)
+    parsed = parse_message(sent["payload"])
+    assert parsed["kind"] == "contact"
+    assert parsed["contact"] == card
+    assert parsed["location"] == pin
+
+
 def test_send_message_sends_poll_options_on_the_wire(tmp_path, monkeypatch):
     node = make_node(tmp_path)
     peer = make_peer()
@@ -365,6 +396,14 @@ def test_send_message_rejects_invalid_location(tmp_path):
     node = make_node(tmp_path)
     with pytest.raises(NodeError):
         node.send_message("alice", "hi", location={"lat": 91, "lon": 0})
+
+
+def test_send_message_rejects_invalid_contact(tmp_path):
+    node = make_node(tmp_path)
+    with pytest.raises(NodeError):
+        node.send_message(
+            "alice", "hi", contact={"name": "carol", "destination_hash": "zz"}
+        )
 
 
 def test_send_message_queues_location_for_offline_peer(tmp_path, monkeypatch):
@@ -3742,6 +3781,38 @@ def test_send_group_edit_keeps_poll_options_on_scheduled_requeue(tmp_path, monke
     assert len(legs) == 2
     assert all(leg.text == "which weekend?" for leg in legs)
     assert all(leg.poll_options == ["Saturday", "Sunday"] for leg in legs)
+
+
+def test_send_group_edit_keeps_contact_on_scheduled_requeue(tmp_path, monkeypatch):
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    send_after = time.time() + 3600.0
+    card = {"name": "carol", "destination_hash": "cc" * 16}
+    response = node.send_group_message(
+        "crew",
+        "meet carol",
+        contact=card,
+        send_after=send_after,
+    )
+    assert all(result.get("queued") for result in response["results"])
+    sent_at = response["sent_at"]
+    record = node.inbox.list_messages(direction="out")[0]
+
+    monkeypatch.setattr(
+        node,
+        "_request",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("no live edit may go out for a scheduled leg")
+        ),
+    )
+    edit = node.send_group_edit(
+        "crew", record["id"], "meet carol soon", target_sent_at=sent_at
+    )
+
+    assert edit["ok"] is True
+    legs = node.mailbox.outbox_list()
+    assert len(legs) == 2
+    assert all(leg.text == "meet carol soon" for leg in legs)
+    assert all(leg.contact == card for leg in legs)
 
 
 def test_send_group_edit_skips_live_edit_when_scheduled_requeue_fails(

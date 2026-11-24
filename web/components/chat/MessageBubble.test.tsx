@@ -171,6 +171,65 @@ describe("MessageBubble", () => {
     expect(screen.getByText(/34\.05000, -83\.88000/)).toBeTruthy();
   });
 
+  it("renders a contact card with an Add peer action", async () => {
+    const onAddPeer = vi.fn().mockResolvedValue(undefined);
+    render(
+      <MessageBubble
+        message={makeMessage({
+          id: 13,
+          text: "👤 Shared contact: carol (cccccccc…)",
+          contact: { name: "carol", destination_hash: "cc".repeat(16) },
+        })}
+        onAddPeer={onAddPeer}
+        now={1700000060}
+      />,
+    );
+    // The card shows the peer's name and short hash (the message text
+    // also names them, so assert on the card's hash line).
+    expect(screen.getByText(/tau:cccccccc/)).toBeTruthy();
+    fireEvent.click(screen.getByText("Add peer"));
+    expect(onAddPeer).toHaveBeenCalledWith(expect.objectContaining({ id: 13 }));
+    await vi.waitFor(() => expect(screen.getByText(/Added/)).toBeTruthy());
+  });
+
+  it("shows the inline error and keeps Add peer when adding fails", async () => {
+    const onAddPeer = vi.fn().mockRejectedValue(new Error("peer did not announce"));
+    render(
+      <MessageBubble
+        message={makeMessage({
+          id: 15,
+          text: "👤 Shared contact: carol (cccccccc…)",
+          contact: { name: "carol", destination_hash: "cc".repeat(16) },
+        })}
+        onAddPeer={onAddPeer}
+        now={1700000060}
+      />,
+    );
+    fireEvent.click(screen.getByText("Add peer"));
+    await vi.waitFor(() =>
+      expect(screen.getByRole("alert").textContent).toMatch(/did not announce/),
+    );
+    // No "Added" line, and the button stays so the user can retry.
+    expect(screen.queryByText(/Added/)).toBeNull();
+    expect(screen.getByText("Add peer")).toBeTruthy();
+  });
+
+  it("hides Add peer on your own sent card", () => {
+    render(
+      <MessageBubble
+        message={makeMessage({
+          id: 14,
+          direction: "out",
+          text: "👤 Shared contact: carol (cccccccc…)",
+          contact: { name: "carol", destination_hash: "cc".repeat(16) },
+        })}
+        onAddPeer={vi.fn()}
+        now={1700000060}
+      />,
+    );
+    expect(screen.queryByText("Add peer")).toBeNull();
+  });
+
   it("shows the disappearing countdown", () => {
     render(
       <MessageBubble

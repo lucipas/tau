@@ -1,6 +1,7 @@
 // Composer.tsx — chat composer: text, send-later scheduling, disappearing
 // expiry picker, file attach (≤10 MiB, enforced client-side), poll mode,
-// location-pin mode (latitude/longitude + optional place name).
+// location-pin mode (latitude/longitude + optional place name), and
+// contact mode (share a known peer's contact card).
 
 "use client";
 
@@ -41,12 +42,20 @@ export function validateLocation(lat: string, lon: string, name: string): string
   return null;
 }
 
+/** A contact card needs a peer picked from the known-peers list. */
+export function validateContact(peerKey: string): string | null {
+  if (peerKey.trim() === "") return "Choose a peer to share.";
+  return null;
+}
+
 export interface ComposerSendOptions {
   expiresIn?: number;
   sendIn?: number;
   pollOptions?: string[];
   /** Pin a place on the message: latitude -90..90, longitude -180..180. */
   location?: { lat: number; lon: number; name?: string };
+  /** Share a peer's contact card: their name and destination hash. */
+  contact?: { name: string; destination_hash: string };
   replyTo?: string;
 }
 
@@ -62,11 +71,18 @@ export interface ComposerProps {
   disabled?: boolean;
   /** Polls are supported for this conversation; hide the toggle otherwise. */
   allowPoll?: boolean;
+  /** Known peers for the contact picker; the Contact toggle hides when empty. */
+  contactPeers?: { key: string; name: string }[];
   /** A saved draft to load into the box (set when its conversation opens). */
   draftSeed?: { key: string; text: string } | null;
   /** Park the current text as a draft for this conversation. */
   onSaveDraft?: (text: string) => Promise<void> | void;
-  onSend: (text: string, opts: ComposerSendOptions) => Promise<void> | void;
+  /** Stable key of the open conversation; the contact draft resets when it changes. */
+  conversationKey?: string;
+  onSend: (
+    text: string,
+    opts: ComposerSendOptions,
+  ) => Promise<boolean | void> | boolean | void;
   onSendFile: (file: File, opts: Omit<ComposerSendOptions, "pollOptions">) => Promise<void> | void;
 }
 
@@ -93,17 +109,20 @@ export default function Composer({
   onCancelEdit,
   disabled = false,
   allowPoll = false,
+  contactPeers,
   draftSeed,
   onSaveDraft,
+  conversationKey,
   onSend,
   onSendFile,
 }: ComposerProps) {
   const [text, setText] = useState("");
-  const [mode, setMode] = useState<"message" | "poll" | "location">("message");
+  const [mode, setMode] = useState<"message" | "poll" | "location" | "contact">("message");
   const [pollOptions, setPollOptions] = useState<string[]>(["", ""]);
   const [latitude, setLatitude] = useState("");
   const [longitude, setLongitude] = useState("");
   const [placeName, setPlaceName] = useState("");
+  const [contactPeer, setContactPeer] = useState("");
   const [expiresIn, setExpiresIn] = useState<number | undefined>(undefined);
   const [sendIn, setSendIn] = useState<number | undefined>(undefined);
   const [file, setFile] = useState<File | null>(null);
@@ -111,6 +130,17 @@ export default function Composer({
   const [sending, setSending] = useState(false);
   const [savingDraft, setSavingDraft] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
+
+  // A contact picked in one thread must not ride into the next:
+  // the composer is reused across conversations, so reset contact
+  // mode and the selected peer when the conversation changes. (The
+  // text draft is per-conversation already, via draftSeed.)
+  const [contactConversationKey, setContactConversationKey] = useState<string | null>(null);
+  if (conversationKey !== undefined && contactConversationKey !== conversationKey) {
+    setContactConversationKey(conversationKey);
+    setContactPeer("");
+    setMode("message");
+  }
 
   // Editing pre-fills the box; keep local edits once the user starts typing.
   const [editSeed, setEditSeed] = useState<number | null>(null);
@@ -148,7 +178,7 @@ export default function Composer({
     }
   }
 
-  const canSend = !disabled && !sending && (mode === "poll" || mode === "location" ? true : text.trim().length > 0 || file !== null);
+  const canSend = !disabled && !sending && (mode === "poll" || mode === "location" || mode === "contact" ? true : text.trim().length > 0 || file !== null);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -191,6 +221,32 @@ export default function Composer({
         setLatitude("");
         setLongitude("");
         setPlaceName("");
+        setMode("message");
+      } finally {
+        setSending(false);
+      }
+      return;
+    }
+    if (mode === "contact") {
+      const problem = validateContact(contactPeer);
+      if (problem) return setError(problem);
+      const picked = contactPeers?.find((p) => p.key === contactPeer);
+      if (!picked) return setError("Choose a peer to share.");
+      setSending(true);
+      try {
+        const sent = await onSend(text.trim(), {
+          contact: { name: picked.name, destination_hash: picked.key },
+          expiresIn,
+          sendIn,
+          replyTo: replyTo?.wire_id,
+        });
+        // A failed share keeps the draft: the text and the picked
+        // peer stay put so the user can retry instead of rebuilding
+        // the card. An onSend that reports nothing is treated as a
+        // failure — only a confirmed send clears the draft.
+        if (!sent) return;
+        setText("");
+        setContactPeer("");
         setMode("message");
       } finally {
         setSending(false);
@@ -362,6 +418,34 @@ export default function Composer({
         </div>
       )}
 
+      {mode === "contact" && (
+        <div className="mb-2 flex flex-col gap-2">
+          <label className="text-xs font-semibold text-zinc-400" htmlFor="contact-peer">
+            Share a contact
+          </label>
+          <select
+            id="contact-peer"
+            value={contactPeer}
+            onChange={(e) => setContactPeer(e.target.value)}
+            aria-label="Peer to share"
+            disabled={disabled}
+            className="rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 outline-none focus:border-cyan-500"
+          >
+            <option value="">Choose a peer…</option>
+            {(contactPeers ?? []).map((p) => (
+              <option key={p.key} value={p.key}>
+                {p.name}
+              </option>
+            ))}
+          </select>
+          <p className="text-xs text-zinc-500">
+            Shares their name and destination hash in this conversation. The card shows
+            the sender&apos;s name for them — the recipient adds the peer from their own
+            announce, so the name is only a claim until then.
+          </p>
+        </div>
+      )}
+
       <div className="mt-2 flex flex-wrap items-center gap-2">
         <input
           ref={fileRef}
@@ -402,6 +486,18 @@ export default function Composer({
         >
           📍 Pin
         </button>
+        {contactPeers && contactPeers.length > 0 && (
+          <button
+            type="button"
+            onClick={() => setMode((m) => (m === "contact" ? "message" : "contact"))}
+            aria-pressed={mode === "contact"}
+            className={`rounded-full border px-3 py-1 text-xs font-medium ${
+              mode === "contact" ? "border-cyan-500 bg-cyan-950 text-cyan-300" : "border-zinc-700 text-zinc-300 hover:bg-zinc-900"
+            }`}
+          >
+            👤 Contact
+          </button>
+        )}
         <label className="flex items-center gap-1 text-xs text-zinc-400">
           <span aria-hidden="true">⏱</span>
           <select
@@ -443,6 +539,7 @@ export default function Composer({
               savingDraft ||
               text.trim().length === 0 ||
               mode === "poll" ||
+              mode === "contact" ||
               file !== null ||
               !!editing
             }
@@ -457,7 +554,7 @@ export default function Composer({
           disabled={!canSend}
           className="ml-auto rounded-full bg-cyan-500 px-4 py-1.5 text-sm font-bold text-zinc-950 hover:bg-cyan-400 disabled:opacity-40"
         >
-          {sendIn !== undefined ? "Schedule" : editing ? "Save edit" : mode === "poll" ? "Post poll" : mode === "location" ? "Send pin" : "Send"}
+          {sendIn !== undefined ? "Schedule" : editing ? "Save edit" : mode === "poll" ? "Post poll" : mode === "location" ? "Send pin" : mode === "contact" ? "Share contact" : "Send"}
         </button>
       </div>
 

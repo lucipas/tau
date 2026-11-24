@@ -5,6 +5,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ApiError,
+  addPeer,
   addReminder,
   cancelReminder,
   cancelScheduledChannelMessage,
@@ -356,6 +357,32 @@ describe("POST endpoints", () => {
       text: "",
       location: { lat: 34.05, lon: -83.88, name: "Rock Springs Park" },
     });
+  });
+
+  it("sends a DM with a contact card", async () => {
+    nextJson = { ok: true, message: {}, response: {} };
+    await sendMessage(
+      { to: "alice" },
+      "meet carol",
+      { contact: { name: "carol", destination_hash: "cc".repeat(16) } },
+    );
+    expect(captured[0].url).toBe("/api/messages");
+    expect(bodyOf(0)).toEqual({
+      to: "alice",
+      text: "meet carol",
+      contact: { name: "carol", destination_hash: "cc".repeat(16) },
+    });
+  });
+
+  it("adds a peer from a contact card", async () => {
+    nextJson = {
+      ok: true,
+      peer: { peer: "ab".repeat(16), name: "alice", known: true, verified: false },
+    };
+    const result = await addPeer("ab".repeat(16));
+    expect(captured[0].url).toBe("/api/peers/add");
+    expect(bodyOf(0)).toEqual({ destination_hash: "ab".repeat(16) });
+    expect(result.peer.name).toBe("alice");
   });
 
   it("sends a group message with the group key, not `to`", async () => {

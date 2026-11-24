@@ -300,10 +300,12 @@ from .protocol import (
     PROTOCOL_VERSION,
     ProtocolError,
     clean_beacon,
+    clean_contact,
     clean_forwarded_from_or_none,
     clean_in_reply_to,
     clean_location,
     clean_reaction,
+    contact_default_text,
     excerpt_hash,
     location_default_text,
     location_maps_url,
@@ -721,6 +723,15 @@ def build_parser() -> argparse.ArgumentParser:
         '"34.05,-83.88 Rock Springs Park"); without message text the '
         "place name (or the coordinates) becomes the text, and the "
         "message is tagged location unless --kind says otherwise",
+    )
+    send.add_argument(
+        "--contact",
+        default=None,
+        metavar="NAME|HASH",
+        help="share a peer's contact card on the message (peer name, "
+        "alias, destination hash or hash prefix); without message text "
+        "the card line becomes the text, and the message is tagged "
+        "contact unless --kind says otherwise",
     )
     send.add_argument(
         "--poll-options",
@@ -3334,6 +3345,14 @@ def build_parser() -> argparse.ArgumentParser:
         "place name (or the coordinates) becomes the text",
     )
     group_send.add_argument(
+        "--contact",
+        default=None,
+        metavar="NAME|HASH",
+        help="share a peer's contact card on the message (peer name, "
+        "alias, destination hash or hash prefix); without message text "
+        "the card line becomes the text",
+    )
+    group_send.add_argument(
         "--discover-timeout",
         type=float,
         default=10.0,
@@ -5724,6 +5743,71 @@ def _message_text_with_location(
     ):
         return location_default_text(location)
     return _read_message(args)
+
+
+def _contact_from_args(
+    args: argparse.Namespace, config: TauConfig
+) -> Optional[Dict[str, Any]]:
+    """Resolve a ``--contact`` flag to a card, or ``None`` when it was not given.
+
+    The card names the peer by their *announced* name, with their
+    destination hash — the identity the recipient resolves.  A local
+    alias is never shared: it is the owner's private nickname for the
+    peer.  An unknown peer, sharing yourself, and sharing a blocked
+    peer are all refused: the recipient already has your hash, and a
+    blocked peer must not be amplified to a third party.
+    """
+    raw = getattr(args, "contact", None)
+    if raw is None:
+        return None
+    registry = PeerRegistry(config.peers_path)
+    try:
+        peer = registry.resolve(raw)
+    except PeerError as exc:
+        raise NodeError(str(exc)) from exc
+    if peer is None:
+        raise NodeError(f"unknown peer: {raw}")
+    identity = load_identity(config.identity_path)
+    own_hash = destination_hash(identity).hex() if identity is not None else None
+    if own_hash is not None and peer.hexhash == own_hash:
+        raise NodeError(
+            "cannot share your own contact: the recipient already has your hash"
+        )
+    # A blocked peer must not be amplified to a third party, mirroring
+    # the share guard.  An unreadable block-list fails closed.
+    blocked = load_blocked_set(config.blocklist_path)
+    if blocked is None:
+        raise NodeError("cannot share a contact: the block-list could not be read")
+    if peer.hexhash in blocked:
+        raise NodeError("cannot share a contact for a blocked peer")
+    # The announced name, not display_name: display_name returns the
+    # owner's local alias when one is set, and that private nickname
+    # must never travel to a third party in the card.
+    name = peer.name or short_hash(peer.hexhash)
+    return {"name": name, "destination_hash": peer.hexhash}
+
+
+def _message_text_with_contact(
+    args: argparse.Namespace,
+    contact: Optional[Dict[str, Any]],
+    location: Optional[Dict[str, Any]],
+) -> str:
+    """Message text for a send carrying a contact card, a pin, or neither.
+
+    A ``--contact`` without message text, a --file, or piped stdin
+    sends the card line as the text, so `tau send --contact Alice`
+    works on its own; a bare pin still sends its label.  The card
+    itself rides as a structured field either way.
+    """
+    if (
+        contact is not None
+        and getattr(args, "message", None) is None
+        and getattr(args, "text", None) is None
+        and getattr(args, "file", None) is None
+        and sys.stdin.isatty()
+    ):
+        return contact_default_text(contact)
+    return _message_text_with_location(args, location)
 
 
 def _detect_image_mime(data: bytes) -> Optional[str]:
@@ -14975,6 +15059,7 @@ def _send_local_message(
     reply_to: Optional[str] = None,
     kind: Optional[str] = None,
     location: Optional[Dict[str, Any]] = None,
+    contact: Optional[Dict[str, Any]] = None,
     wait: float = 0.0,
     send_after: Optional[float] = None,
     poll_options: Optional[List[str]] = None,
@@ -15007,6 +15092,7 @@ def _send_local_message(
         expires_at=expires_at,
         kind=kind,
         location=location,
+        contact=contact,
         send_after=send_after,
         poll_options=poll_options,
         poll_vote=poll_vote,
@@ -15035,6 +15121,7 @@ def _send_group_local_message(
     queue: bool = True,
     in_reply_to: Optional[Dict[str, Any]] = None,
     location: Optional[Dict[str, Any]] = None,
+    contact: Optional[Dict[str, Any]] = None,
     expires_at: Optional[float] = None,
     wait: float = 0.0,
     send_after: Optional[float] = None,
@@ -15070,6 +15157,7 @@ def _send_group_local_message(
         expires_at=expires_at,
         send_after=send_after,
         location=location,
+        contact=contact,
         poll_options=poll_options,
         poll_vote=poll_vote,
         poll_close=poll_close,
@@ -15393,6 +15481,7 @@ def _send_via_local_node(
     wait: float = 0.0,
     send_after: Optional[float] = None,
     location: Optional[Dict[str, Any]] = None,
+    contact: Optional[Dict[str, Any]] = None,
     poll_options: Optional[List[str]] = None,
     poll_vote: Optional[Dict[str, Any]] = None,
     poll_close: Optional[Dict[str, Any]] = None,
@@ -15450,6 +15539,7 @@ def _send_via_local_node(
                     expires_at=expires_at,
                     kind=kind,
                     location=location,
+                    contact=contact,
                     send_after=send_after,
                     poll_options=poll_options,
                     poll_vote=poll_vote,
@@ -15515,6 +15605,7 @@ def _send_via_running_node(
     wait: float = 0.0,
     send_after: Optional[float] = None,
     location: Optional[Dict[str, Any]] = None,
+    contact: Optional[Dict[str, Any]] = None,
     poll_options: Optional[List[str]] = None,
     poll_vote: Optional[Dict[str, Any]] = None,
     poll_close: Optional[Dict[str, Any]] = None,
@@ -15547,6 +15638,7 @@ def _send_via_running_node(
                 reply_to=getattr(args, "reply_to", None),
                 kind=kind,
                 location=location,
+                contact=contact,
                 wait=wait,
                 send_after=send_after,
                 poll_options=poll_options,
@@ -16219,8 +16311,11 @@ def cmd_send(args: argparse.Namespace) -> int:
     # Validate the pin before reading the message, so an invalid
     # --location fails at once instead of blocking on stdin.
     location = _location_from_args(args)
-    text = _message_text_with_location(args, location)
     config = _make_config(args)
+    # Resolve the shared contact before reading the message, so an
+    # unknown peer fails at once instead of blocking on stdin.
+    contact = _contact_from_args(args, config)
+    text = _message_text_with_contact(args, contact, location)
     try:
         # No --kind means no kind: the node tags a pin ``location``
         # and defaults anything else to ``chat``.
@@ -16277,6 +16372,7 @@ def cmd_send(args: argparse.Namespace) -> int:
         results = _send_via_running_node(
             args, config, text, targets, expires_at, reply_ids, kind=kind, wait=wait,
             send_after=send_after, location=location,
+            contact=contact,
             poll_options=poll_options,
         )
     else:
@@ -16284,6 +16380,7 @@ def cmd_send(args: argparse.Namespace) -> int:
         results = _send_via_local_node(
             args, config, text, targets, expires_at, reply_ids, kind=kind, wait=wait,
             send_after=send_after, location=location,
+            contact=contact,
             poll_options=poll_options,
         )
 
@@ -17810,6 +17907,13 @@ def _print_message_entry(
         print(f"  {quote}")
     for line in str(entry.get("text", "")).splitlines() or [""]:
         print(f"  {line}")
+    contact = clean_contact(entry.get("contact"))
+    if contact is not None:
+        # A shared contact prints under the text with its hash, so a
+        # contact message reads in the terminal the way it renders
+        # in the console; a hand-edited record with a bad card just
+        # shows its text.
+        print(f"  👤 {contact['name']} ({contact['destination_hash']})")
     location = clean_location(entry.get("location"))
     if location is not None:
         # A static pin prints under the text with its map link, so a
@@ -21850,6 +21954,7 @@ def _send_group_via_running_node(
     wait: float,
     in_reply_to: Optional[Dict[str, Any]] = None,
     location: Optional[Dict[str, Any]] = None,
+    contact: Optional[Dict[str, Any]] = None,
     poll_options: Optional[List[str]] = None,
     poll_vote: Optional[Dict[str, Any]] = None,
     poll_close: Optional[Dict[str, Any]] = None,
@@ -21871,6 +21976,7 @@ def _send_group_via_running_node(
             queue=not getattr(args, "no_queue", False),
             in_reply_to=in_reply_to,
             location=location,
+            contact=contact,
             expires_at=expires_at,
             wait=wait,
             send_after=send_after,
@@ -21894,6 +22000,7 @@ def _send_group_via_local_node(
     wait: float,
     in_reply_to: Optional[Dict[str, Any]] = None,
     location: Optional[Dict[str, Any]] = None,
+    contact: Optional[Dict[str, Any]] = None,
     poll_options: Optional[List[str]] = None,
     poll_vote: Optional[Dict[str, Any]] = None,
     poll_close: Optional[Dict[str, Any]] = None,
@@ -21930,6 +22037,7 @@ def _send_group_via_local_node(
             expires_at=expires_at,
             send_after=send_after,
             location=location,
+            contact=contact,
             poll_options=poll_options,
             poll_vote=poll_vote,
             poll_close=poll_close,
@@ -22070,8 +22178,11 @@ def cmd_group_send(args: argparse.Namespace) -> int:
     # Validate the pin before reading the message, so an invalid
     # --location fails at once instead of blocking on stdin.
     location = _location_from_args(args)
-    text = _message_text_with_location(args, location)
     config = _make_config(args)
+    # Resolve the shared contact before reading the message, so an
+    # unknown peer fails at once instead of blocking on stdin.
+    contact = _contact_from_args(args, config)
+    text = _message_text_with_contact(args, contact, location)
     expires_at = None
     expire_text = getattr(args, "expire", None)
     if expire_text is not None:
@@ -22115,6 +22226,7 @@ def cmd_group_send(args: argparse.Namespace) -> int:
             wait=wait,
             in_reply_to=in_reply_to,
             location=location,
+            contact=contact,
         )
     else:
         response = _send_group_via_local_node(
@@ -22126,6 +22238,7 @@ def cmd_group_send(args: argparse.Namespace) -> int:
             wait=wait,
             in_reply_to=in_reply_to,
             location=location,
+            contact=contact,
         )
     return _report_group_send_results(args, response, expires_at, send_after)
 

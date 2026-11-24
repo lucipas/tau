@@ -86,6 +86,20 @@ def test_request_roundtrip_keeps_location_pin(tmp_path):
     assert load_dm_requests(path)[0].location is None
 
 
+def test_request_roundtrip_keeps_contact_card(tmp_path):
+    card = {"name": "carol", "destination_hash": "cc" * 16}
+    path = tmp_path / "dm-requests.json"
+    assert record_dm_request(path, make_request(contact=card)) is True
+    loaded = load_dm_requests(path)
+    assert loaded == [make_request(contact=card)]
+    assert json.loads(path.read_text())["requests"][0]["contact"] == card
+    # A malformed card on a stored request drops instead of the request.
+    data = json.loads(path.read_text())
+    data["requests"][0]["contact"] = {"name": "carol", "destination_hash": "zz"}
+    path.write_text(json.dumps(data))
+    assert load_dm_requests(path)[0].contact is None
+
+
 def test_duplicate_id_keeps_first_receipt(tmp_path):
     path = tmp_path / "dm-requests.json"
     assert record_dm_request(path, make_request(received_at=1000.0), now=1000.0) is True
