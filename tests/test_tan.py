@@ -10156,6 +10156,52 @@ def test_cli_post_expire_rejects_delay_not_shorter_than_expiry(tmp_path, capsys)
     assert "must be shorter than --expire" in capsys.readouterr().err
 
 
+def test_cli_post_delay_with_location_queues_pin(tmp_path, capsys):
+    from tau.scheduled_posts import load_scheduled_posts
+
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--delay",
+                "1h",
+                "--location",
+                "34.05,-83.88 Rock Springs Park",
+                "--json",
+                "meet me here tomorrow",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["scheduled"]["location"] == {
+        "lat": 34.05,
+        "lon": -83.88,
+        "name": "Rock Springs Park",
+    }
+    queued = load_scheduled_posts(data_dir / "scheduled-posts.json")
+    assert len(queued) == 1
+    assert queued.posts[0].location == {
+        "lat": 34.05,
+        "lon": -83.88,
+        "name": "Rock Springs Park",
+    }
+    # The queue listing shows the pin, like it shows an image.
+    assert (
+        main(["tan", "scheduled", "--data-dir", str(data_dir)])
+        == 0
+    )
+    listed = capsys.readouterr().out
+    assert "📍 Rock Springs Park — 34.05, -83.88" in listed
+    assert "openstreetmap.org/?mlat=34.05&mlon=-83.88" in listed
+
+
 def test_cli_post_expire_rejects_over_cap(tmp_path, capsys):
     data_dir = tmp_path / "alice"
     assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0

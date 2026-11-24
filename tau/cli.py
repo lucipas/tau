@@ -6892,13 +6892,6 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
-        if getattr(args, "delay", None) is not None:
-            print(
-                "error: --location cannot be combined with --delay — "
-                "scheduled posts cannot carry an attachment yet",
-                file=sys.stderr,
-            )
-            return 2
         location = _location_from_args(args)
 
     delay_text = getattr(args, "delay", None)
@@ -6937,6 +6930,7 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
                 name=config.name,
                 expires_in=expire_seconds,
                 image=image,
+                location=location,
             )
         except ScheduledPostsError as exc:
             raise NodeError(str(exc)) from exc
@@ -7554,6 +7548,11 @@ def cmd_tan_scheduled(args: argparse.Namespace) -> int:
             print(f"  to {', '.join(post.to)}")
         if post.image is not None:
             print(f"  image {post.image['name']} ({post.image['size']} bytes)")
+        if post.location is not None:
+            name = post.location.get("name")
+            label = name if isinstance(name, str) and name else "Location"
+            print(f"  📍 {label} — {post.location['lat']}, {post.location['lon']}")
+            print(f"  {location_maps_url(post.location)}")
         if post.text:
             for line in post.text.splitlines() or [""]:
                 print(f"  {line}")

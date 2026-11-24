@@ -767,6 +767,7 @@ def check_post_text_fits(
     reply_to: Optional[str] = None,
     expires: bool = False,
     image: Optional[Dict[str, Any]] = None,
+    location: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Raise PostError if *text* cannot fit a Tan request once encoded.
 
@@ -781,6 +782,8 @@ def check_post_text_fits(
     widest-possible timestamp stands in for it.  When *image* is given
     the attachment rides in the estimate too — its descriptor is
     ~150 bytes of JSON, enough to push a borderline text over budget.
+    When *location* is given the pin rides in the estimate the same
+    way — its name can be long enough to matter on a borderline text.
     """
     try:
         clean_text = normalize_message(text)
@@ -806,6 +809,11 @@ def check_post_text_fits(
                 now + MAX_TAN_POST_EXPIRY + 0.123456789 if expires else None
             ),
             **({"image": _clean_image(image)} if image is not None else {}),
+            **(
+                {"location": _clean_location(location)}
+                if location is not None
+                else {}
+            ),
         }
     )
 
