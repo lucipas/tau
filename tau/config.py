@@ -54,6 +54,7 @@ JOIN_REQUESTS_FILE_NAME = "join-requests.json"
 SCHEDULED_POSTS_FILE_NAME = "scheduled-posts.json"
 SCHEDULED_CHANNEL_MESSAGES_FILE_NAME = "scheduled-channel-messages.json"
 SCHEDULED_FILES_FILE_NAME = "scheduled-files.json"
+AUTO_BACKUPS_FILE_NAME = "auto-backups.json"
 REMINDERS_FILE_NAME = "reminders.json"
 SCHEDULED_FILES_DIR_NAME = "scheduled-files"
 PROFILE_FILE_NAME = "profile.json"
@@ -413,12 +414,17 @@ def backup_passphrase_file(data_dir: Path) -> Optional[Path]:
     None when unset: automatic backups are then plaintext, like a
     manual backup with no passphrase flags. A non-string or empty
     stored value also means None, so a hand-edited node.json cannot
-    point the worker at a nonsense path.
+    point the worker at a nonsense path. A relative stored value
+    resolves against the data directory's parent, so it means the
+    same file no matter which directory the serving node started in.
     """
     value = load_node_settings(data_dir).get("backup_passphrase_file")
     if not isinstance(value, str) or not value.strip():
         return None
-    return Path(value.strip()).expanduser()
+    path = Path(value.strip()).expanduser()
+    if not path.is_absolute():
+        path = Path(data_dir).parent / path
+    return path
 
 
 def write_node_metadata(data_dir: Path, name: str) -> Path:

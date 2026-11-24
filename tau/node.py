@@ -1653,6 +1653,14 @@ class TauNode:
         if worker is not None and worker is not threading.current_thread():
             if worker.ident is not None:
                 worker.join()
+        # Same for the automatic-backup worker: a live backup still
+        # reading state must finish before the instance lock is
+        # released, or a replacement node could start on the data
+        # directory under it.
+        worker = self._auto_backup_thread
+        if worker is not None and worker is not threading.current_thread():
+            if worker.ident is not None:
+                worker.join()
 
     def _release_instance_lock(self) -> None:
         lock, self._instance_lock = self._instance_lock, None
@@ -5370,7 +5378,14 @@ class TauNode:
                 self._exchange_sweep(max_peers=_EXCHANGE_SWEEP_PEERS)
             except Exception:  # pragma: no cover - network dependent
                 log.debug("Peer exchange sweep failed", exc_info=True)
-            if self._stop_event.wait(_MAIL_INTERVAL):
+            # Wake early for the next automatic backup when its interval
+            # is shorter than the mail cadence, so a short backup
+            # interval is honored instead of running at mail-loop speed.
+            wait_for = _MAIL_INTERVAL
+            due_in = self._auto_backup_scheduler.next_due_in()
+            if due_in is not None:
+                wait_for = min(_MAIL_INTERVAL, due_in)
+            if self._stop_event.wait(wait_for):
                 break
 
     def _publish_due_scheduled_posts(self) -> None:
@@ -5483,17 +5498,17 @@ class TauNode:
         thread = self._auto_backup_thread
         if thread is not None and thread.is_alive():
             return
+        if self._stop_event.is_set():
+            return
         if not self._auto_backup_scheduler.due():
             return
 
         def _run() -> None:
             try:
-                target = self._auto_backup_scheduler.run()
+                self._auto_backup_scheduler.run()
             except Exception:  # pragma: no cover - defensive; helper logs
                 log.warning("Automatic backup failed", exc_info=True)
                 return
-            if target is not None:
-                log.info("Automatic backup written to %s", target)
 
         thread = threading.Thread(target=_run, name="auto-backup", daemon=True)
         self._auto_backup_thread = thread

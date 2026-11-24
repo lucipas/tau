@@ -73,6 +73,7 @@ log = logging.getLogger(__name__)
 from . import __version__
 from .config import (
     ARCHIVED_FILE_NAME,
+    AUTO_BACKUPS_FILE_NAME,
     AWAY_FILE_NAME,
     CHANNELS_DB_FILE_NAME,
     DEVICES_FILE_NAME,
@@ -127,6 +128,7 @@ BACKUP_FILES = (
     SAVED_MESSAGES_FILE_NAME,
     SCHEDULED_POSTS_FILE_NAME,
     SCHEDULED_FILES_FILE_NAME,
+    AUTO_BACKUPS_FILE_NAME,
     "groups.json",
     "blocklist.json",
     DEVICES_FILE_NAME,

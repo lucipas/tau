@@ -25155,16 +25155,19 @@ def cmd_config(args: argparse.Namespace) -> int:
             return _EXIT_OK
         # Fail fast: an unreadable file or a too-short passphrase would
         # break every automatic backup until it is fixed, so validate
-        # now instead of at the next backup.
+        # now instead of at the next backup. The path is resolved to
+        # absolute here, so it means the same file no matter which
+        # directory a later `tau serve` starts from.
+        resolved = Path(path_arg).expanduser().resolve()
         try:
-            passphrase = _read_passphrase_file(Path(path_arg))
+            passphrase = _read_passphrase_file(resolved)
         except _BackupError as exc:
             raise NodeError(str(exc)) from exc
         try:
             _validate_backup_passphrase(passphrase)
         except _BackupError as exc:
             raise NodeError(str(exc)) from exc
-        stored = str(Path(path_arg).expanduser())
+        stored = str(resolved)
         set_node_setting(config.data_dir, "backup_passphrase_file", stored)
         if json_output:
             _emit({"backup_passphrase_file": stored}, True)
