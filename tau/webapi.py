@@ -162,6 +162,9 @@ script) can read what arrives from the mesh and send messages back:
                            "send_in": <seconds from now>}`` — at least one
                            of "text" / "send_in" is required
     GET  /api/backup       download a backup archive of the data directory
+    POST /api/backup/verify verify the newest automatic backup would
+                           restore, without restoring it (loopback only;
+                           503 when no automatic backup exists yet)
     GET  /api/devices      this device and the pairing offers it issued
                            (loopback only — a bundle holds the identity)
     POST /api/devices/pair mint a pairing bundle for a second device
@@ -380,7 +383,14 @@ from .dm_requests import (
     list_dm_requests,
 )
 from .away import AwayError, AwayState, away_lock, load_away, save_away
-from .backup import BackupError, create_backup
+from .auto_backup import list_auto_backups, load_auto_backup_registry
+from .backup import (
+    BackupError,
+    create_backup,
+    is_encrypted_backup,
+    read_passphrase_file,
+    verify_backup,
+)
 from .beacons import (
     BEACON_DEFAULT_DURATION,
     BEACON_MAX_DURATION,
@@ -406,6 +416,8 @@ from .config import (
     REMINDERS_FILE_NAME,
     accept_files_enabled,
     announce_interval,
+    backup_dir,
+    backup_passphrase_file,
     send_read_receipts_enabled,
     set_node_setting,
     tan_sync_depth,
@@ -10023,6 +10035,59 @@ class WebBridge:
             self._backup_artifacts.add(target)
         return result
 
+    def verify_latest_auto_backup(self) -> Dict[str, Any]:
+        """Verify the newest automatic backup would restore, without restoring it.
+
+        The same checks as ``tau backup-verify`` (#756) — manifest,
+        member list, staged-bytes read, scheduled-files hash check, and
+        identity load — run over the newest archive the auto-backup
+        worker recorded (#750), against a private temp directory, so
+        nothing live is touched.  Only names both recorded in
+        ``auto-backups.json`` and present on disk count
+        (:func:`tau.auto_backup.list_auto_backups`), so a manual archive
+        is never verified by mistake; the registry and the directory are
+        read fresh on every call, never cached.  An encrypted
+        auto-backup is verified with the node's configured backup
+        passphrase file — the same source the worker encrypts with —
+        so no passphrase travels in the request or the response, and a
+        plaintext archive ignores it.  A registered archive is always
+        complete (``create_backup`` writes through a temp file and
+        renames it onto the target), so a concurrent worker cannot hand
+        this a half-written file.
+
+        Returns the CLI payload shape: archive name, node, destination,
+        file list, encrypted flag, valid True.  Raises
+        :class:`WebBridgeError` when this node has no data directory or
+        no automatic backup yet (the route maps it to 503); a failed
+        check raises :class:`BackupError` naming it.
+        """
+        config = getattr(self.node, "config", None)
+        if config is None or getattr(config, "data_dir", None) is None:
+            raise WebBridgeError("this node has no data directory to back up")
+        data_dir = Path(config.data_dir)
+        registered = load_auto_backup_registry(data_dir)
+        backups = list_auto_backups(
+            backup_dir(data_dir), config.name, registered
+        )
+        if not backups:
+            raise WebBridgeError("no automatic backup yet")
+        newest = backups[-1]
+        passphrase = None
+        passphrase_path = backup_passphrase_file(data_dir)
+        if passphrase_path is not None:
+            passphrase = read_passphrase_file(passphrase_path)
+        manifest, files, destination = verify_backup(
+            newest, passphrase=passphrase
+        )
+        return {
+            "backup": newest.name,
+            "node": manifest.get("node"),
+            "destination": destination,
+            "files": files,
+            "encrypted": is_encrypted_backup(newest),
+            "valid": True,
+        }
+
     def _build_backup(self, config: Any) -> Dict[str, Any]:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
         filename = f"tau-backup-{_backup_name(config.name)}-{stamp}.tar.gz"
@@ -16158,6 +16223,35 @@ class _WebHandler(BaseHTTPRequestHandler):
             if path == "/api/announce":
                 self.bridge.announce()
                 self._send_json({"ok": True}, head_only)
+                return
+            if path == "/api/backup/verify":
+                # The result names the archive, node and destination —
+                # and the archive holds the node identity — so it goes
+                # only to the local machine, like the backup download.
+                if not _is_loopback_client(self.client_address[0]):
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "backup verification is only available from localhost"
+                            }
+                        },
+                        head_only,
+                        403,
+                    )
+                    return
+                try:
+                    result = self.bridge.verify_latest_auto_backup()
+                except WebBridgeError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 503
+                    )
+                    return
+                except BackupError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 500
+                    )
+                    return
+                self._send_json(result, head_only)
                 return
             if path == "/api/id/rename":
                 name = body.get("name")

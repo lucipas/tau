@@ -22,8 +22,9 @@ import {
   importTan,
   pairDevice,
   revokeDeviceOffer,
+  verifyLatestAutoBackup,
 } from "@/lib/api";
-import type { AllowList, DevicesInfo, DoctorReport } from "@/lib/types";
+import type { AllowList, BackupVerifyResult, DevicesInfo, DoctorReport } from "@/lib/types";
 
 function downloadBundleFile(url: string, filename: string) {
   const a = document.createElement("a");
@@ -50,6 +51,7 @@ async function readJsonFile(file: File): Promise<unknown> {
 
 export default function ToolsSection() {
   const [doctor, setDoctor] = useState<DoctorReport | null>(null);
+  const [backupVerify, setBackupVerify] = useState<BackupVerifyResult | null>(null);
   const [allowlist, setAllowlist] = useState<AllowList | null>(null);
   const [devices, setDevices] = useState<DevicesInfo | null>(null);
   const [devicesError, setDevicesError] = useState<string | null>(null);
@@ -196,6 +198,23 @@ export default function ToolsSection() {
           >
             ⬇ Download backup
           </a>
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => {
+              setBackupVerify(null);
+              void run(
+                async () => {
+                  const result = await verifyLatestAutoBackup();
+                  setBackupVerify(result);
+                },
+                "Latest automatic backup verified — it would restore.",
+              );
+            }}
+            className="rounded-full border border-zinc-700 px-4 py-1.5 text-sm font-semibold text-zinc-200 hover:bg-zinc-900 disabled:opacity-50"
+          >
+            Verify latest auto-backup
+          </button>
           <label className="flex items-center gap-1.5 text-xs text-zinc-300">
             <input
               type="checkbox"
@@ -243,6 +262,21 @@ export default function ToolsSection() {
             />
           </label>
         </div>
+        {backupVerify !== null && (
+          <div className="mt-3 rounded-lg border border-zinc-800 bg-zinc-900/50 px-3 py-2">
+            <p className="text-sm font-semibold text-emerald-300">
+              ✓ {backupVerify.backup} would restore
+            </p>
+            <p className="mt-1 truncate font-mono text-xs text-zinc-400">
+              Node: {backupVerify.node ?? "unknown"} · Destination:{" "}
+              {backupVerify.destination}
+            </p>
+            <p className="mt-0.5 text-xs text-zinc-500">
+              {backupVerify.files.length} files ·{" "}
+              {backupVerify.encrypted ? "encrypted" : "not encrypted"}
+            </p>
+          </div>
+        )}
         <div className="mt-3 flex flex-wrap gap-2">
           <button
             type="button"

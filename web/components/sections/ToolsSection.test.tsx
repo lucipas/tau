@@ -37,6 +37,16 @@ beforeEach(() => {
       return { enabled: true, entries: allowlistEntries };
     }
     if (url.includes("/api/bundle/export")) return { bundle: true };
+    if (url.includes("/api/backup/verify")) {
+      return {
+        backup: "tau-backup-alice-20251125-000000.tar.gz",
+        node: "alice",
+        destination: "cd".repeat(32),
+        files: ["identity", "peers.json"],
+        encrypted: false,
+        valid: true,
+      };
+    }
     if (url.includes("/api/devices/pair")) {
       return {
         ok: true,
@@ -110,6 +120,24 @@ describe("ToolsSection", () => {
     render(<ToolsSection />);
     const link = await screen.findByRole("link", { name: /Download backup/ });
     expect(link.getAttribute("href")).toContain("/api/backup");
+  });
+
+  it("verifies the latest auto-backup and shows the result", async () => {
+    render(<ToolsSection />);
+    await screen.findByText("carol");
+    fireEvent.click(
+      screen.getByRole("button", { name: "Verify latest auto-backup" }),
+    );
+    await waitFor(() => expect(calls).toContain("POST /api/backup/verify"));
+    expect(
+      await screen.findByText(
+        "✓ tau-backup-alice-20251125-000000.tar.gz would restore",
+      ),
+    ).toBeTruthy();
+    expect(screen.getByText("2 files · not encrypted")).toBeTruthy();
+    expect(
+      screen.getByText("Latest automatic backup verified — it would restore."),
+    ).toBeTruthy();
   });
 
   it("lists this device and its outstanding pairing offers", async () => {

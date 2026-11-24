@@ -21,8 +21,9 @@ import RNS
 
 from tau import cli
 from tau.allowlist import AllowList, load_allowlist, save_allowlist
+from tau.auto_backup import AutoBackupScheduler
 from tau.away import DEFAULT_AWAY_MESSAGE
-from tau.backup import MANIFEST_NAME, restore_backup
+from tau.backup import MANIFEST_NAME, BackupError, restore_backup
 from tau.beacons import (
     BEACON_DEFAULT_DURATION,
     BEACON_UPDATE_INTERVAL,
@@ -32,7 +33,7 @@ from tau.beacons import (
     save_beacons,
 )
 from tau.blocklist import BlockList, load_blocklist, save_blocklist
-from tau.config import TauConfig
+from tau.config import TauConfig, set_node_setting
 from tau.devices import verify_pairing_bundle
 from tau.groups import GroupStore
 from tau.identity import destination_hash, load_identity
@@ -5416,6 +5417,162 @@ def test_backup_download_rejects_remote_client(bridge, monkeypatch):
 
     monkeypatch.setattr(webapi, "_is_loopback_client", lambda client: False)
     status, _, payload = _json(bridge, "/api/backup")
+    assert status == 403
+    assert "only available from localhost" in payload["error"]["message"]
+
+
+def _start_auto_backup_bridge(tmp_path, *, encrypted=False):
+    """Start a bridge over a real node dir with one auto-backup taken."""
+    data_dir = tmp_path / "node"
+    assert (
+        cli.main(["init", "--data-dir", str(data_dir), "--name", "alice", "--json"])
+        == 0
+    )
+    directory = tmp_path / "backups"
+    set_node_setting(data_dir, "backup_interval", 3600)
+    set_node_setting(data_dir, "backup_dir", str(directory))
+    if encrypted:
+        passphrase_file = tmp_path / "pass.txt"
+        passphrase_file.write_text(
+            "correct horse battery staple\n", encoding="utf-8"
+        )
+        set_node_setting(data_dir, "backup_passphrase_file", str(passphrase_file))
+    scheduler = AutoBackupScheduler(TauConfig.resolve(data_dir=data_dir))
+    target = scheduler.run(now=1764028800.0)
+    assert target is not None
+    node = FakeNode(tmp_path / "mailbox.json")
+    node.config = TauConfig.resolve(data_dir=data_dir)
+    web_dir = tmp_path / "out"
+    web_dir.mkdir()
+    (web_dir / "index.html").write_text("<html>tau console</html>", encoding="utf-8")
+    bridge = WebBridge(node, host="127.0.0.1", port=0, web_dir=web_dir)
+    bridge.start()
+    return bridge, data_dir, target
+
+
+def test_verify_latest_auto_backup_plaintext(tmp_path):
+    bridge, data_dir, target = _start_auto_backup_bridge(tmp_path)
+    try:
+        result = bridge.verify_latest_auto_backup()
+    finally:
+        bridge.stop()
+    assert result["backup"] == target.name
+    assert result["node"] == "alice"
+    assert result["destination"] == destination_hash(
+        load_identity(data_dir / "identity")
+    ).hex()
+    assert "identity" in result["files"]
+    assert result["encrypted"] is False
+    assert result["valid"] is True
+
+
+def test_verify_latest_auto_backup_encrypted(tmp_path):
+    bridge, _data_dir, target = _start_auto_backup_bridge(
+        tmp_path, encrypted=True
+    )
+    try:
+        result = bridge.verify_latest_auto_backup()
+    finally:
+        bridge.stop()
+    assert result["backup"] == target.name
+    assert result["encrypted"] is True
+    assert result["valid"] is True
+
+
+def test_verify_latest_auto_backup_newest_wins(tmp_path):
+    bridge, data_dir, first = _start_auto_backup_bridge(tmp_path)
+    try:
+        scheduler = AutoBackupScheduler(TauConfig.resolve(data_dir=data_dir))
+        second = scheduler.run(now=1764028800.0 + 3600)
+        assert second is not None and second != first
+        result = bridge.verify_latest_auto_backup()
+    finally:
+        bridge.stop()
+    assert result["backup"] == second.name
+
+
+def test_verify_latest_auto_backup_ignores_unregistered_archive(tmp_path):
+    # A valid archive that merely shares the backup directory — even
+    # one named exactly like an automatic backup — is never verified:
+    # only registry names count.
+    bridge, data_dir, target = _start_auto_backup_bridge(tmp_path)
+    try:
+        from tau.auto_backup import auto_backup_filename
+
+        later = auto_backup_filename(
+            "alice", encrypted=False, now=1764028800.0 + 7200
+        )
+        (tmp_path / "backups" / later).write_bytes(target.read_bytes())
+        result = bridge.verify_latest_auto_backup()
+    finally:
+        bridge.stop()
+    assert result["backup"] == target.name
+
+
+def test_verify_latest_auto_backup_rejects_corrupt_archive(tmp_path):
+    bridge, _data_dir, target = _start_auto_backup_bridge(tmp_path)
+    try:
+        with pytest.raises(BackupError):
+            target.write_bytes(target.read_bytes()[:100])
+            bridge.verify_latest_auto_backup()
+    finally:
+        bridge.stop()
+
+
+def test_verify_latest_auto_backup_without_backup(tmp_path):
+    data_dir = tmp_path / "node"
+    assert (
+        cli.main(["init", "--data-dir", str(data_dir), "--name", "alice", "--json"])
+        == 0
+    )
+    node = FakeNode(tmp_path / "mailbox.json")
+    node.config = TauConfig.resolve(data_dir=data_dir)
+    web_dir = tmp_path / "out"
+    web_dir.mkdir()
+    (web_dir / "index.html").write_text("<html>tau console</html>", encoding="utf-8")
+    bridge = WebBridge(node, host="127.0.0.1", port=0, web_dir=web_dir)
+    bridge.start()
+    try:
+        with pytest.raises(WebBridgeError, match="no automatic backup yet"):
+            bridge.verify_latest_auto_backup()
+    finally:
+        bridge.stop()
+
+
+def test_backup_verify_route(tmp_path):
+    bridge, _data_dir, target = _start_auto_backup_bridge(tmp_path)
+    try:
+        status, _, payload = _json(
+            bridge, "/api/backup/verify", method="POST", body={}
+        )
+    finally:
+        bridge.stop()
+    assert status == 200
+    assert payload["backup"] == target.name
+    assert payload["node"] == "alice"
+    assert payload["encrypted"] is False
+    assert payload["valid"] is True
+
+
+def test_backup_verify_route_without_backup_is_unavailable(bridge):
+    status, _, payload = _json(
+        bridge, "/api/backup/verify", method="POST", body={}
+    )
+    assert status == 503
+    assert "no data directory" in payload["error"]["message"]
+
+
+def test_backup_verify_route_rejects_remote_client(tmp_path, monkeypatch):
+    import tau.webapi as webapi
+
+    bridge, _data_dir, _target = _start_auto_backup_bridge(tmp_path)
+    try:
+        monkeypatch.setattr(webapi, "_is_loopback_client", lambda client: False)
+        status, _, payload = _json(
+            bridge, "/api/backup/verify", method="POST", body={}
+        )
+    finally:
+        bridge.stop()
     assert status == 403
     assert "only available from localhost" in payload["error"]["message"]
 
