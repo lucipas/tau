@@ -440,6 +440,71 @@ def test_scheduler_next_due_in_while_running(tmp_path):
     assert scheduler.next_due_in(now=1000.0) == 0.0
 
 
+def test_scheduler_start_failure_backs_off(tmp_path):
+    node = _init_node(tmp_path, "a", "alice")
+    _set(node, "backup_interval", 3600)
+    scheduler = AutoBackupScheduler(_config(node))
+    assert scheduler.due(now=1000.0) is True
+    assert scheduler.next_due_in(now=1000.0) == 0.0
+    scheduler.note_start_failure(now=1000.0)
+    # Within the retry delay the backup is not due, and the mail
+    # loop waits out the delay instead of spinning on a zero wait.
+    assert scheduler.due(now=1000.0) is False
+    assert scheduler.due(now=1059.0) is False
+    assert scheduler.next_due_in(now=1000.0) == 60.0
+    assert scheduler.next_due_in(now=1030.0) == 30.0
+    # Once the delay elapses the backup is due again at once.
+    assert scheduler.due(now=1060.0) is True
+    assert scheduler.next_due_in(now=1060.0) == 0.0
+
+
+def test_scheduler_run_clears_start_failure(tmp_path):
+    node = _init_node(tmp_path, "a", "alice")
+    _set(node, "backup_interval", 30)
+    scheduler = AutoBackupScheduler(_config(node))
+    scheduler.note_start_failure(now=1000.0)
+    assert scheduler.due(now=1000.0) is False
+    scheduler.run(now=1000.0)
+    # The worker started, so the failure is behind us: the next
+    # backup is due an interval after the attempt, not after the
+    # longer start-failure delay.
+    assert scheduler.due(now=1030.0) is True
+
+
+def test_maybe_auto_backup_start_failure_backs_off(tmp_path, monkeypatch):
+    import threading
+    from types import SimpleNamespace
+
+    from tau.node import TauNode
+
+    node = _init_node(tmp_path, "a", "alice")
+    _set(node, "backup_interval", 3600)
+    scheduler = AutoBackupScheduler(_config(node))
+    namespace = SimpleNamespace(
+        _auto_backup_thread=None,
+        _stop_event=threading.Event(),
+        _auto_backup_scheduler=scheduler,
+    )
+
+    class _FailingThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+        def is_alive(self):
+            return False
+
+    monkeypatch.setattr(threading, "Thread", _FailingThread)
+    # A worker that cannot start must not raise into the mail loop,
+    # and the failure is recorded so the scheduler backs off.
+    TauNode._maybe_auto_backup(namespace)
+    assert scheduler._last_start_failure_at is not None
+    assert scheduler.due() is False
+    assert scheduler.next_due_in() > 0
+
+
 # --- CLI config commands --------------------------------------------------
 
 
