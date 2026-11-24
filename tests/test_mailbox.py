@@ -741,6 +741,50 @@ def test_load_dedupes_duplicate_message_ids(tmp_path):
     assert box.load() == {"outbox": 0, "held": 0, "pending_acks": 0}
 
 
+def test_mailbox_defer_load_reads_nothing_until_transaction(tmp_path):
+    """A mailbox constructed with defer_load=True (#744) reads nothing
+    from disk: its collections stay empty until a transaction reloads
+    them, so a caller with its own bounded wait never blocks on the
+    mailbox lock before that wait begins."""
+    path = tmp_path / "mailbox.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "outbox": [
+                    {
+                        "id": "one",
+                        "to": BOB.hex(),
+                        "text": "hello",
+                        "created_at": 1000.0,
+                        "expires_at": 9000.0,
+                    }
+                ],
+                "held": [],
+                "seen": {},
+                "pending_acks": {},
+                "dropped_held": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    box = Mailbox(path, defer_load=True)
+    assert box.counts() == {
+        "outbox": 0,
+        "held": 0,
+        "seen": 0,
+        "sent": 0,
+        "receipts": 0,
+        "retracted": 0,
+        "sent_retracted": 0,
+    }
+    with box.transaction():
+        assert box.counts()["outbox"] == 1
+        assert box.get_outbox("one") is not None
+        assert box.get_outbox("one").text == "hello"
+
+
 def test_load_skips_nonfinite_timestamps(tmp_path):
     """NaN / infinite timestamps never parse: a corrupt copy cannot
     replace a newer valid entry in the newest-wins comparison."""

@@ -1325,6 +1325,114 @@ def test_devices_redeem_retry_gate_falls_back_when_mailbox_lock_held(
         handle.close()
 
 
+def test_devices_redeem_retry_gate_falls_back_when_mailbox_has_duplicates_and_lock_held(
+    tmp_path, capsys, monkeypatch
+):
+    # Qodo Warning on #744: the gate used to construct its Mailbox
+    # eagerly, and loading a mailbox.json carrying duplicate ids
+    # rewrites the file under an UNBOUNDED transaction — so with the
+    # lock held by another process the gate hung before its bounded
+    # five-second timeout even began.  The gate now defers the load
+    # and takes the timeout fallback instead.
+    fcntl = pytest.importorskip("fcntl")
+    node_a = _init_node(tmp_path, "a", "alice")
+    _seed_history(node_a)
+    capsys.readouterr()
+
+    bundle_path = tmp_path / "pairing.json"
+    assert (
+        cli.main(
+            [
+                "devices",
+                "pair",
+                "--to",
+                str(bundle_path),
+                "--data-dir",
+                str(node_a),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    node_b = tmp_path / "b"
+    assert (
+        cli.main(
+            [
+                "devices",
+                "redeem",
+                "--from",
+                str(bundle_path),
+                "--data-dir",
+                str(node_b),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["history"]["imported"] == 3
+
+    # One snapshot record is missing, so the gate needs the markers —
+    # and node_b's mailbox.json carries a duplicate outbox id, so an
+    # eager load would rewrite it under an unbounded transaction.
+    inbox_b = Inbox(node_b / "inbox.json")
+    inbox_b.delete("msg-1")
+    mailbox_path = node_b / "mailbox.json"
+    mailbox_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "outbox": [
+                    {
+                        "id": "dup-id",
+                        "to": "b" * 32,
+                        "text": "newer copy",
+                        "created_at": 2000.0,
+                        "expires_at": 9000.0,
+                    },
+                    {
+                        "id": "dup-id",
+                        "to": "b" * 32,
+                        "text": "older copy",
+                        "created_at": 1000.0,
+                        "expires_at": 9000.0,
+                    },
+                ],
+                "held": [],
+                "seen": {},
+                "pending_acks": {},
+                "dropped_held": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    lock_path = node_b / "mailbox.json.lock"
+    handle = open(lock_path, "a")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        monkeypatch.setattr(cli, "_HISTORY_RETRY_LOCK_TIMEOUT", 0.0)
+        config = TauConfig.resolve(data_dir=node_b)
+        registry = DeviceRegistry(config.devices_path)
+        identity = load_identity(config.identity_path)
+        bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+        started = time.monotonic()
+        assert (
+            cli._history_retry_allowed(config, registry, identity, bundle)
+            is True
+        )
+        assert time.monotonic() - started < 5.0
+    finally:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+    # The gate never loaded the mailbox, so the duplicates are still
+    # on disk for the next eager load to dedupe.
+    reloaded = json.loads(mailbox_path.read_text(encoding="utf-8"))
+    assert len(reloaded["outbox"]) == 2
+
+
 def test_devices_pair_redeem_skips_retracted_history(tmp_path, capsys):
     # A message the sender retracted after the bundle was minted must
     # not be resurrected by the stale snapshot: the redeem passes this

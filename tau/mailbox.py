@@ -1309,9 +1309,25 @@ def _lock_file(handle: Any, timeout: Optional[float]) -> None:
 
 
 class Mailbox:
-    """Thread-safe store-and-forward storage, optionally JSON backed."""
+    """Thread-safe store-and-forward storage, optionally JSON backed.
 
-    def __init__(self, path: Optional[Union[str, Path]] = None) -> None:
+    ``defer_load`` leaves the in-memory collections empty until the
+    caller loads them (``load()`` or a ``transaction()``, which
+    reloads from disk first).  It exists for callers that must not
+    block on the mailbox lock before their own bounded wait begins:
+    :meth:`load` rewrites a file carrying duplicate ids under an
+    unbounded transaction, so constructing a mailbox eagerly can hang
+    indefinitely while another process holds the lock (see #744).
+    Callers that defer the load must read state only inside a
+    transaction, which reloads it first.
+    """
+
+    def __init__(
+        self,
+        path: Optional[Union[str, Path]] = None,
+        *,
+        defer_load: bool = False,
+    ) -> None:
         self.path = Path(path).expanduser() if path is not None else None
         self._lock = threading.RLock()
         self._txn_depth = 0
@@ -1397,7 +1413,7 @@ class Mailbox:
         # the same retention as the sent-retraction markers — long
         # enough to outlive any queued leg of the same retract.
         self._retract_cleanup_blocked: Dict[str, float] = {}
-        if self.path is not None:
+        if self.path is not None and not defer_load:
             self.load()
 
     @contextmanager
