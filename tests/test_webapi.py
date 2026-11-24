@@ -5547,8 +5547,23 @@ def test_devices_claimed_bundle_cleaned_up_on_stop(tmp_path, capsys):
     _, _, minted = _json(bridge, "/api/devices/pair", method="POST", body={})
     staged, _name = bridge.claim_device_bundle(minted["token"])
     assert staged.exists()
+    assert staged in bridge._device_bundles_in_flight
     bridge.stop()
     assert not staged.exists()
+    assert not bridge._device_bundles_in_flight
+
+
+def test_devices_finish_claimed_drops_inflight_and_deletes(tmp_path, capsys):
+    _, bridge = _devices_bridge(tmp_path, capsys)
+    try:
+        result = bridge.pair_device()
+        staged, _name = bridge.claim_device_bundle(result["token"])
+        assert staged in bridge._device_bundles_in_flight
+        bridge.finish_claimed_device_bundle(staged)
+        assert staged not in bridge._device_bundles_in_flight
+        assert not staged.exists()
+    finally:
+        bridge.stop()
 
 
 def test_devices_prune_deletes_expired_staged_bundles(tmp_path, capsys):
