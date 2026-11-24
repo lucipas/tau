@@ -172,4 +172,54 @@ describe("RightSidebar pending successor navigation", () => {
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(window.location.hash).toBe("#social");
   });
+
+  it("does not follow the successor if the user left and came back before it arrived", async () => {
+    mockFetchBodies((url) => {
+      if (url.includes("/api/groups/remove-member")) {
+        return {
+          group: { ...group(), id: NEW_ID },
+          previous_id: GROUP_ID,
+        };
+      }
+      return inviteOnly(url);
+    });
+    window.location.hash = `#chat?group=${GROUP_ID}`;
+    const peers = [
+      fakePeer({ destination: BOB, name: "bob" }),
+      fakePeer({ destination: CAROL, name: "carol" }),
+    ];
+    const before = fakeTau({ peers, groups: [group()] });
+    before.refresh = vi.fn(async () => null);
+    const rendered = render(
+      <TauContext.Provider value={before}>
+        <RightSidebar />
+      </TauContext.Provider>,
+    );
+    await waitFor(() => expect(screen.getByText("Members")).toBeTruthy());
+    fireEvent.click(screen.getByLabelText("Remove bob from group"));
+    fireEvent.click(screen.getByText("Confirm remove?"));
+    await waitFor(() =>
+      expect(
+        screen.getByText(
+          "Members updated, but the new group couldn't be loaded yet — it will appear when the connection recovers.",
+        ),
+      ).toBeTruthy(),
+    );
+
+    // The user leaves the thread, then comes back before the
+    // successor snapshot arrives: the departure already cleared the
+    // pending navigation, so returning must not re-arm it.
+    window.location.hash = "#social";
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    window.location.hash = `#chat?group=${GROUP_ID}`;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const after = fakeTau({ peers, groups: [{ ...group(), id: NEW_ID }] });
+    rendered.rerender(
+      <TauContext.Provider value={after}>
+        <RightSidebar />
+      </TauContext.Provider>,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(window.location.hash).toBe(`#chat?group=${GROUP_ID}`);
+  });
 });
