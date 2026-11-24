@@ -179,9 +179,13 @@ export default function PeerPanel({ conversation }: { conversation: Conversation
   // id, so after the refresh the open thread follows the new id (in the
   // section the panel is showing — chat on desktop, people on mobile).
   async function changeMembers(adding: boolean, members: string[]) {
-    if (!groupId) return;
+    // One roster change at a time: each rotates the same predecessor id.
+    if (!groupId || busy !== null) return;
     setBusy(adding ? "add-member" : "remove-member");
     setError(null);
+    // Only follow the successor if the user is still on this thread when
+    // the request completes (they may have switched chats or sections).
+    const startedAt = window.location.hash;
     try {
       const result = adding
         ? await addGroupMembers(groupId, members)
@@ -189,7 +193,7 @@ export default function PeerPanel({ conversation }: { conversation: Conversation
       setConfirmRemove(null);
       setAddPeer("");
       await tau.refresh();
-      if (result.group.id !== groupId) {
+      if (result.group.id !== groupId && window.location.hash === startedAt) {
         navigate(section, { group: result.group.id });
       }
     } catch (err) {
@@ -345,7 +349,7 @@ export default function PeerPanel({ conversation }: { conversation: Conversation
                   (confirmRemove === m.hash ? (
                     <button
                       type="button"
-                      disabled={busy === "remove-member"}
+                      disabled={busy !== null}
                       onClick={() => void changeMembers(false, [m.hash])}
                       className="shrink-0 rounded-full border border-red-800 px-2 py-0.5 text-xs font-semibold text-red-300 hover:bg-red-950 disabled:opacity-40"
                     >
@@ -388,7 +392,7 @@ export default function PeerPanel({ conversation }: { conversation: Conversation
                     ))}
                   </select>
                   <ActionButton
-                    disabled={!addPeer || busy === "add-member"}
+                    disabled={!addPeer || busy !== null}
                     onClick={() => void changeMembers(true, [addPeer])}
                   >
                     Add
