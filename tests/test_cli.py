@@ -14435,6 +14435,63 @@ def test_tan_quote_with_image_stores_attachment(tmp_path, capsys):
     assert payload["scheduled"][0]["image"]["sha256"] == digest
 
 
+def test_tan_quote_with_image_rejects_bad_delay_without_pinning(
+    tmp_path, capsys
+):
+    import hashlib
+
+    from tau.tangents.tan import feed, init_db, media_path
+
+    data_dir, png, digest = _post_image_fixture(tmp_path, capsys)
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        target = feed(conn)[0]["hash"]
+    finally:
+        conn.close()
+    # A second image, distinct from the fixture's pinned one, so an
+    # orphaned pin would be visible.
+    other = tmp_path / "other.png"
+    other.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x01" * 64)
+    other_digest = hashlib.sha256(other.read_bytes()).hexdigest()
+    assert media_path(data_dir, other_digest) is None
+    # The delay is validated before the image is read: a rejected
+    # --delay must not leave unreferenced bytes pinned in the media
+    # store, which is never pruned.
+    assert cli.main(
+        [
+            "tan",
+            "quote",
+            "--data-dir",
+            str(data_dir),
+            target,
+            "never",
+            "--image",
+            str(other),
+            "--delay",
+            "99x",
+        ]
+    ) == 2
+    capsys.readouterr()
+    assert media_path(data_dir, other_digest) is None
+    assert cli.main(
+        [
+            "tan",
+            "quote",
+            "--data-dir",
+            str(data_dir),
+            target,
+            "never",
+            "--image",
+            str(other),
+            "--delay",
+            "5m",
+            "--no-publish",
+        ]
+    ) == 2
+    capsys.readouterr()
+    assert media_path(data_dir, other_digest) is None
+
+
 def test_tan_post_image_rejects_bad_input(tmp_path, capsys):
     data_dir = tmp_path / "node"
     assert cli.main(["init", "--data-dir", str(data_dir), "--json"]) == 0

@@ -605,6 +605,10 @@ export default function PostCard({
                       aria-label="Remove attached image"
                       onClick={() => {
                         setQuoteFile(null);
+                        // Clear the input too, or picking the same file
+                        // again fires no change event and the image
+                        // stays dropped — the same reset TanComposer
+                        // does when it clears a picked file.
                         if (quoteFileRef.current) quoteFileRef.current.value = "";
                       }}
                       className="text-zinc-500 hover:text-zinc-200"

@@ -132,6 +132,38 @@ describe("PostCard quote composer with an image", () => {
     expect((await screen.findByRole("alert")).textContent).toMatch(/2 MB limit/);
     expect(actions.quote).not.toHaveBeenCalled();
   });
+
+  it("lets the same file be picked again after removing it", async () => {
+    const actions = makeActions();
+    render(<PostCard post={makePost()} actions={actions} />);
+    openQuoteComposer();
+    fireEvent.change(screen.getByLabelText("Quote text"), {
+      target: { value: "second try" },
+    });
+    const file = pickImage();
+    expect(screen.getByText("pic.png")).toBeTruthy();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Remove attached image" }),
+    );
+    expect(screen.queryByText("pic.png")).toBeNull();
+    // jsdom does not model a file input's value, so the reset of
+    // the input itself (which is what lets a real browser fire a
+    // change event when the same file is picked again) cannot be
+    // observed here — it follows TanComposer's identical reset.
+    // This covers the round-trip: re-pick and submit carries the
+    // image again.
+    const input = screen.getByLabelText(
+      "Attach an image to the quote",
+    ) as HTMLInputElement;
+    fireEvent.change(input, { target: { files: [file] } });
+    expect(screen.getByText("pic.png")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Post quote" }));
+    await waitFor(() =>
+      expect(actions.quote).toHaveBeenCalledWith(POST_HASH, "second try", {
+        image: { dataUrl: "data:image/png;base64,aGVsbG8=" },
+      }),
+    );
+  });
 });
 
 describe("PostCard share picker", () => {

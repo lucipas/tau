@@ -15172,6 +15172,125 @@ def test_tan_quote_via_api_accepts_image(tmp_path):
         bridge.stop()
 
 
+def test_tan_quote_via_api_accepts_large_image(tmp_path):
+    # A quote image near the 2 MiB limit is far past the generic 32 KiB
+    # JSON-body cap: both quote routes get the file-body cap, like
+    # /api/tan/posts, or most quote images would fail to upload.
+    import base64
+    import hashlib
+
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        post = create_post(conn, identity, "api quotable", name="tester", now=1000)
+    finally:
+        conn.close()
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        png = b"\x89PNG\r\n\x1a\n" + b"\x00" * (100 * 1024)
+        data_url = (
+            "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+        )
+        assert len(data_url) > 32 * 1024
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/quote",
+            method="POST",
+            body={"target": post["hash"], "text": "big picture", "image": data_url},
+        )
+        assert status == 200
+        assert payload["post"]["image"]["size"] == len(png)
+
+        # A scheduled quote with the same image rides the same cap.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/schedule",
+            method="POST",
+            body={
+                "kind": "quote",
+                "target_post": post["hash"],
+                "text": "big picture, later",
+                "send_in": 60,
+                "image": data_url,
+            },
+        )
+        assert status == 200
+        assert payload["scheduled"]["image"]["size"] == len(png)
+    finally:
+        bridge.stop()
+
+
+def test_tan_quote_via_api_refuses_unknown_target_without_pinning(tmp_path):
+    # The target is resolved before the image is decoded or pinned:
+    # a refused quote must not leave unreferenced bytes in the
+    # pinned media store, which is never pruned.
+    import base64
+    import hashlib
+
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, create_post, init_db, media_path
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        post = create_post(conn, identity, "api quotable", name="tester", now=1000)
+    finally:
+        conn.close()
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+        data_url = (
+            "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+        )
+        digest = hashlib.sha256(png).hexdigest()
+        assert media_path(tmp_path, digest) is None
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/quote",
+            method="POST",
+            body={"target": "cd" * 32, "text": "nowhere", "image": data_url},
+        )
+        assert status == 400
+        assert "unknown post" in payload["error"]["message"]
+        assert media_path(tmp_path, digest) is None
+
+        # A scheduled quote to an unknown target refuses the same way.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/schedule",
+            method="POST",
+            body={
+                "kind": "quote",
+                "target_post": "cd" * 32,
+                "text": "nowhere",
+                "send_in": 60,
+                "image": data_url,
+            },
+        )
+        assert status == 400
+        assert "unknown post" in payload["error"]["message"]
+        assert media_path(tmp_path, digest) is None
+    finally:
+        bridge.stop()
+
+
 def test_tan_schedule_post_via_api(tmp_path):
     import RNS
 
