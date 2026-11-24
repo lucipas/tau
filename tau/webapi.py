@@ -4052,6 +4052,18 @@ class WebBridge:
                 raise ValueError(
                     f"a scheduled {kind} cannot carry poll options"
                 )
+        # Validate the pin's contents before decoding or pinning the
+        # image: a malformed pin fails later in schedule_post, after
+        # the image bytes are already pinned with nothing referencing
+        # them. Cleaned once here, the same value rides on.
+        cleaned_location = (
+            clean_location(location) if location is not None else None
+        )
+        if location is not None and cleaned_location is None:
+            raise ValueError(
+                "field 'location' must be an object with latitude "
+                "-90..90 and longitude -180..180"
+            )
         image_attachment: Optional[Dict[str, Any]] = None
         if image is not None:
             from .tangents.tan import image_attachment_from_data_url
@@ -4115,7 +4127,7 @@ class WebBridge:
             name=getattr(self.node, "name", None),
             expires_in=float(expires_in),
             image=image_attachment,
-            location=location,
+            location=cleaned_location,
         )
         return post.to_dict()
 

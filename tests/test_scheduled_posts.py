@@ -95,6 +95,28 @@ def test_store_rejects_malformed_entries(tmp_path):
         load_scheduled_posts(path)
 
 
+def test_store_rejects_reply_with_attachment(tmp_path):
+    # The write path refuses both combinations, and the publish pass
+    # would drop the attachment silently — so a hand-edited queue file
+    # carrying either must fail to load.
+    for field, value in (
+        ("location", {"lat": 34.05, "lon": -83.88}),
+        ("image", {"sha256": "ab" * 32, "size": 10, "mime": "image/png"}),
+    ):
+        path = tmp_path / "scheduled-posts.json"
+        entry = {
+            "id": "ab" * 8,
+            "text": "a reply",
+            "reply_to": "de" * 32,
+            "publish_at": 1000.0,
+            "created_at": 999.0,
+            field: value,
+        }
+        path.write_text(json.dumps({"posts": [entry]}), encoding="utf-8")
+        with pytest.raises(ScheduledPostsError):
+            load_scheduled_posts(path)
+
+
 def test_store_rejects_empty_text_and_bad_ttl():
     with pytest.raises(ScheduledPostsError):
         _post(text="   ")

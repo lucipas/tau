@@ -15270,6 +15270,44 @@ def test_tan_schedule_post_with_location_via_api(tmp_path):
         bridge.stop()
 
 
+def test_tan_schedule_post_bad_location_pins_no_image(tmp_path):
+    # A valid image with a malformed pin must fail before the bytes
+    # are pinned: otherwise the schedule 400s and the image sits
+    # orphaned in the pinned store with nothing referencing it.
+    from tau.config import TauConfig
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+        data_url = "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+        digest = hashlib.sha256(png).hexdigest()
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/schedule",
+            method="POST",
+            body={
+                "text": "meet me here tomorrow",
+                "send_in": 3600,
+                "image": data_url,
+                "location": {"lat": 999, "lon": 0},
+            },
+        )
+        assert status == 400
+        assert "location" in payload["error"]["message"]
+
+        from tau.tangents.tan import media_path
+
+        assert media_path(tmp_path, digest) is None
+        status, _, payload = _json(bridge, "/api/tan/scheduled")
+        assert payload["count"] == 0
+    finally:
+        bridge.stop()
+
+
 def test_tan_schedule_poll_via_api(tmp_path):
     node = FakeNode()
     node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
