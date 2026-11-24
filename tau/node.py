@@ -29,6 +29,7 @@ from .allowlist import (
     load_allowlist_or_deny_all,
     save_allowlist,
 )
+from .auto_backup import AutoBackupScheduler
 from .beacons import (
     BEACON_DEFAULT_DURATION,
     BEACON_UPDATE_INTERVAL,
@@ -855,6 +856,8 @@ class TauNode:
         self._foreign_announces_lock = threading.Lock()
         self._mail_thread: Optional[threading.Thread] = None
         self._scheduled_files_thread: Optional[threading.Thread] = None
+        self._auto_backup_thread: Optional[threading.Thread] = None
+        self._auto_backup_scheduler = AutoBackupScheduler(self.config)
         self._mail_lock = threading.Lock()
         self._mail_round_threads: Set[threading.Thread] = set()
         self._mail_rounds_lock = threading.Lock()
@@ -5352,6 +5355,10 @@ class TauNode:
             except Exception:  # pragma: no cover - defensive
                 log.debug("Scheduled file send failed", exc_info=True)
             try:
+                self._maybe_auto_backup()
+            except Exception:  # pragma: no cover - defensive
+                log.debug("Automatic backup check failed", exc_info=True)
+            try:
                 self._fire_due_reminders()
             except Exception:  # pragma: no cover - defensive
                 log.debug("Reminder firing failed", exc_info=True)
@@ -5460,6 +5467,36 @@ class TauNode:
 
         thread = threading.Thread(target=_run, name="scheduled-files", daemon=True)
         self._scheduled_files_thread = thread
+        thread.start()
+
+    def _maybe_auto_backup(self) -> None:
+        """Take an automatic backup when one is due, on a worker thread.
+
+        A backup can take minutes, so the pass never runs on the
+        mail-loop thread (see ``tau.auto_backup``). At most one backup
+        runs at a time: a backup still working when the next mail loop
+        comes around is left alone, and the scheduler's next-due time
+        is already past it, so the following pass picks it up. A failed
+        backup is logged and the schedule advances — see
+        ``tau.auto_backup`` — so this never raises into the mail loop.
+        """
+        thread = self._auto_backup_thread
+        if thread is not None and thread.is_alive():
+            return
+        if not self._auto_backup_scheduler.due():
+            return
+
+        def _run() -> None:
+            try:
+                target = self._auto_backup_scheduler.run()
+            except Exception:  # pragma: no cover - defensive; helper logs
+                log.warning("Automatic backup failed", exc_info=True)
+                return
+            if target is not None:
+                log.info("Automatic backup written to %s", target)
+
+        thread = threading.Thread(target=_run, name="auto-backup", daemon=True)
+        self._auto_backup_thread = thread
         thread.start()
 
     def _fire_due_reminders(self) -> None:

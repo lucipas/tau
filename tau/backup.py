@@ -172,6 +172,24 @@ MIN_BACKUP_PASSPHRASE_LENGTH = 8
 _MAX_ENCRYPTED_BYTES = MAX_TOTAL_BYTES + 64 * 1024 * 1024
 
 
+def read_passphrase_file(path: Path) -> str:
+    """Read a backup passphrase from *path*, dropping one trailing newline.
+
+    The file usually ends with a newline from the editor that wrote it;
+    that newline is not part of the passphrase, but any other whitespace
+    is — the value must match exactly what a prompt would have read.
+    """
+    try:
+        content = Path(path).expanduser().read_text(encoding="utf-8")
+    except OSError as exc:
+        raise BackupError(f"cannot read passphrase file {path}: {exc}") from exc
+    if content.endswith("\r\n"):
+        content = content[:-2]
+    elif content.endswith("\n"):
+        content = content[:-1]
+    return content
+
+
 def _clean_passphrase(passphrase: object) -> str:
     """Validate a backup passphrase: a string of at least 8 characters.
 

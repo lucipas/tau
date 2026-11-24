@@ -49,6 +49,8 @@ from .away import (
 from .backup import create_backup, is_encrypted_backup, restore_backup
 from .backup import BackupError as _BackupError
 from .backup import _clean_passphrase as _validate_backup_passphrase
+from .backup import _is_within as _path_is_within
+from .backup import read_passphrase_file as _read_backup_passphrase_file
 from .blocklist import (
     BlockListError,
     load_blocked_set,
@@ -66,9 +68,15 @@ from .bundle import (
 from .config import (
     ANNOUNCE_INTERVAL_DEFAULT,
     ANNOUNCE_INTERVAL_MAX,
+    BACKUP_INTERVAL_MAX,
+    BACKUP_KEEP_MAX,
     TauConfig,
     accept_files_enabled,
     announce_interval,
+    backup_dir,
+    backup_interval,
+    backup_keep,
+    backup_passphrase_file,
     load_node_name,
     parse_host_port,
     send_read_receipts_enabled,
@@ -2083,6 +2091,65 @@ def build_parser() -> argparse.ArgumentParser:
         help="re-announce every SECONDS seconds; 0 sends no automatic announces",
     )
     config_announce.set_defaults(func=cmd_config)
+    config_cmd.set_defaults(func=cmd_config)
+
+    config_backup_interval = config_sub.add_parser(
+        "backup-interval",
+        parents=[common],
+        help="how often a serving node backs itself up (seconds, 0 disables, default 0)",
+    )
+    config_backup_interval.add_argument(
+        "seconds",
+        nargs="?",
+        type=_backup_interval_value,
+        help="back up every SECONDS seconds; 0 takes no automatic backups",
+    )
+    config_backup_interval.set_defaults(func=cmd_config)
+    config_cmd.set_defaults(func=cmd_config)
+
+    config_backup_dir = config_sub.add_parser(
+        "backup-dir",
+        parents=[common],
+        help="where automatic backups land (default: tau-backups next to the data directory)",
+    )
+    config_backup_dir.add_argument(
+        "path",
+        nargs="?",
+        help="directory for automatic backups; must be absolute and outside the data directory",
+    )
+    config_backup_dir.set_defaults(func=cmd_config)
+    config_cmd.set_defaults(func=cmd_config)
+
+    config_backup_keep = config_sub.add_parser(
+        "backup-keep",
+        parents=[common],
+        help="how many automatic backups to retain (default 7, 0 keeps all)",
+    )
+    config_backup_keep.add_argument(
+        "count",
+        nargs="?",
+        type=_backup_keep_value,
+        help="retain the COUNT newest automatic backups; 0 keeps all",
+    )
+    config_backup_keep.set_defaults(func=cmd_config)
+    config_cmd.set_defaults(func=cmd_config)
+
+    config_backup_passphrase = config_sub.add_parser(
+        "backup-passphrase-file",
+        parents=[common],
+        help="passphrase file automatic backups are encrypted with (unset means plaintext)",
+    )
+    config_backup_passphrase.add_argument(
+        "path",
+        nargs="?",
+        help="file holding the backup passphrase; omit to show the current file",
+    )
+    config_backup_passphrase.add_argument(
+        "--clear",
+        action="store_true",
+        help="stop encrypting automatic backups",
+    )
+    config_backup_passphrase.set_defaults(func=cmd_config)
     config_cmd.set_defaults(func=cmd_config)
 
     block = subparsers.add_parser(
@@ -15809,21 +15876,8 @@ def _send_routes_via_running_node(config: TauConfig) -> bool:
 
 
 def _read_passphrase_file(path: Path) -> str:
-    """Read a backup passphrase from *path*, dropping one trailing newline.
-
-    The file usually ends with a newline from the editor that wrote it;
-    that newline is not part of the passphrase, but any other whitespace
-    is — the value must match exactly what a prompt would have read.
-    """
-    try:
-        content = Path(path).expanduser().read_text(encoding="utf-8")
-    except OSError as exc:
-        raise _BackupError(f"cannot read passphrase file {path}: {exc}") from exc
-    if content.endswith("\r\n"):
-        content = content[:-2]
-    elif content.endswith("\n"):
-        content = content[:-1]
-    return content
+    """Read a backup passphrase from *path* (see ``tau.backup``)."""
+    return _read_backup_passphrase_file(path)
 
 
 def _prompt_backup_passphrase(*, confirm: bool) -> str:
@@ -24872,6 +24926,44 @@ def _announce_interval_value(text: str) -> float:
     return value
 
 
+def _backup_interval_value(text: str) -> float:
+    """Parse the `tau config backup-interval` argument (see #750)."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"invalid backup interval: {text!r}"
+        ) from None
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError(
+            "backup interval must be 0 or more seconds"
+        )
+    if value > BACKUP_INTERVAL_MAX:
+        raise argparse.ArgumentTypeError(
+            f"backup interval must be at most {BACKUP_INTERVAL_MAX:g} seconds"
+        )
+    return value
+
+
+def _backup_keep_value(text: str) -> int:
+    """Parse the `tau config backup-keep` argument (see #750)."""
+    try:
+        value = int(text, 10)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"invalid backup keep count: {text!r}"
+        ) from None
+    if value < 0:
+        raise argparse.ArgumentTypeError(
+            "backup keep count must be 0 or more"
+        )
+    if value > BACKUP_KEEP_MAX:
+        raise argparse.ArgumentTypeError(
+            f"backup keep count must be at most {BACKUP_KEEP_MAX}"
+        )
+    return value
+
+
 def cmd_config(args: argparse.Namespace) -> int:
     """Show or change this node's own settings (stored in node.json)."""
     config = _make_config(args)
@@ -24954,11 +25046,145 @@ def cmd_config(args: argparse.Namespace) -> int:
                 print("  a running `tau serve` picks this up at its next cycle")
         return _EXIT_OK
 
+    if command == "backup-interval":
+        seconds_arg = getattr(args, "seconds", None)
+        if seconds_arg is None:
+            interval = backup_interval(config.data_dir)
+            if json_output:
+                _emit({"backup_interval": interval}, True)
+            else:
+                if interval == 0:
+                    print("Backup interval: off")
+                    print("  this node takes no automatic backups")
+                else:
+                    print(f"Backup interval: {interval:g} seconds")
+                    print("  0 disables automatic backups")
+            return _EXIT_OK
+        interval = float(seconds_arg)
+        set_node_setting(config.data_dir, "backup_interval", interval)
+        if json_output:
+            _emit({"backup_interval": interval}, True)
+        else:
+            if interval == 0:
+                print("Backup interval: off")
+                print("  this node takes no automatic backups")
+            else:
+                print(f"Backup interval: {interval:g} seconds")
+                print("  a running `tau serve` picks this up at its next cycle")
+        return _EXIT_OK
+
+    if command == "backup-dir":
+        path_arg = getattr(args, "path", None)
+        if path_arg is None:
+            directory = backup_dir(config.data_dir)
+            if json_output:
+                _emit({"backup_dir": str(directory)}, True)
+            else:
+                print(f"Backup directory: {directory}")
+            return _EXIT_OK
+        directory = Path(path_arg).expanduser()
+        if not directory.is_absolute():
+            raise NodeError("backup directory must be an absolute path")
+        if _path_is_within(directory, config.data_dir):
+            raise NodeError(
+                "backup directory must be outside the data directory"
+            )
+        set_node_setting(config.data_dir, "backup_dir", str(directory))
+        if json_output:
+            _emit({"backup_dir": str(directory)}, True)
+        else:
+            print(f"Backup directory: {directory}")
+            print("  a running `tau serve` picks this up at its next cycle")
+        return _EXIT_OK
+
+    if command == "backup-keep":
+        count_arg = getattr(args, "count", None)
+        if count_arg is None:
+            keep = backup_keep(config.data_dir)
+            if json_output:
+                _emit({"backup_keep": keep}, True)
+            else:
+                if keep == 0:
+                    print("Backup keep: all")
+                    print("  automatic backups are never pruned")
+                else:
+                    print(f"Backup keep: {keep}")
+            return _EXIT_OK
+        keep = int(count_arg)
+        set_node_setting(config.data_dir, "backup_keep", keep)
+        if json_output:
+            _emit({"backup_keep": keep}, True)
+        else:
+            if keep == 0:
+                print("Backup keep: all")
+                print("  automatic backups are never pruned")
+            else:
+                print(f"Backup keep: {keep}")
+                print("  a running `tau serve` picks this up at its next cycle")
+        return _EXIT_OK
+
+    if command == "backup-passphrase-file":
+        if getattr(args, "clear", False):
+            set_node_setting(
+                config.data_dir, "backup_passphrase_file", None
+            )
+            if json_output:
+                _emit({"backup_passphrase_file": None}, True)
+            else:
+                print("Backup passphrase file: none")
+                print("  automatic backups are plaintext from now on")
+            return _EXIT_OK
+        path_arg = getattr(args, "path", None)
+        if path_arg is None:
+            stored = backup_passphrase_file(config.data_dir)
+            if json_output:
+                _emit(
+                    {
+                        "backup_passphrase_file": (
+                            str(stored) if stored is not None else None
+                        )
+                    },
+                    True,
+                )
+            else:
+                if stored is None:
+                    print("Backup passphrase file: none")
+                    print("  automatic backups are plaintext")
+                else:
+                    print(f"Backup passphrase file: {stored}")
+            return _EXIT_OK
+        # Fail fast: an unreadable file or a too-short passphrase would
+        # break every automatic backup until it is fixed, so validate
+        # now instead of at the next backup.
+        try:
+            passphrase = _read_passphrase_file(Path(path_arg))
+        except _BackupError as exc:
+            raise NodeError(str(exc)) from exc
+        try:
+            _validate_backup_passphrase(passphrase)
+        except _BackupError as exc:
+            raise NodeError(str(exc)) from exc
+        stored = str(Path(path_arg).expanduser())
+        set_node_setting(config.data_dir, "backup_passphrase_file", stored)
+        if json_output:
+            _emit({"backup_passphrase_file": stored}, True)
+        else:
+            print(f"Backup passphrase file: {stored}")
+            print("  automatic backups are encrypted from now on")
+        return _EXIT_OK
+
+    passphrase_file = backup_passphrase_file(config.data_dir)
     settings = {
         "accept_files": accept_files_enabled(config.data_dir),
         "send_read_receipts": send_read_receipts_enabled(config.data_dir),
         "tan_sync_depth": tan_sync_depth(config.data_dir),
         "announce_interval": announce_interval(config.data_dir),
+        "backup_interval": backup_interval(config.data_dir),
+        "backup_dir": str(backup_dir(config.data_dir)),
+        "backup_keep": backup_keep(config.data_dir),
+        "backup_passphrase_file": (
+            str(passphrase_file) if passphrase_file is not None else None
+        ),
     }
     if json_output:
         _emit(settings, True)
@@ -24975,10 +25201,29 @@ def cmd_config(args: argparse.Namespace) -> int:
         print(f"  send read receipts: {receipts_state}")
         print(f"  tan sync depth: {settings['tan_sync_depth']}")
         print(f"  announce interval: {interval_state}")
+        backup_interval_state = (
+            "off"
+            if settings["backup_interval"] == 0
+            else f"{settings['backup_interval']:g} seconds"
+        )
+        print(f"  backup interval: {backup_interval_state}")
+        print(f"  backup directory: {settings['backup_dir']}")
+        backup_keep_state = (
+            "all" if settings["backup_keep"] == 0 else settings["backup_keep"]
+        )
+        print(f"  backup keep: {backup_keep_state}")
+        backup_passphrase_state = (
+            settings["backup_passphrase_file"] or "none"
+        )
+        print(f"  backup passphrase file: {backup_passphrase_state}")
         print("  change with: tau config accept-files on|off")
         print("  change with: tau config read-receipts on|off")
         print("  change with: tau config tan-sync-depth 1|2")
         print("  change with: tau config announce-interval <seconds>")
+        print("  change with: tau config backup-interval <seconds>")
+        print("  change with: tau config backup-dir <path>")
+        print("  change with: tau config backup-keep <count>")
+        print("  change with: tau config backup-passphrase-file <path>")
     return _EXIT_OK
 
 
