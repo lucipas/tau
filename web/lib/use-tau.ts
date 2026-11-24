@@ -492,17 +492,23 @@ export function useConversations(
   // Orphaned ignored ids (record gone) come only from /api/groups/left;
   // the snapshot covers every ignored group whose record still exists.
   const [leftIgnored, setLeftIgnored] = useState<{ id: string; name: string }[]>([]);
+  const ignoredSeq = useRef(0);
   const refreshIgnoredGroups = useCallback(async () => {
+    const seq = ++ignoredSeq.current;
     try {
       const left = await getLeftGroups();
-      setLeftIgnored(left.ignored ?? []);
+      // A stale response must not overwrite a newer one.
+      if (seq === ignoredSeq.current) setLeftIgnored(left.ignored ?? []);
     } catch {
       // Ignored groups are advisory; a failed poll must not break the list.
     }
   }, []);
+  // Re-read the orphan list whenever the snapshot's groups change, so
+  // ignore/leave/un-ignore from elsewhere (PeerPanel, CLI, another tab)
+  // is reflected without a reload.
   useEffect(() => {
     void refreshIgnoredGroups();
-  }, [refreshIgnoredGroups]);
+  }, [refreshIgnoredGroups, tau.groups]);
 
   const conversations = useMemo(
     () =>
