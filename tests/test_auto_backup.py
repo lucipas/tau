@@ -124,11 +124,15 @@ def test_auto_backup_filename():
 
 
 def test_is_auto_backup_name():
-    assert is_auto_backup_name("tau-backup-alice-20251125-000000.tar.gz")
-    assert is_auto_backup_name("tau-backup-alice-20251125-000000.tau")
-    assert not is_auto_backup_name("backup.tar.gz")
-    assert not is_auto_backup_name("tau-backup-alice-20251125-000000.zip")
-    assert not is_auto_backup_name("tau-backup-notes.txt")
+    assert is_auto_backup_name("tau-backup-alice-20251125-000000.tar.gz", "alice")
+    assert is_auto_backup_name("tau-backup-alice-20251125-000000.tau", "alice")
+    assert is_auto_backup_name("tau-backup-alice-20251125-000000-2.tau", "alice")
+    assert not is_auto_backup_name("backup.tar.gz", "alice")
+    assert not is_auto_backup_name("tau-backup-alice-20251125-000000.zip", "alice")
+    assert not is_auto_backup_name("tau-backup-notes.txt", "alice")
+    # A manual archive that merely shares the prefix is not ours.
+    assert not is_auto_backup_name("tau-backup-notes.tar.gz", "alice")
+    assert not is_auto_backup_name("tau-backup-bob-20251125-000000.tar.gz", "alice")
 
 
 def test_list_and_prune_auto_backups(tmp_path):
@@ -143,18 +147,51 @@ def test_list_and_prune_auto_backups(tmp_path):
         (directory / name).write_bytes(b"x")
     (directory / "backup.tar.gz").write_bytes(b"manual")
     (directory / "notes.txt").write_text("keep me", encoding="utf-8")
-    assert [p.name for p in list_auto_backups(directory)] == names
-    assert list_auto_backups(tmp_path / "missing") == []
+    assert [p.name for p in list_auto_backups(directory, "alice")] == names
+    assert list_auto_backups(tmp_path / "missing", "alice") == []
 
-    deleted = prune_auto_backups(directory, 2)
+    deleted = prune_auto_backups(directory, 2, "alice")
     assert [p.name for p in deleted] == [names[0]]
-    assert [p.name for p in list_auto_backups(directory)] == names[1:]
+    assert [p.name for p in list_auto_backups(directory, "alice")] == names[1:]
     # A manual backup and an unrelated file are never pruned.
     assert (directory / "backup.tar.gz").exists()
     assert (directory / "notes.txt").exists()
 
-    assert prune_auto_backups(directory, 0) == []
-    assert len(list_auto_backups(directory)) == 2
+    assert prune_auto_backups(directory, 0, "alice") == []
+    assert len(list_auto_backups(directory, "alice")) == 2
+
+
+def test_prune_never_deletes_manual_prefixed_archive(tmp_path):
+    directory = tmp_path / "backups"
+    directory.mkdir()
+    manual = directory / "tau-backup-notes.tar.gz"
+    manual.write_bytes(b"manual")
+    for hour in range(3):
+        (directory / f"tau-backup-alice-20251125-0{hour}0000.tar.gz").write_bytes(b"x")
+    prune_auto_backups(directory, 1, "alice")
+    assert manual.exists()
+    assert len(list_auto_backups(directory, "alice")) == 1
+
+
+def test_prune_scoped_to_node_sharing_directory(tmp_path):
+    directory = tmp_path / "backups"
+    directory.mkdir()
+    # Sibling node "bob" wrote its archives into the same directory.
+    bob = [
+        "tau-backup-bob-20251125-000000.tar.gz",
+        "tau-backup-bob-20251125-010000.tar.gz",
+    ]
+    for name in bob:
+        (directory / name).write_bytes(b"x")
+    alice = [
+        "tau-backup-alice-20251125-000000.tar.gz",
+        "tau-backup-alice-20251125-010000.tar.gz",
+    ]
+    for name in alice:
+        (directory / name).write_bytes(b"x")
+    prune_auto_backups(directory, 1, "alice")
+    assert [p.name for p in list_auto_backups(directory, "alice")] == [alice[1]]
+    assert [p.name for p in list_auto_backups(directory, "bob")] == bob
 
 
 # --- scheduler ------------------------------------------------------------
@@ -255,7 +292,7 @@ def test_scheduler_run_prunes_to_keep(tmp_path):
     scheduler = AutoBackupScheduler(_config(node))
     for offset in (0, 120, 240):
         assert scheduler.run(now=1764028800.0 + offset) is not None
-    kept = [p.name for p in list_auto_backups(directory)]
+    kept = [p.name for p in list_auto_backups(directory, "alice")]
     assert kept == [
         "tau-backup-alice-20251125-000200.tar.gz",
         "tau-backup-alice-20251125-000400.tar.gz",
@@ -270,12 +307,45 @@ def test_scheduler_failure_advances_schedule(tmp_path):
     # An unreadable passphrase file breaks the backup...
     _set(node, "backup_passphrase_file", str(tmp_path / "missing.txt"))
     scheduler = AutoBackupScheduler(_config(node))
+    # The attempt "started" at 1000, long before now, so its retry must
+    # be anchored to when it finished, not when it started.
     with pytest.raises(Exception):
         scheduler.run(now=1000.0)
-    # ...but the next backup is not due until the interval passes,
-    # so a failing backup does not retry every mail-loop pass.
-    assert scheduler.due(now=1000.0) is False
-    assert scheduler.due(now=1000.0 + 3600) is True
+    finished = time.time()
+    # ...but the next backup is not due until the interval passes after
+    # the failure, so a failing backup does not retry every mail-loop pass.
+    assert scheduler.due(now=finished) is False
+    assert scheduler.due(now=finished + 3600) is True
+
+
+def test_scheduler_reservation_skips_taken_names(tmp_path):
+    node = _init_node(tmp_path, "a", "alice")
+    directory = tmp_path / "backups"
+    directory.mkdir()
+    _set(node, "backup_interval", 3600)
+    _set(node, "backup_dir", str(directory))
+    # Another worker already claimed the base name for this second.
+    base = "tau-backup-alice-20251125-000000.tar.gz"
+    (directory / base).write_bytes(b"")
+    scheduler = AutoBackupScheduler(_config(node))
+    target = scheduler.run(now=1764028800.0)
+    assert target is not None
+    assert target.name == "tau-backup-alice-20251125-000000-2.tar.gz"
+    assert (directory / base).read_bytes() == b""
+
+
+def test_scheduler_short_interval_follows_live_setting(tmp_path):
+    node = _init_node(tmp_path, "a", "alice")
+    directory = tmp_path / "backups"
+    _set(node, "backup_interval", 3600)
+    _set(node, "backup_dir", str(directory))
+    scheduler = AutoBackupScheduler(_config(node))
+    assert scheduler.run(now=1764028800.0) is not None
+    # Shortening the live interval takes effect without waiting out the old one.
+    _set(node, "backup_interval", 60)
+    assert scheduler.due(now=1764028800.0 + 59) is False
+    assert scheduler.due(now=1764028800.0 + 60) is True
+    assert scheduler.seconds_until_due(now=1764028800.0 + 30) == 30.0
 
 
 # --- CLI config commands --------------------------------------------------

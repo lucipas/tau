@@ -27,6 +27,7 @@ A manual backup that happens to share the directory is untouched.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import time
 from datetime import datetime, timezone
@@ -59,6 +60,10 @@ AUTO_BACKUP_ENCRYPTED_SUFFIX = ".tau"
 _UNSAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
+def _node_slug(node_name: str) -> str:
+    return _UNSAFE_NAME_RE.sub("-", str(node_name or "")).strip("-") or "node"
+
+
 def auto_backup_filename(
     node_name: str, *, encrypted: bool, now: Optional[float] = None
 ) -> str:
@@ -68,7 +73,7 @@ def auto_backup_filename(
     backup, ``.tau`` for an encrypted one. The timestamp is UTC, so
     names sort in the order the backups were taken.
     """
-    name = _UNSAFE_NAME_RE.sub("-", str(node_name or "")).strip("-") or "node"
+    name = _node_slug(node_name)
     stamp = datetime.fromtimestamp(
         time.time() if now is None else now, tz=timezone.utc
     ).strftime("%Y%m%d-%H%M%S")
@@ -78,37 +83,58 @@ def auto_backup_filename(
     return f"{AUTO_BACKUP_PREFIX}{name}-{stamp}{suffix}"
 
 
-def is_auto_backup_name(name: str) -> bool:
-    """True when *name* is a file this worker created."""
-    return name.startswith(AUTO_BACKUP_PREFIX) and (
-        name.endswith(AUTO_BACKUP_PLAIN_SUFFIX)
-        or name.endswith(AUTO_BACKUP_ENCRYPTED_SUFFIX)
+def _auto_backup_pattern(node_name: str) -> "re.Pattern[str]":
+    """Strict pattern for the automatic backups *node_name* writes.
+
+    Matches only ``tau-backup-<slug>-<YYYYMMDD-HHMMSS>[-N]`` with the
+    plaintext or encrypted suffix, where ``<slug>`` is this node's own
+    sanitized name. A manual backup such as ``tau-backup-notes.tar.gz``
+    or a sibling node's archive does not match.
+    """
+    slug = re.escape(_node_slug(node_name))
+    return re.compile(
+        rf"^{re.escape(AUTO_BACKUP_PREFIX)}{slug}-"
+        r"(?P<stamp>\d{8}-\d{6})(?:-(?P<n>\d+))?"
+        rf"(?:{re.escape(AUTO_BACKUP_PLAIN_SUFFIX)}"
+        rf"|{re.escape(AUTO_BACKUP_ENCRYPTED_SUFFIX)})$"
     )
 
 
-def list_auto_backups(backup_dir_path: Path) -> List[Path]:
-    """Automatic backups in *backup_dir_path*, oldest first.
+def is_auto_backup_name(name: str, node_name: str) -> bool:
+    """True when *name* is an automatic backup written by *node_name*."""
+    return _auto_backup_pattern(node_name).match(name) is not None
 
-    Names sort in the order the backups were taken (the timestamp is
-    part of the name), so no stat call is needed. A missing directory
-    holds no backups, and a directory that cannot be read is treated
-    the same way — the worker backs up rather than failing.
+
+def list_auto_backups(backup_dir_path: Path, node_name: str) -> List[Path]:
+    """Automatic backups of *node_name* in *backup_dir_path*, oldest first.
+
+    Ordered by the timestamp in the name, then the collision counter,
+    so nodes sharing one directory never mix series. A missing
+    directory holds no backups, and a directory that cannot be read is
+    treated the same way — the worker backs up rather than failing.
     """
     try:
         entries = list(Path(backup_dir_path).iterdir())
     except OSError:
         return []
-    backups = [
-        entry
-        for entry in entries
-        if entry.is_file() and is_auto_backup_name(entry.name)
-    ]
-    return sorted(backups, key=lambda entry: entry.name)
+    pattern = _auto_backup_pattern(node_name)
+    matched = []
+    for entry in entries:
+        match = pattern.match(entry.name)
+        if match is None or not entry.is_file():
+            continue
+        matched.append(
+            (match.group("stamp"), int(match.group("n") or 0), entry)
+        )
+    matched.sort(key=lambda item: item[:2])
+    return [entry for _stamp, _n, entry in matched]
 
 
-def newest_auto_backup_mtime(backup_dir_path: Path) -> Optional[float]:
-    """Modification time of the newest automatic backup, or None."""
-    backups = list_auto_backups(backup_dir_path)
+def newest_auto_backup_mtime(
+    backup_dir_path: Path, node_name: str
+) -> Optional[float]:
+    """Modification time of the newest automatic backup of *node_name*."""
+    backups = list_auto_backups(backup_dir_path, node_name)
     if not backups:
         return None
     try:
@@ -117,8 +143,10 @@ def newest_auto_backup_mtime(backup_dir_path: Path) -> Optional[float]:
         return None
 
 
-def prune_auto_backups(backup_dir_path: Path, keep: int) -> List[Path]:
-    """Delete automatic backups past the newest *keep*.
+def prune_auto_backups(
+    backup_dir_path: Path, keep: int, node_name: str
+) -> List[Path]:
+    """Delete this node's automatic backups past the newest *keep*.
 
     ``keep`` of 0 keeps all. Only files this worker created are ever
     deleted; a delete that fails is logged and the rest still prune,
@@ -126,7 +154,7 @@ def prune_auto_backups(backup_dir_path: Path, keep: int) -> List[Path]:
     """
     if keep <= 0:
         return []
-    backups = list_auto_backups(backup_dir_path)
+    backups = list_auto_backups(backup_dir_path, node_name)
     doomed = backups[: max(0, len(backups) - keep)]
     deleted: List[Path] = []
     for entry in doomed:
@@ -151,10 +179,20 @@ class AutoBackupScheduler:
 
     def __init__(self, config: TauConfig) -> None:
         self.config = config
-        # When the next backup may run. None until the first due check,
-        # which seeds it from the newest automatic backup so a restart
-        # respects the schedule instead of backing up immediately.
-        self._next_at: Optional[float] = None
+        # Start of the last backup, or the time the last attempt
+        # finished when it failed. None until the first schedule check,
+        # which seeds it from this node's newest automatic backup so a
+        # restart respects the schedule instead of backing up at once.
+        self._last_at: Optional[float] = None
+        self._schedule_dir: Optional[Path] = None
+
+    def _sync_schedule(self) -> None:
+        """Seed the schedule on first use, and again if the directory moves."""
+        directory = backup_dir(self.config.data_dir)
+        if self._last_at is None or directory != self._schedule_dir:
+            newest = newest_auto_backup_mtime(directory, self.config.name)
+            self._last_at = newest if newest is not None else 0.0
+            self._schedule_dir = directory
 
     def due(self, now: Optional[float] = None) -> bool:
         """True when an automatic backup should run now."""
@@ -162,30 +200,39 @@ class AutoBackupScheduler:
         interval = backup_interval(self.config.data_dir)
         if interval <= 0:
             return False
-        if self._next_at is None:
-            newest = newest_auto_backup_mtime(
-                backup_dir(self.config.data_dir)
-            )
-            self._next_at = (
-                newest + interval if newest is not None else 0.0
-            )
-        return moment >= self._next_at
+        self._sync_schedule()
+        # The live interval is read on every call, so a shortened or
+        # lengthened setting applies at the next check.
+        return moment >= self._last_at + interval
+
+    def seconds_until_due(self, now: Optional[float] = None) -> Optional[float]:
+        """Seconds until the next backup is due, or None when disabled."""
+        moment = time.time() if now is None else now
+        interval = backup_interval(self.config.data_dir)
+        if interval <= 0:
+            return None
+        self._sync_schedule()
+        return max(0.0, self._last_at + interval - moment)
 
     def run(self, now: Optional[float] = None) -> Optional[Path]:
         """Take one automatic backup, or None when disabled.
 
-        The schedule advances even when the backup fails, so a failure
-        retries at the next interval rather than every mail-loop pass.
-        Raises :class:`tau.backup.BackupError` when the backup itself
-        fails; the caller logs it and the node keeps serving.
+        A failed attempt schedules its retry one interval after it
+        finished, so a slow failure cannot leave the retry deadline in
+        the past. Raises :class:`tau.backup.BackupError` when the backup
+        itself fails; the caller logs it and the node keeps serving.
         """
         moment = time.time() if now is None else now
-        interval = backup_interval(self.config.data_dir)
+        if backup_interval(self.config.data_dir) <= 0:
+            return None
+        self._sync_schedule()
         try:
-            return self._take_backup(moment)
-        finally:
-            if interval > 0:
-                self._next_at = moment + interval
+            target = self._take_backup(moment)
+        except BaseException:
+            self._last_at = time.time()
+            raise
+        self._last_at = moment
+        return target
 
     def _take_backup(self, now: float) -> Optional[Path]:
         if backup_interval(self.config.data_dir) <= 0:
@@ -198,42 +245,67 @@ class AutoBackupScheduler:
                 read_passphrase_file(passphrase_path)
             )
         directory.mkdir(parents=True, exist_ok=True)
-        target = self._fresh_target(directory, passphrase is not None, now)
-        target, _manifest = create_backup(
-            self.config, target, live=True, passphrase=passphrase
+        placeholder = self._reserve_target(
+            directory, passphrase is not None, now
         )
+        try:
+            # The placeholder is ours, so force=True only replaces it;
+            # create_backup writes a temp file and renames it into place.
+            target, _manifest = create_backup(
+                self.config,
+                placeholder,
+                force=True,
+                live=True,
+                passphrase=passphrase,
+            )
+        except BaseException:
+            _discard_placeholder(placeholder)
+            raise
         pruned = prune_auto_backups(
-            directory, backup_keep(self.config.data_dir)
+            directory, backup_keep(self.config.data_dir), self.config.name
         )
         if pruned:
             log.info("Pruned %d old automatic backup(s)", len(pruned))
         log.info("Automatic backup written to %s", target)
         return target
 
-    def _fresh_target(
+    def _reserve_target(
         self, directory: Path, encrypted: bool, now: float
     ) -> Path:
-        """A target name that does not already exist in *directory*.
+        """Atomically claim a fresh target name in *directory*.
 
-        Two backups in the same second (a restart racing the schedule,
-        or a manual backup landing on the same name) must not collide:
-        the second takes a ``-2`` suffix, then ``-3``, and so on.
+        The name is created with O_EXCL, so two workers (even in
+        different processes) that pick the same timestamp cannot both
+        claim it: the loser moves on to the next free ``-N`` suffix.
         """
         base = auto_backup_filename(
             self.config.name, encrypted=encrypted, now=now
         )
-        target = directory / base
-        if not target.exists():
-            return target
-        # Split the suffix off the generated name: ".tar.gz" is two
-        # dots, ".tau" is one, so split on the first dot after the
-        # timestamp instead of assuming one suffix shape.
-        stem = base.split(".")[0]
-        suffix = base[len(stem):]
-        for attempt in range(2, 100):
-            candidate = directory / f"{stem}-{attempt}{suffix}"
-            if not candidate.exists():
-                return candidate
+        suffix = (
+            AUTO_BACKUP_ENCRYPTED_SUFFIX
+            if base.endswith(AUTO_BACKUP_ENCRYPTED_SUFFIX)
+            else AUTO_BACKUP_PLAIN_SUFFIX
+        )
+        stem = base[: -len(suffix)]
+        for attempt in range(1, 100):
+            name = base if attempt == 1 else f"{stem}-{attempt}{suffix}"
+            candidate = directory / name
+            try:
+                fd = os.open(
+                    candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+                )
+            except FileExistsError:
+                continue
+            os.close(fd)
+            return candidate
         raise BackupError(
             f"could not find a free automatic backup name in {directory}"
         )
+
+
+def _discard_placeholder(path: Path) -> None:
+    """Remove a reservation left behind by a failed backup."""
+    try:
+        path.unlink()
+    except OSError:
+        pass
