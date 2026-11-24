@@ -1862,6 +1862,41 @@ def test_peers_add_retry_after_failed_save_persists(bridge, node, monkeypatch):
     assert node.registry.saved is True
 
 
+def test_peers_add_keeps_disk_alias_set_by_one_shot_command(tmp_path):
+    # Adding an already-known contact saves the registry: without a
+    # refresh first, an alias (or note) a one-shot `tau peers alias`
+    # command wrote to disk since the node's last refresh would be
+    # silently overwritten with the stale in-memory value.
+    import threading
+    from types import SimpleNamespace
+
+    from tau.peers import PeerRegistry
+
+    path = tmp_path / "peers.json"
+    registry = PeerRegistry(path)
+    registry.upsert(bytes.fromhex(PEER_HASH), b"\x01" * 64, name="alice", now=1000.0)
+    registry.save()
+
+    # A one-shot command edits the file through its own registry.
+    other = PeerRegistry(path)
+    other.set_alias(bytes.fromhex(PEER_HASH), "Al")
+    other.save()
+
+    peer = registry.get(PEER_HASH)
+    assert peer.alias is None  # the running node has not refreshed yet
+    node = SimpleNamespace(
+        registry=registry,
+        resolve_peer=lambda target, *, timeout=10.0: peer,
+        _save_lock=threading.RLock(),
+    )
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    result = bridge.add_peer(PEER_HASH)
+    assert result["known"] is True
+
+    reloaded = PeerRegistry(path)
+    assert reloaded.get(PEER_HASH).alias == "Al"
+
+
 def test_peers_safety_number_shows_without_verifying(tmp_path):
     import RNS
 

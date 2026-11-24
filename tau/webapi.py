@@ -10285,6 +10285,12 @@ class WebBridge:
         # cannot write a stale snapshot over this one.
         lock = getattr(self.node, "_save_lock", None) or nullcontext()
         with lock:
+            # Pick up aliases and notes a one-shot command saved since
+            # the last refresh, so this save does not write back stale
+            # ones — the same reason the verify path refreshes first.
+            # (Without it, adding an already-known contact silently
+            # erased a `tau peers alias`/`note` change made on disk.)
+            self.node.registry.refresh_aliases()
             try:
                 saved = self.node.registry.save()
             except OSError as exc:
