@@ -8,7 +8,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import PeerPanel from "./PeerPanel";
 import { TauContext } from "../chrome/TauContext";
 import { fakeTau as fakeTauChat, makePeer } from "../test-utils";
-import { fakeTau as fakeTauSections, mockFetch } from "../sections/test-utils";
+import { fakeTau as fakeTauSections, fakePeer, mockFetch } from "../sections/test-utils";
 import type { Conversation } from "@/lib/use-tau";
 import type { Group, Peer } from "@/lib/types";
 
@@ -262,5 +262,191 @@ describe("PeerPanel announcements-only", () => {
     expect(screen.getByText("Creator only")).toBeTruthy();
     expect(screen.queryByText("Make announcements-only")).toBeNull();
     expect(screen.queryByText("Open posting to everyone")).toBeNull();
+  });
+});
+
+describe("PeerPanel group members", () => {
+  const SELF = "a".repeat(32);
+  const BOB = "b".repeat(32);
+  const CAROL = "c".repeat(32);
+  const NEW_ID = "d".repeat(32);
+
+  // The fake node's own destination is "a"*32, so the creator's own
+  // row is the "testnode" member.
+  function memberGroup(overrides: Partial<Group> = {}): Conversation {
+    return groupConv({
+      members: [
+        { hash: SELF, name: "testnode" },
+        { hash: BOB, name: "bob" },
+      ],
+      ...overrides,
+    });
+  }
+
+  function renderGroupPanel(
+    conversation: Conversation,
+    peers: Peer[] = [
+      fakePeer({ destination: BOB, name: "bob" }),
+      fakePeer({ destination: CAROL, name: "carol" }),
+    ],
+  ) {
+    return render(
+      <TauContext.Provider value={fakeTauSections({ peers })}>
+        <PeerPanel conversation={conversation} />
+      </TauContext.Provider>,
+    );
+  }
+
+  // mockFetch records method + url only; member changes need the body
+  // asserted too, so this local variant records parsed JSON bodies.
+  function mockFetchBodies(
+    handler: (url: string, method: string, body: unknown) => unknown,
+  ) {
+    const calls: { method: string; url: string; body: unknown }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        const method = init?.method ?? "GET";
+        let body: unknown = null;
+        if (init?.body) {
+          try {
+            body = JSON.parse(String(init.body));
+          } catch {
+            body = null;
+          }
+        }
+        calls.push({ method, url, body });
+        const payload = await handler(url, method, body);
+        return {
+          ok: true,
+          status: 200,
+          text: async () => JSON.stringify(payload ?? {}),
+        } as Response;
+      }),
+    );
+    return { calls };
+  }
+
+  function inviteOnly(url: string) {
+    if (url.includes("/api/groups/invite")) {
+      return { mode: "open", generation: 0, link: null };
+    }
+    return { ok: true };
+  }
+
+  afterEach(() => {
+    // A rotated group id lands in the URL hash; clear it so the next
+    // test starts from the default "#chat" hash.
+    window.location.hash = "";
+  });
+
+  it("offers Remove on other members, none on the creator's own row, and an add picker for known peers", async () => {
+    mockFetchBodies((url) => inviteOnly(url));
+    renderGroupPanel(memberGroup());
+    await waitFor(() => expect(screen.getByText("Members")).toBeTruthy());
+    expect(screen.getByLabelText("Remove bob from group")).toBeTruthy();
+    expect(screen.queryByLabelText("Remove testnode from group")).toBeNull();
+    const select = screen.getByLabelText("Add member") as HTMLSelectElement;
+    expect(Array.from(select.options).map((o) => o.value)).toEqual(["", CAROL]);
+    expect(screen.getByText("Add")).toBeTruthy();
+    expect((screen.getByText("Add") as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("adds the picked peer and follows the rotated group id", async () => {
+    const { calls } = mockFetchBodies((url, method) => {
+      if (url.includes("/api/groups/add-member")) {
+        return {
+          group: { ...memberGroup().group, id: NEW_ID },
+          previous_id: GROUP_ID,
+        };
+      }
+      return inviteOnly(url);
+    });
+    renderGroupPanel(memberGroup());
+    await waitFor(() => expect(screen.getByText("Members")).toBeTruthy());
+    fireEvent.change(screen.getByLabelText("Add member"), {
+      target: { value: CAROL },
+    });
+    fireEvent.click(screen.getByText("Add"));
+    await waitFor(() =>
+      expect(window.location.hash).toBe(`#chat?group=${NEW_ID}`),
+    );
+    expect(
+      calls.some(
+        (c) =>
+          c.method === "POST" &&
+          c.url.includes("/api/groups/add-member") &&
+          JSON.stringify(c.body) ===
+            JSON.stringify({ group: GROUP_ID, members: [CAROL] }),
+      ),
+    ).toBe(true);
+  });
+
+  it("removes a member after a confirm step and follows the rotated group id", async () => {
+    const { calls } = mockFetchBodies((url, method) => {
+      if (url.includes("/api/groups/remove-member")) {
+        return {
+          group: { ...memberGroup().group, id: NEW_ID },
+          previous_id: GROUP_ID,
+        };
+      }
+      return inviteOnly(url);
+    });
+    renderGroupPanel(memberGroup());
+    await waitFor(() => expect(screen.getByText("Members")).toBeTruthy());
+    fireEvent.click(screen.getByLabelText("Remove bob from group"));
+    expect(screen.getByText("Confirm remove?")).toBeTruthy();
+    fireEvent.click(screen.getByText("Confirm remove?"));
+    await waitFor(() =>
+      expect(window.location.hash).toBe(`#chat?group=${NEW_ID}`),
+    );
+    expect(
+      calls.some(
+        (c) =>
+          c.method === "POST" &&
+          c.url.includes("/api/groups/remove-member") &&
+          JSON.stringify(c.body) ===
+            JSON.stringify({ group: GROUP_ID, members: [BOB] }),
+      ),
+    ).toBe(true);
+  });
+
+  it("shows no add or remove controls for a group this node did not create", async () => {
+    mockFetchBodies((url) => inviteOnly(url));
+    renderGroupPanel(memberGroup({ created_by_me: false }));
+    await waitFor(() => expect(screen.getByText("Members")).toBeTruthy());
+    expect(screen.queryByLabelText("Add member")).toBeNull();
+    expect(screen.queryByLabelText("Remove bob from group")).toBeNull();
+    expect(screen.getByText("bob")).toBeTruthy();
+  });
+
+  it("says so when every known peer is already a member", async () => {
+    mockFetchBodies((url) => inviteOnly(url));
+    renderGroupPanel(memberGroup(), [
+      fakePeer({ destination: BOB, name: "bob" }),
+    ]);
+    await waitFor(() => expect(screen.getByText("Members")).toBeTruthy());
+    expect(screen.queryByLabelText("Add member")).toBeNull();
+    expect(
+      screen.getByText("Every known peer is already a member."),
+    ).toBeTruthy();
+  });
+
+  it("shows an API error and keeps the roster for a retry", async () => {
+    mockFetchBodies((url, method) => {
+      if (url.includes("/api/groups/remove-member")) {
+        throw new Error("bob is not a member of 'crew'");
+      }
+      return inviteOnly(url);
+    });
+    renderGroupPanel(memberGroup());
+    await waitFor(() => expect(screen.getByText("Members")).toBeTruthy());
+    fireEvent.click(screen.getByLabelText("Remove bob from group"));
+    fireEvent.click(screen.getByText("Confirm remove?"));
+    await waitFor(() =>
+      expect(screen.getByText("bob is not a member of 'crew'")).toBeTruthy(),
+    );
+    expect(window.location.hash).toBe("");
+    expect(screen.getByText("bob")).toBeTruthy();
   });
 });

@@ -4,15 +4,19 @@
 // shown first; verification happens only after a separate "Numbers match"
 // confirm — never automatically), block/unblock, forget, alias, note,
 // archive, mute, pin, disappearing default, mark unread/read.
-// Group: members, topic, mute, mark unread/read, leave.
+// Group: members, topic, mute, mark unread/read, leave. The creator also
+// manages the roster here (add/remove members); a roster change rotates
+// the group to a successor id, so the panel follows the new id.
 
 "use client";
 
 import { useEffect, useState } from "react";
 import {
+  addGroupMembers,
   getGroupInviteStatus,
   leaveGroup,
   mintGroupInvite,
+  removeGroupMembers,
   revokeGroupInvites,
   setDisappearingDefault,
   setGroupAnnouncements,
@@ -24,6 +28,7 @@ import { usePeerActions, type Conversation } from "@/lib/use-tau";
 import type { Peer } from "@/lib/types";
 import Avatar from "../chrome/Avatar";
 import { useTauContext } from "../chrome/TauContext";
+import { useHash } from "../chrome/useHash";
 
 const DISAPPEARING_CHOICES: { label: string; seconds: number | null }[] = [
   { label: "Off", seconds: null },
@@ -87,11 +92,27 @@ export default function PeerPanel({ conversation }: { conversation: Conversation
   const [inviteBusy, setInviteBusy] = useState(false);
   const [confirmRevoke, setConfirmRevoke] = useState(false);
   const [copied, setCopied] = useState(false);
+  // Roster management (creator only): the peer picked to add, and the
+  // member awaiting a remove confirm.
+  const [addPeer, setAddPeer] = useState("");
+  const [confirmRemove, setConfirmRemove] = useState<string | null>(null);
+  const { section, navigate } = useHash();
 
   const peer: Peer | undefined = conversation?.peer;
   const isGroup = conversation?.kind === "group";
   const groupId = isGroup ? conversation.key : null;
   const groupCreatedByMe = Boolean(isGroup && conversation.group?.created_by_me);
+  // The creator's own row carries no Remove button: the backend refuses
+  // removing the creator, so it is hidden rather than left to fail.
+  const ownHash = (tau.node?.destination ?? "").toLowerCase();
+  // Known peers who are not already members, by name, for the add
+  // picker. Member hashes and peer destinations are lowercase hex.
+  const memberHashes = new Set(
+    (conversation?.group?.members ?? []).map((m) => m.hash.toLowerCase()),
+  );
+  const addCandidates = tau.peers
+    .filter((p) => !memberHashes.has(p.destination.toLowerCase()))
+    .sort((a, b) => (a.name || a.destination).localeCompare(b.name || b.destination));
 
   useEffect(() => {
     setAlias(peer?.alias ?? "");
@@ -103,6 +124,14 @@ export default function PeerPanel({ conversation }: { conversation: Conversation
     setConfirmForget(false);
     setConfirmLeave(false);
   }, [peer?.destination, peer?.alias, peer?.note, peer?.verified]);
+
+  // A roster change rotates the group to a successor id: the add picker
+  // and any pending remove confirm belong to the old id, so clear them
+  // when the open group changes.
+  useEffect(() => {
+    setAddPeer("");
+    setConfirmRemove(null);
+  }, [groupId]);
 
   // The invite link is creator-managed: only fetch it for groups this
   // node created, and refresh it after every mint/revoke.
@@ -138,6 +167,31 @@ export default function PeerPanel({ conversation }: { conversation: Conversation
     try {
       await fn();
       await tau.refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  // Add or remove members of a group this node created. Like `run`, but
+  // the result matters: a roster change rotates the group to a successor
+  // id, so after the refresh the open thread follows the new id (in the
+  // section the panel is showing — chat on desktop, people on mobile).
+  async function changeMembers(adding: boolean, members: string[]) {
+    if (!groupId) return;
+    setBusy(adding ? "add-member" : "remove-member");
+    setError(null);
+    try {
+      const result = adding
+        ? await addGroupMembers(groupId, members)
+        : await removeGroupMembers(groupId, members);
+      setConfirmRemove(null);
+      setAddPeer("");
+      await tau.refresh();
+      if (result.group.id !== groupId) {
+        navigate(section, { group: result.group.id });
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -287,9 +341,62 @@ export default function PeerPanel({ conversation }: { conversation: Conversation
                 <Avatar name={m.name} seed={m.hash} size="sm" />
                 <span className="truncate text-zinc-200">{m.name}</span>
                 <span className="ml-auto text-xs text-zinc-500">{truncatedHash(m.hash)}</span>
+                {groupCreatedByMe && m.hash.toLowerCase() !== ownHash &&
+                  (confirmRemove === m.hash ? (
+                    <button
+                      type="button"
+                      disabled={busy === "remove-member"}
+                      onClick={() => void changeMembers(false, [m.hash])}
+                      className="shrink-0 rounded-full border border-red-800 px-2 py-0.5 text-xs font-semibold text-red-300 hover:bg-red-950 disabled:opacity-40"
+                    >
+                      Confirm remove?
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      disabled={busy !== null}
+                      onClick={() => setConfirmRemove(m.hash)}
+                      aria-label={`Remove ${m.name} from group`}
+                      className="shrink-0 rounded-full border border-zinc-700 px-2 py-0.5 text-xs font-semibold text-zinc-200 hover:bg-zinc-800 disabled:opacity-40"
+                    >
+                      Remove
+                    </button>
+                  ))}
               </li>
             ))}
           </ul>
+          {groupCreatedByMe && (
+            <div className="mt-3 flex flex-col gap-2">
+              <label className="text-xs font-semibold text-zinc-400" htmlFor="add-group-member">
+                Add member
+              </label>
+              {addCandidates.length === 0 ? (
+                <p className="text-xs text-zinc-500">Every known peer is already a member.</p>
+              ) : (
+                <div className="flex gap-2">
+                  <select
+                    id="add-group-member"
+                    value={addPeer}
+                    onChange={(e) => setAddPeer(e.target.value)}
+                    className="min-w-0 flex-1 rounded-lg border border-zinc-700 bg-zinc-900 px-2 py-1.5 text-sm text-zinc-100"
+                  >
+                    <option value="">Choose a peer…</option>
+                    {addCandidates.map((p) => (
+                      <option key={p.destination} value={p.destination}>
+                        {p.name || p.destination.slice(0, 8)}
+                      </option>
+                    ))}
+                  </select>
+                  <ActionButton
+                    disabled={!addPeer || busy === "add-member"}
+                    onClick={() => void changeMembers(true, [addPeer])}
+                  >
+                    Add
+                  </ActionButton>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       )}
       {isGroup && conversation.group?.created_by_me && (
