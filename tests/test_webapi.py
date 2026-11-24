@@ -5509,6 +5509,61 @@ def test_verify_latest_auto_backup_ignores_unregistered_archive(tmp_path):
     assert result["backup"] == target.name
 
 
+def test_verify_latest_auto_backup_ignores_missing_passphrase_file_for_plaintext(
+    tmp_path,
+):
+    # A passphrase file configured after the plaintext backup was taken —
+    # and since deleted — must not fail verification of a valid archive.
+    bridge, data_dir, target = _start_auto_backup_bridge(tmp_path)
+    try:
+        set_node_setting(
+            data_dir, "backup_passphrase_file", str(tmp_path / "gone.txt")
+        )
+        result = bridge.verify_latest_auto_backup()
+    finally:
+        bridge.stop()
+    assert result["backup"] == target.name
+    assert result["encrypted"] is False
+    assert result["valid"] is True
+
+
+def test_verify_latest_auto_backup_retries_after_prune(tmp_path, monkeypatch):
+    # The scheduled worker prunes the selected archive between selection
+    # and open (retention 1): verification retries against the current
+    # newest instead of reporting a missing file.
+    import tau.webapi as webapi
+
+    bridge, data_dir, first = _start_auto_backup_bridge(tmp_path)
+    set_node_setting(data_dir, "backup_keep", 1)
+    scheduler = AutoBackupScheduler(TauConfig.resolve(data_dir=data_dir))
+    real_verify = webapi.verify_backup
+    calls: list = []
+    created: list = []
+
+    def _pruning_verify(source, *, passphrase=None):
+        calls.append(Path(source).name)
+        if len(calls) == 1:
+            # Scheduled run creates a newer archive and, with retention 1,
+            # prunes the archive verification just selected.
+            second = scheduler.run(now=1764028800.0 + 7200)
+            assert second is not None and second != first
+            created.append(second)
+        return real_verify(Path(source), passphrase=passphrase)
+
+    try:
+        monkeypatch.setattr(webapi, "verify_backup", _pruning_verify)
+        result = bridge.verify_latest_auto_backup()
+    finally:
+        bridge.stop()
+    assert not first.exists()
+    assert len(created) == 1 and created[0] is not None
+    second = created[0]
+    assert second != first
+    assert result["backup"] == second.name
+    assert result["valid"] is True
+    assert calls == [first.name, second.name]
+
+
 def test_verify_latest_auto_backup_rejects_corrupt_archive(tmp_path):
     bridge, _data_dir, target = _start_auto_backup_bridge(tmp_path)
     try:
