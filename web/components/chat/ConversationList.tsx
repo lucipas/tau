@@ -165,7 +165,7 @@ export default function ConversationList({
             <span aria-hidden="true">{showIgnored ? "▾" : "▸"}</span>
           </button>
           {showIgnored && (
-            <ul>
+            <ul className="max-h-64 overflow-y-auto">
               {ignoredGroups.map((group) => (
                 <li key={`ignored:${group.id}`}>
                   <div className="flex w-full items-center gap-3 px-3 py-2 text-left text-sm text-zinc-400">
