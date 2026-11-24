@@ -1,4 +1,4 @@
-"""Tests for linked-device pairing (slices 1–2 of #469, #713/#736)."""
+"""Tests for linked-device pairing (slices 1–3 of #469, #713/#736/#745)."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import io
 import json
 import os
 import stat
+import time
 from pathlib import Path
 
 import pytest
@@ -455,6 +456,83 @@ def test_registry_prunes_expired_offers(tmp_path):
     assert registry.issued_offers(now=2000.0) == []
 
 
+def test_registry_revoke_offer_removes_live_offer(tmp_path):
+    # #745: a revoked offer is gone from the list and stays gone
+    # after a reload; the other outstanding offer is untouched.
+    # Real wall-clock times: record_issued prunes against the real
+    # clock, so fake-epoch offers would be pruned on the next write.
+    now = time.time()
+    registry = DeviceRegistry(tmp_path / "devices.json")
+    registry.record_issued("a" * 32, now, now + 3600.0)
+    registry.record_issued("b" * 32, now, now + 3600.0)
+    revoked = registry.revoke_offer("a" * 8, now=now + 60.0)
+    assert revoked["token"] == "a" * 32
+    assert [offer["token"] for offer in registry.issued_offers(now=now + 60.0)] == [
+        "b" * 32
+    ]
+    reloaded = DeviceRegistry(tmp_path / "devices.json")
+    assert [offer["token"] for offer in reloaded.issued_offers(now=now + 60.0)] == [
+        "b" * 32
+    ]
+
+
+def test_registry_revoke_offer_accepts_full_token(tmp_path):
+    now = time.time()
+    registry = DeviceRegistry(tmp_path / "devices.json")
+    registry.record_issued("a" * 32, now, now + 3600.0)
+    assert registry.revoke_offer("a" * 32, now=now + 60.0)["token"] == "a" * 32
+    assert registry.issued_offers(now=now + 60.0) == []
+
+
+def test_registry_revoke_offer_unknown_token(tmp_path):
+    now = time.time()
+    registry = DeviceRegistry(tmp_path / "devices.json")
+    registry.record_issued("a" * 32, now, now + 3600.0)
+    with pytest.raises(DevicesError, match="no outstanding pairing offer"):
+        registry.revoke_offer("c" * 32, now=now + 60.0)
+    # The failed revoke changed nothing.
+    assert len(registry.issued_offers(now=now + 60.0)) == 1
+
+
+def test_registry_revoke_offer_ambiguous_prefix(tmp_path):
+    now = time.time()
+    registry = DeviceRegistry(tmp_path / "devices.json")
+    registry.record_issued("ab" + "0" * 30, now, now + 3600.0)
+    registry.record_issued("ab" + "1" * 30, now, now + 3600.0)
+    with pytest.raises(DevicesError, match="2 pairing offers match prefix"):
+        registry.revoke_offer("ab", now=now + 60.0)
+    assert len(registry.issued_offers(now=now + 60.0)) == 2
+
+
+def test_registry_revoke_offer_names_expired_offer(tmp_path):
+    now = time.time()
+    registry = DeviceRegistry(tmp_path / "devices.json")
+    registry.record_issued("a" * 32, now - 3600.0, now - 60.0)
+    with pytest.raises(DevicesError, match="already expired"):
+        registry.revoke_offer("a" * 8, now=now)
+
+
+def test_registry_revoke_offer_names_redeemed_token(tmp_path):
+    registry = DeviceRegistry(tmp_path / "devices.json")
+    registry.record_redeemed("a" * 32, "b" * 32, 4600.0, now=1200.0)
+    with pytest.raises(DevicesError, match="already redeemed"):
+        registry.revoke_offer("a" * 8, now=1300.0)
+
+
+def test_registry_revoke_offer_prunes_expired_offers(tmp_path):
+    # The revoke transaction applies the same housekeeping as
+    # record_issued: an expired offer goes with the revoked one.
+    # The expired offer is recorded after the live one, so the
+    # record call itself does not prune it first.
+    now = time.time()
+    registry = DeviceRegistry(tmp_path / "devices.json")
+    registry.record_issued("b" * 32, now, now + 3600.0)
+    registry.record_issued("a" * 32, now - 3600.0, now - 60.0)
+    registry.revoke_offer("b" * 32, now=now + 60.0)
+    reloaded = DeviceRegistry(tmp_path / "devices.json")
+    assert reloaded.issued_offers(now=now + 60.0) == []
+
+
 def test_registry_corrupt_file_fails_closed(tmp_path):
     path = tmp_path / "devices.json"
     path.write_text("{not json", encoding="utf-8")
@@ -486,6 +564,10 @@ def test_parser_devices_subcommands():
 
     listing = parser.parse_args(["devices", "list"])
     assert listing.func is cli.cmd_devices_list
+
+    revoke = parser.parse_args(["devices", "revoke", "abcdef12"])
+    assert revoke.func is cli.cmd_devices_revoke
+    assert revoke.token == "abcdef12"
 
     bare = parser.parse_args(["devices"])
     assert bare.func is cli.cmd_devices_list
@@ -564,6 +646,75 @@ def test_devices_pair_redeem_round_trip(tmp_path, capsys):
     assert "pairing offers issued: 1" in capsys.readouterr().out
     assert cli.main(["devices", "list", "--data-dir", str(node_b)]) == 0
     assert f"paired from: {destination_a}" in capsys.readouterr().out
+
+
+def test_devices_revoke_cancels_offer(tmp_path, capsys):
+    # #745: a minted offer can be cancelled by its 8-character
+    # prefix; afterwards `devices list` shows none, and revoking
+    # the same prefix again fails because nothing is outstanding.
+    node_a = _init_node(tmp_path, "a", "alice")
+    capsys.readouterr()
+    bundle_path = tmp_path / "pairing.json"
+    assert (
+        cli.main(
+            [
+                "devices",
+                "pair",
+                "--to",
+                str(bundle_path),
+                "--data-dir",
+                str(node_a),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    token = json.loads(capsys.readouterr().out)["token"]
+    assert cli.main(["devices", "list", "--data-dir", str(node_a)]) == 0
+    assert "pairing offers issued: 1" in capsys.readouterr().out
+
+    assert (
+        cli.main(
+            ["devices", "revoke", token[:8], "--data-dir", str(node_a), "--json"]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["revoked"]["token"] == token
+    assert cli.main(["devices", "list", "--data-dir", str(node_a)]) == 0
+    assert "no pairing offers issued" in capsys.readouterr().out
+
+    code = cli.main(["devices", "revoke", token[:8], "--data-dir", str(node_a)])
+    assert code == 1
+    assert "no outstanding pairing offer" in capsys.readouterr().err
+
+
+def test_devices_revoke_says_the_bundle_still_redeems(tmp_path, capsys):
+    # #745: the human output must not oversell the revoke — a bundle
+    # file already copied still redeems until it expires, so the
+    # command tells the owner to delete the file too.
+    node_a = _init_node(tmp_path, "a", "alice")
+    capsys.readouterr()
+    bundle_path = tmp_path / "pairing.json"
+    assert (
+        cli.main(
+            [
+                "devices",
+                "pair",
+                "--to",
+                str(bundle_path),
+                "--data-dir",
+                str(node_a),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    token = json.loads(capsys.readouterr().out)["token"]
+    assert cli.main(["devices", "revoke", token, "--data-dir", str(node_a)]) == 0
+    out = capsys.readouterr().out
+    assert f"revoked pairing offer {token[:8]}" in out
+    assert "delete the bundle file too" in out
 
 
 def _seed_history(node):
