@@ -5556,6 +5556,9 @@ def test_verify_latest_auto_backup_retries_after_prune(tmp_path, monkeypatch):
     finally:
         bridge.stop()
     assert not first.exists()
+    assert len(created) == 1 and created[0] is not None
+    second = created[0]
+    assert second != first
     assert result["backup"] == second.name
     assert result["valid"] is True
     assert calls == [first.name, second.name]
