@@ -18,6 +18,7 @@ import type {
   AllowList,
   ApiErrorBody,
   AwayMessageSettings,
+  BackupVerifyResult,
   Beacon,
   BlockResult,
   BroadcastList,
@@ -280,6 +281,11 @@ export async function getDoctor(): Promise<DoctorReport> {
 /** Download URL for a full backup archive of the data directory (loopback only). */
 export function backupUrl(): string {
   return `${API_BASE}/api/backup`;
+}
+
+/** Verify the newest automatic backup would restore, without restoring it (loopback only). */
+export async function verifyLatestAutoBackup(): Promise<BackupVerifyResult> {
+  return post("/api/backup/verify", {});
 }
 
 /** Linked devices: this device and the pairing offers it issued (loopback only). */

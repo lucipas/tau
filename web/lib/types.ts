@@ -604,6 +604,16 @@ export interface DoctorReport {
   checks: DoctorCheck[];
 }
 
+/** Result of verifying the newest automatic backup (`POST /api/backup/verify`). */
+export interface BackupVerifyResult {
+  backup: string;
+  node: string | null;
+  destination: string;
+  files: string[];
+  encrypted: boolean;
+  valid: boolean;
+}
+
 /** One outstanding pairing offer this node issued (`tau devices list`). */
 export interface DeviceOffer {
   token: string;

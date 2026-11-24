@@ -1368,12 +1368,12 @@ def verify_backup(
                 raise BackupError(f"not a valid tau backup: {exc}") from exc
             try:
                 archive = tarfile.open(plain_path, mode="r:gz")
-            except (tarfile.TarError, OSError) as exc:
+            except _READ_ERRORS as exc:
                 raise BackupError(f"not a valid tau backup: {exc}") from exc
         else:
             try:
                 archive = tarfile.open(source, mode="r:gz")
-            except (tarfile.TarError, OSError) as exc:
+            except _READ_ERRORS as exc:
                 raise BackupError(f"not a valid tau backup: {exc}") from exc
         with archive:
             try:
@@ -1466,12 +1466,12 @@ def restore_backup(
                 raise BackupError(f"not a valid tau backup: {exc}") from exc
             try:
                 archive = tarfile.open(plain_path, mode="r:gz")
-            except (tarfile.TarError, OSError) as exc:
+            except _READ_ERRORS as exc:
                 raise BackupError(f"not a valid tau backup: {exc}") from exc
         else:
             try:
                 archive = tarfile.open(source, mode="r:gz")
-            except (tarfile.TarError, OSError) as exc:
+            except _READ_ERRORS as exc:
                 raise BackupError(f"not a valid tau backup: {exc}") from exc
         with archive:
             try:

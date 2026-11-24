@@ -1719,6 +1719,38 @@ def test_backup_verify_rejects_truncated_archive(tmp_path, capsys):
         verify_backup(truncated)
 
 
+def test_backup_verify_rejects_archive_cut_to_the_header(tmp_path, capsys):
+    # A cut inside the first gzip member used to escape verify as a raw
+    # EOFError from tarfile.open — the open only caught TarError/OSError.
+    node_a = _init_node(tmp_path, "a", "alice")
+    capsys.readouterr()
+    archive = tmp_path / "alice.tar.gz"
+    assert cli.main(["backup", str(archive), "--data-dir", str(node_a)]) == 0
+    capsys.readouterr()
+    raw = archive.read_bytes()
+    truncated = tmp_path / "cut.tar.gz"
+    truncated.write_bytes(raw[:100])
+    with pytest.raises(BackupError, match="not a valid tau backup"):
+        verify_backup(truncated)
+
+
+def test_restore_rejects_archive_cut_to_the_header(tmp_path, capsys):
+    # Same cut, same hole in restore: the open must raise BackupError,
+    # not a raw EOFError, and must install nothing.
+    node_a = _init_node(tmp_path, "a", "alice")
+    capsys.readouterr()
+    archive = tmp_path / "alice.tar.gz"
+    assert cli.main(["backup", str(archive), "--data-dir", str(node_a)]) == 0
+    capsys.readouterr()
+    raw = archive.read_bytes()
+    truncated = tmp_path / "cut.tar.gz"
+    truncated.write_bytes(raw[:100])
+    node_b = tmp_path / "b"
+    with pytest.raises(BackupError, match="not a valid tau backup"):
+        restore_backup(TauConfig.resolve(data_dir=node_b), truncated)
+    assert not (node_b / "identity").exists()
+
+
 def test_backup_verify_rejects_corrupt_identity(tmp_path, capsys):
     node_a = _init_node(tmp_path, "a", "alice")
     capsys.readouterr()
