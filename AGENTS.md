@@ -44,3 +44,35 @@ When assigned a task or processing a queue item, the agent must follow this stri
 - **Novel Branches:** If you plan to edit **ANY** file, make a new branch before you do. At the end of the work, commit your changes and do a pr to the main branch.
 
 ## 6. Design Rules
+
+These are expectations the review history proved, not style preferences. Each rule names where it applies and why it exists. A PR that breaks one should carry a test or a reason.
+
+### 6.1 Race the sweep under the lock
+
+- **Where:** any background sweep that touches state a foreground operation also touches — outbox/relay sweeps, scheduled-post publish passes, backup pruning, pairing-history snapshots.
+- **Rule:** the sweep runs under the same lock as the operation it races, or it re-checks its decision after acquiring the lock. Never let a sweep act on state it read before the lock.
+- **Why:** the group-retract sweep and a retract marker could race — a leg read before the marker landed would be sent after the retract (#706); the history-retry gate reads its markers under one bounded mailbox transaction for the same reason (#743).
+
+### 6.2 Re-read across processes, never trust a cached copy
+
+- **Where:** anything shared between runs, processes, or machines — the on-disk data dir, the PR head on GitHub, a review comment's footer.
+- **Rule:** re-read the live state immediately before acting on it. A check made before the last push, the last run, or the last process restart is stale.
+- **Why:** GitHub's PR-head reads lagged pushes for minutes, so merges landed on pre-fix heads repeatedly (#661, #729, #739, #764, #768); timed-out runs left staged reverts of real fixes in the shared clone; Qodo reviews update in place, so only the footer commit plus `updated_at` say which head was reviewed.
+
+### 6.3 Normalize case and ids at the boundary
+
+- **Where:** every place an identifier or name crosses into the system — peer hashes, group names, invite tokens, reaction targets.
+- **Rule:** canonicalize at ingestion (one case, one id form) and compare only canonical forms. Never compare raw user input against a stored id, and never use a display name where an id is required.
+- **Why:** an invite check compared a token's mint-time name against the live group name exactly and rejected legitimate joins after a rename (#702); a contact card rendered through `display_name` leaked a local alias to another peer (#762).
+
+### 6.4 Quality gate — what "done" means
+
+A task is not done until all of these hold. This is the merge loop's critical-error gate, written down so the ticket loop, the merge loop, and Qodo all enforce the same bar.
+
+- **Qodo findings:** every valid Critical or Major is fixed on the branch; every valid Warning is fixed too (Warnings here are Medium-severity in practice). A Warning that can't be fixed in scope becomes a follow-up issue the same day, never a silent pass. Informational findings are flagged for the human, not silently dropped.
+- **CI:** all checks green on the PR's current head — not an older head, not a re-run of a stale commit.
+- **Local validation:** `make lint` and `make test` pass on the tree merged with current main; the integration and web suites pass when the change touches them.
+- **Review freshness:** the latest completed Qodo review covers the current head — check the review comment's footer commit and its `updated_at`, not just that a review exists. Never merge an unreviewed PR.
+- **Disputes need evidence:** a finding left unchanged carries a reason grounded in the code (a test, a quoted invariant, a linked prior decision). "Qodo is wrong" without evidence is not a reason.
+- **A stalled loop stops:** if a fix-and-review cycle stops making progress, the task is reported as not done with the blocker named — it is never waved through.
+
