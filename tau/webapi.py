@@ -4064,13 +4064,10 @@ class WebBridge:
                 "field 'location' must be an object with latitude "
                 "-90..90 and longitude -180..180"
             )
-        image_attachment: Optional[Dict[str, Any]] = None
-        if image is not None:
-            from .tangents.tan import image_attachment_from_data_url
-
-            image_attachment = image_attachment_from_data_url(
-                image, Path(self._tan_db_path()).parent
-            )
+        # Resolve the reply and quote targets before decoding or
+        # pinning the image: a refused schedule must not leave
+        # unreferenced bytes in the pinned media store, which is
+        # never pruned.  The pin itself was already validated above.
         if reply_to is not None:
             conn = self._tan_conn()
             try:
@@ -4083,6 +4080,13 @@ class WebBridge:
                 target_post = resolve_post(conn, target_post)["hash"]
             finally:
                 conn.close()
+        image_attachment: Optional[Dict[str, Any]] = None
+        if image is not None:
+            from .tangents.tan import image_attachment_from_data_url
+
+            image_attachment = image_attachment_from_data_url(
+                image, Path(self._tan_db_path()).parent
+            )
         config = self.node.config
         if kind == "repost":
             post = schedule_repost(
@@ -4343,6 +4347,25 @@ class WebBridge:
         app = self._tan_app()
         if app is None:
             raise WebBridgeError("the Tan social feed is not enabled; run serve --social")
+        # Resolve the target — and check it can be quoted — before
+        # decoding or pinning the image: a refused quote must not
+        # leave unreferenced bytes in the pinned media store, which
+        # is never pruned.  resolve_post already refuses unknown,
+        # deleted and expired targets.
+        conn = self._tan_conn()
+        try:
+            from .tangents.tan import QUOTABLE_KINDS, resolve_post
+
+            target_post = resolve_post(conn, target)
+            if target_post.get("kind", "post") not in QUOTABLE_KINDS:
+                raise ValueError("only posts and replies can be quoted")
+            if not target_post.get("linked"):
+                raise ValueError(
+                    "post has not linked yet; sync its chain before quoting"
+                )
+            post_hash = target_post["hash"]
+        finally:
+            conn.close()
         image_attachment: Optional[Dict[str, Any]] = None
         if image is not None:
             from .tangents.tan import image_attachment_from_data_url
@@ -4350,13 +4373,6 @@ class WebBridge:
             image_attachment = image_attachment_from_data_url(
                 image, Path(self._tan_db_path()).parent
             )
-        conn = self._tan_conn()
-        try:
-            from .tangents.tan import resolve_post
-
-            post_hash = resolve_post(conn, target)["hash"]
-        finally:
-            conn.close()
         return app.quote(post_hash, text, publish=True, image=image_attachment)
 
     def tan_share(
@@ -14842,8 +14858,10 @@ class _WebHandler(BaseHTTPRequestHandler):
             # A file send carries base64 bytes, a Tan post may carry a
             # base64 image, and an import carries a whole message history
             # or a whole signed chain, so each gets a larger body cap than
-            # a chat message or a single action.
-            if path in ("/api/send-file", "/api/groups/send-file", "/api/broadcasts/send-file", "/api/tan/posts"):
+            # a chat message or a single action.  A quote may carry an
+            # image too, immediate or scheduled, so both quote routes
+            # get the file cap as well.
+            if path in ("/api/send-file", "/api/groups/send-file", "/api/broadcasts/send-file", "/api/tan/posts", "/api/tan/quote", "/api/tan/schedule"):
                 limit = MAX_FILE_BODY_BYTES
             elif path in ("/api/messages/import", "/api/tan/import"):
                 limit = MAX_IMPORT_BYTES

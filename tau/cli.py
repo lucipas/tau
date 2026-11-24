@@ -7670,11 +7670,11 @@ def cmd_tan_quote(args: argparse.Namespace) -> int:
     finally:
         conn.close()
 
-    image = None
-    if getattr(args, "image", None) is not None:
-        image = _read_image(args.image, config.data_dir)
-
+    # Validate the delay before reading the image: a rejected
+    # --delay must not leave unreferenced bytes pinned in the media
+    # store, which is never pruned.
     delay_text = getattr(args, "delay", None)
+    delay = None
     if delay_text is not None:
         if getattr(args, "no_publish", False):
             print(
@@ -7692,6 +7692,12 @@ def cmd_tan_quote(args: argparse.Namespace) -> int:
         except ValueError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
+
+    image = None
+    if getattr(args, "image", None) is not None:
+        image = _read_image(args.image, config.data_dir)
+
+    if delay_text is not None:
         try:
             scheduled = schedule_quote(
                 config.scheduled_posts_path,
