@@ -9,8 +9,10 @@ import { mockFetch } from "./test-utils";
 let calls: string[] = [];
 let allowlistEntries: { destination: string; name: string }[] = [];
 let deviceOffers: { token: string; created_at: number; expires_at: number; owner: string | null }[] = [];
+let verifyShouldFail = false;
 
 beforeEach(() => {
+  verifyShouldFail = false;
   allowlistEntries = [{ destination: "c".repeat(32), name: "carol" }];
   deviceOffers = [
     { token: "ab".repeat(16), created_at: 1700000000, expires_at: 1794000000, owner: null },
@@ -38,6 +40,7 @@ beforeEach(() => {
     }
     if (url.includes("/api/bundle/export")) return { bundle: true };
     if (url.includes("/api/backup/verify")) {
+      if (verifyShouldFail) throw new Error("no automatic backup yet");
       return {
         backup: "tau-backup-alice-20251125-000000.tar.gz",
         node: "alice",
@@ -137,6 +140,26 @@ describe("ToolsSection", () => {
     expect(screen.getByText("2 files · not encrypted")).toBeTruthy();
     expect(
       screen.getByText("Latest automatic backup verified — it would restore."),
+    ).toBeTruthy();
+  });
+
+  it("keeps a failed verification visible when the doctor refresh lands", async () => {
+    verifyShouldFail = true;
+    render(<ToolsSection />);
+    // Click while the mount refresh is still in flight: verification
+    // fails first, the refresh then succeeds and clears the shared
+    // error — the verification error must survive in its own state.
+    fireEvent.click(
+      screen.getByRole("button", { name: "Verify latest auto-backup" }),
+    );
+    expect(
+      await screen.findByText(
+        "no automatic backup yet",
+      ),
+    ).toBeTruthy();
+    await screen.findByText("carol");
+    expect(
+      screen.getByText("no automatic backup yet"),
     ).toBeTruthy();
   });
 
