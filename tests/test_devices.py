@@ -1162,6 +1162,86 @@ def test_devices_redeem_retry_gate_falls_back_when_mailbox_lock_held(
         handle.close()
 
 
+def test_devices_redeem_retry_gate_skips_eager_mailbox_load(
+    tmp_path, capsys, monkeypatch
+):
+    # Qodo Warning on #743: constructing a Mailbox eagerly loads it,
+    # and loading deduplicates persisted entries under an unbounded
+    # transaction — so with duplicates on disk and the lock held, the
+    # gate could hang before its bounded transaction even began. The
+    # gate constructs the mailbox without the eager load; its bounded
+    # transaction reloads the markers instead.
+    fcntl = pytest.importorskip("fcntl")
+    node_a = _init_node(tmp_path, "a", "alice")
+    _seed_history(node_a)
+    capsys.readouterr()
+
+    bundle_path = tmp_path / "pairing.json"
+    assert (
+        cli.main(
+            [
+                "devices",
+                "pair",
+                "--to",
+                str(bundle_path),
+                "--data-dir",
+                str(node_a),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    node_b = tmp_path / "b"
+    assert (
+        cli.main(
+            [
+                "devices",
+                "redeem",
+                "--from",
+                str(bundle_path),
+                "--data-dir",
+                str(node_b),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["history"]["imported"] == 3
+
+    # One snapshot record is missing, so the gate needs the markers —
+    # and the mailbox holds a duplicated outbox entry, so an eager
+    # load would try to rewrite it under an unbounded transaction.
+    inbox_b = Inbox(node_b / "inbox.json")
+    inbox_b.delete("msg-1")
+    box = Mailbox(node_b / "mailbox.json")
+    box.enqueue(to=b"\xbb" * 16, text="queued", now=1000.0)
+    mailbox_path = node_b / "mailbox.json"
+    raw = json.loads(mailbox_path.read_text(encoding="utf-8"))
+    assert len(raw["outbox"]) == 1
+    raw["outbox"].append(dict(raw["outbox"][0]))
+    mailbox_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    lock_path = node_b / "mailbox.json.lock"
+    handle = open(lock_path, "a")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        monkeypatch.setattr(cli, "_HISTORY_RETRY_LOCK_TIMEOUT", 0.0)
+        config = TauConfig.resolve(data_dir=node_b)
+        registry = DeviceRegistry(config.devices_path)
+        identity = load_identity(config.identity_path)
+        bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+        assert (
+            cli._history_retry_allowed(config, registry, identity, bundle)
+            is True
+        )
+    finally:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
 def test_devices_pair_redeem_skips_retracted_history(tmp_path, capsys):
     # A message the sender retracted after the bundle was minted must
     # not be resurrected by the stale snapshot: the redeem passes this

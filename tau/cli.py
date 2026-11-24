@@ -14333,11 +14333,13 @@ def _history_retry_allowed(
     # frees up later.  The same holds for a record its sender
     # retracted: the import skips it, so a missing-but-retracted
     # record would keep the bundle retryable forever too (the
-    # retraction variant of the capacity gap, see #742).  The mailbox
-    # loads its markers lazily, so read them under its transaction,
-    # the way the history import does; a mailbox that cannot be read
-    # leaves the markers unknown, and the gate falls back to the
-    # missing-record check rather than blocking a legitimate retry.
+    # retraction variant of the capacity gap, see #742).  The gate
+    # reads the markers under a bounded mailbox transaction below;
+    # the mailbox is constructed without its eager load, so a
+    # stalled lock holder cannot hang construction first.  A mailbox
+    # that cannot be read leaves the markers unknown, and the gate
+    # falls back to the missing-record check rather than blocking a
+    # legitimate retry.
     stored_counts: Dict[Any, int] = {}
     for item in stored:
         if isinstance(item, dict):
@@ -14365,7 +14367,7 @@ def _history_retry_allowed(
     # falls back to the missing-record check rather than blocking a
     # legitimate retry.
     try:
-        mailbox = Mailbox(config.mailbox_path)
+        mailbox = Mailbox(config.mailbox_path, load=False)
         with mailbox.transaction(timeout=_HISTORY_RETRY_LOCK_TIMEOUT):
             return any(
                 not _snapshot_record_retracted(mailbox, record)

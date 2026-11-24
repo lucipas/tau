@@ -1311,7 +1311,12 @@ def _lock_file(handle: Any, timeout: Optional[float]) -> None:
 class Mailbox:
     """Thread-safe store-and-forward storage, optionally JSON backed."""
 
-    def __init__(self, path: Optional[Union[str, Path]] = None) -> None:
+    def __init__(
+        self,
+        path: Optional[Union[str, Path]] = None,
+        *,
+        load: bool = True,
+    ) -> None:
         self.path = Path(path).expanduser() if path is not None else None
         self._lock = threading.RLock()
         self._txn_depth = 0
@@ -1397,7 +1402,16 @@ class Mailbox:
         # the same retention as the sent-retraction markers — long
         # enough to outlive any queued leg of the same retract.
         self._retract_cleanup_blocked: Dict[str, float] = {}
-        if self.path is not None:
+        # Most callers want the persisted state immediately, but a
+        # caller that will read under its own bounded transaction
+        # (the history-retry gate, see #742) must not load here:
+        # loading deduplicates persisted entries, and that rewrite
+        # runs under an unbounded transaction, so a stalled lock
+        # holder could hang construction before any timeout applies.
+        # With load=False the state stays empty until a transaction
+        # reloads it (see _transaction, which reads the document on
+        # entry).
+        if load and self.path is not None:
             self.load()
 
     @contextmanager
