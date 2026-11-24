@@ -1653,6 +1653,13 @@ class TauNode:
         if worker is not None and worker is not threading.current_thread():
             if worker.ident is not None:
                 worker.join()
+        # A live backup still reads the data directory; let it finish
+        # before the instance lock is released, so a replacement node
+        # never overlaps it and no archive is cut off mid-write.
+        worker = self._auto_backup_thread
+        if worker is not None and worker is not threading.current_thread():
+            if worker.ident is not None:
+                worker.join()
 
     def _release_instance_lock(self) -> None:
         lock, self._instance_lock = self._instance_lock, None
@@ -5370,8 +5377,24 @@ class TauNode:
                 self._exchange_sweep(max_peers=_EXCHANGE_SWEEP_PEERS)
             except Exception:  # pragma: no cover - network dependent
                 log.debug("Peer exchange sweep failed", exc_info=True)
-            if self._stop_event.wait(_MAIL_INTERVAL):
+            if self._stop_event.wait(self._mail_wait_seconds()):
                 break
+
+    def _mail_wait_seconds(self) -> float:
+        """How long the mail loop sleeps before its next pass.
+
+        Normally the mail cadence, but never past the next automatic
+        backup deadline, so a short ``backup_interval`` is honored.
+        While a backup is still running the cadence applies, so the
+        loop does not spin waiting for it.
+        """
+        thread = self._auto_backup_thread
+        if thread is not None and thread.is_alive():
+            return _MAIL_INTERVAL
+        remaining = self._auto_backup_scheduler.seconds_until_due()
+        if remaining is None:
+            return _MAIL_INTERVAL
+        return max(1.0, min(_MAIL_INTERVAL, remaining))
 
     def _publish_due_scheduled_posts(self) -> None:
         """Publish Tan posts whose scheduled time has come.
@@ -5480,6 +5503,8 @@ class TauNode:
         backup is logged and the schedule advances — see
         ``tau.auto_backup`` — so this never raises into the mail loop.
         """
+        if self._stop_event.is_set():
+            return
         thread = self._auto_backup_thread
         if thread is not None and thread.is_alive():
             return
