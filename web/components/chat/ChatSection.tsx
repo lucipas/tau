@@ -444,7 +444,11 @@ export default function ChatSection() {
     }
   }
 
-  async function handleCreateGroup(name: string, members: string[]) {
+  async function handleCreateGroup(
+    name: string,
+    members: string[],
+    opts?: { secret?: boolean },
+  ) {
     // The panel owns validation and shows API errors inline; this
     // handler only closes the panel and opens the new thread. It
     // mirrors the join flow: refresh, then navigate whether or not
@@ -454,7 +458,7 @@ export default function ChatSection() {
     // was tried here and removed: it needed its own retirement rule,
     // diverged the sidebar's group lookup, and held only one
     // pending group.
-    const group = await createGroup(name, members);
+    const group = await createGroup(name, members, opts);
     setShowNewGroup(false);
     await tau.refresh().catch(() => undefined);
     navigate("chat", { group: group.id });

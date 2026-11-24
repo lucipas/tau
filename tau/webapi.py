@@ -24,7 +24,7 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/conversations/pinned pinned conversations, newest pin first
     POST /api/conversations/pin pin/unpin ``{"peer"|"group"|"channel": "...", "pinned": true}``
     GET  /api/groups       known group DMs with their member lists
-    POST /api/groups       create ``{"name": "...", "members": ["<hash>", ...]}``
+    POST /api/groups       create ``{"name": "...", "members": ["<hash>", ...]}`` (optional ``"secret": true`` for a secret group)
     POST /api/groups/delete delete ``{"group": "<id | prefix | name>"}``
     POST /api/groups/add-member add ``{"group": "...", "members": ["<hash>", ...]}``
     POST /api/groups/remove-member remove ``{"group": "...", "members": ["<hash>", ...]}``
@@ -11382,14 +11382,25 @@ class WebBridge:
             "ignored": group["id"] in ignored_ids,
         }
 
-    def create_group(self, name: str, members: List[str]) -> Dict[str, Any]:
+    def create_group(
+        self,
+        name: str,
+        members: List[str],
+        *,
+        secret: bool = False,
+    ) -> Dict[str, Any]:
         """Create a group from the console, mirroring ``tau group create``.
 
         The creator is always a member, so this node's own hash is
         added when the caller did not include it.  Members are peer
         hashes from the console's picker; the store validates each one
-        and the roster size.
+        and the roster size.  With *secret* the group is a secret
+        group — an opaque random id bound to the roster by a
+        creator-signed attestation, like ``tau group create
+        --secret`` — so the serving node's identity signs it.
         """
+        if not isinstance(secret, bool):
+            raise ValueError("field 'secret' must be true or false")
         if not isinstance(name, str) or not name.strip():
             raise ValueError("field 'name' is required")
         if not isinstance(members, list) or not members:
@@ -11413,7 +11424,11 @@ class WebBridge:
         if len(cleaned) < 2:
             raise ValueError("a group needs at least one other peer")
         group = self.node.groups.create(
-            name.strip(), cleaned, created_by=own_hash
+            name.strip(),
+            cleaned,
+            created_by=own_hash,
+            secret=secret,
+            identity=getattr(self.node, "identity", None),
         )
         return self._describe_group(group)
 
@@ -14758,7 +14773,9 @@ class _WebHandler(BaseHTTPRequestHandler):
             if path == "/api/groups":
                 try:
                     group = self.bridge.create_group(
-                        body.get("name"), body.get("members")
+                        body.get("name"),
+                        body.get("members"),
+                        secret=body.get("secret", False),
                     )
                 except (ValueError, ProtocolError) as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)

@@ -908,6 +908,29 @@ describe("group invite links", () => {
     expect(result).toEqual(group);
   });
 
+  it("sends secret: true when creating a secret group, and omits it otherwise", async () => {
+    const group = {
+      id: "abc123",
+      name: "crew",
+      members: [],
+      created_at: 1,
+      topic: "",
+      created_by_me: true,
+      can_leave: true,
+      ignored: false,
+    };
+    nextJson = { ok: true, group };
+    await createGroup("crew", ["a".repeat(32)], { secret: true });
+    expect(bodyOf(0)).toEqual({
+      name: "crew",
+      members: ["a".repeat(32)],
+      secret: true,
+    });
+    nextJson = { ok: true, group };
+    await createGroup("crew", ["a".repeat(32)]);
+    expect(bodyOf(1)).toEqual({ name: "crew", members: ["a".repeat(32)] });
+  });
+
   it("fetches the invite status by group", async () => {
     nextJson = { group: {}, mode: "open", generation: 0, link: null };
     await getGroupInviteStatus("abc123");

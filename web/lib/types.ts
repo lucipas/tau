@@ -207,6 +207,8 @@ export interface Group {
   topic: string;
   /** True when only the group's creator can post. Absent on older payloads: reads as open. */
   announcements_only?: boolean;
+  /** True when the group is secret: an opaque id, and only members know it exists or who is in it. */
+  secret?: boolean;
   created_by_me: boolean;
   can_leave: boolean;
   ignored: boolean;

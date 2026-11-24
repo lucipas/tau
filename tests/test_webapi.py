@@ -2849,6 +2849,61 @@ def test_api_groups_create_rejects_bad_input(bridge, node, tmp_path):
     assert listed["count"] == 0
 
 
+def test_api_groups_create_secret_group(bridge, node, tmp_path):
+    from tau.groups import GroupStore
+    from tau.protocol import derive_group_id
+
+    store = GroupStore(tmp_path / "groups.json")
+    node.groups = store
+    # The fake node carries a fixed destination hash but a random
+    # identity; a secret group signs its roster attestation with the
+    # identity, so the two must agree for the signer to be the
+    # creator — a real node always satisfies this by construction.
+    node.destination_hexhash = destination_hash(node.identity).hex()
+    members = [node.destination_hexhash, PEER_HASH]
+    status, _, payload = _json(
+        bridge,
+        "/api/groups",
+        method="POST",
+        body={"name": "weekend", "members": [PEER_HASH], "secret": True},
+    )
+    assert status == 200
+    group = payload["group"]
+    assert group["secret"] is True
+    # A secret group's id is an opaque random token, not the id a
+    # plain group with the same creator, name and roster derives.
+    assert group["id"] != derive_group_id(
+        node.destination_hexhash, "weekend", members
+    )
+    stored = store.find(group["id"])
+    assert stored is not None
+    assert stored["secret"] is True
+    assert stored["roster_attestation"] is not None
+    # The same name created plain still derives its id, with no
+    # attestation — the secret flag changes the minting, not the name.
+    status, _, plain = _json(
+        bridge,
+        "/api/groups",
+        method="POST",
+        body={"name": "plain", "members": [PEER_HASH]},
+    )
+    assert status == 200
+    assert plain["group"]["secret"] is False
+    assert plain["group"]["id"] == derive_group_id(
+        node.destination_hexhash, "plain", members
+    )
+    assert store.find(plain["group"]["id"])["roster_attestation"] is None
+    # A non-boolean secret is rejected, not coerced.
+    status, _, payload = _json(
+        bridge,
+        "/api/groups",
+        method="POST",
+        body={"name": "nope", "members": [PEER_HASH], "secret": "yes"},
+    )
+    assert status == 400
+    assert "field 'secret' must be true or false" in payload["error"]["message"]
+
+
 def test_api_groups_delete_removes_group(bridge, node, tmp_path):
     from tau.groups import GroupStore
 

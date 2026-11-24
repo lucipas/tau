@@ -9,12 +9,17 @@ import type { Group, Peer } from "@/lib/types";
 
 export interface NewGroupPanelProps {
   peers: Peer[];
-  onCreate: (name: string, members: string[]) => Promise<Group>;
+  onCreate: (
+    name: string,
+    members: string[],
+    opts?: { secret?: boolean },
+  ) => Promise<Group>;
 }
 
 export default function NewGroupPanel({ peers, onCreate }: NewGroupPanelProps) {
   const [name, setName] = useState("");
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [secret, setSecret] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
 
@@ -47,9 +52,16 @@ export default function NewGroupPanel({ peers, onCreate }: NewGroupPanelProps) {
     setCreating(true);
     setFormError(null);
     try {
-      await onCreate(trimmed, members);
+      // The secret flag rides only when set, so an ordinary create
+      // calls onCreate exactly as before.
+      if (secret) {
+        await onCreate(trimmed, members, { secret: true });
+      } else {
+        await onCreate(trimmed, members);
+      }
       setName("");
       setSelected(new Set());
+      setSecret(false);
     } catch (err) {
       setFormError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -103,6 +115,21 @@ export default function NewGroupPanel({ peers, onCreate }: NewGroupPanelProps) {
             {formError}
           </p>
         )}
+        <label className="flex cursor-pointer items-start gap-2 text-sm text-zinc-200">
+          <input
+            type="checkbox"
+            checked={secret}
+            onChange={(e) => setSecret(e.target.checked)}
+            className="mt-0.5"
+          />
+          <span>
+            Secret group
+            <span className="block text-xs text-zinc-500">
+              Only members know the group exists or who is in it — the id is
+              random instead of derived from the name and roster.
+            </span>
+          </span>
+        </label>
         <button
           type="button"
           disabled={creating}

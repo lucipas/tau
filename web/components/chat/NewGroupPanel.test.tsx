@@ -114,6 +114,21 @@ describe("NewGroupPanel", () => {
     });
   });
 
+  it("creates a secret group when the secret box is checked", async () => {
+    const props = renderPanel();
+    fireEvent.change(screen.getByLabelText("Group name"), {
+      target: { value: "crew" },
+    });
+    fireEvent.click(screen.getByLabelText("Alice"));
+    fireEvent.click(screen.getByLabelText(/Secret group/));
+    fireEvent.click(screen.getByText("Create group"));
+    await vi.waitFor(() => {
+      expect(props.onCreate).toHaveBeenCalledWith("crew", [ALICE], {
+        secret: true,
+      });
+    });
+  });
+
   it("says so when no peer has announced yet", () => {
     renderPanel({ peers: [] });
     expect(screen.getByText(/No known peers yet/)).toBeTruthy();

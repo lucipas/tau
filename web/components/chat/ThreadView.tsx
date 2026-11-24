@@ -107,7 +107,7 @@ export default function ThreadView({
             {typingName
               ? `${typingName} is typing…`
               : conversation.kind === "group"
-                ? `${conversation.group?.members.length ?? 0} members${conversation.group?.topic ? ` · ${conversation.group.topic}` : ""}${conversation.group?.announcements_only ? " · Announcements only" : ""}`
+                ? `${conversation.group?.members.length ?? 0} members${conversation.group?.topic ? ` · ${conversation.group.topic}` : ""}${conversation.group?.secret ? " · Secret" : ""}${conversation.group?.announcements_only ? " · Announcements only" : ""}`
                 : conversation.peer?.blocked
                   ? "Blocked"
                   : conversation.peer?.verified
