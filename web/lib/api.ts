@@ -449,7 +449,10 @@ export async function revokeGroupInvites(group: string): Promise<{ group: Group;
 
 export interface GroupJoinResult {
   status: "added" | "already_member" | "pending" | "queued";
-  /** The joined group when added, the group name when queued. */
+  /**
+   * The joined group when added, the group name when queued. The name may
+   * be empty: a sealed (v2) invite link names nothing in the clear.
+   */
   group: Group | string;
 }
 

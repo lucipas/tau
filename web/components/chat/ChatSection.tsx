@@ -424,13 +424,17 @@ export default function ChatSection() {
         const name =
           typeof result.group === "object" ? result.group.name : result.group;
         setJoinResult(
-          `Join request pending — the creator of “${name}” has to approve it first.`,
+          name
+            ? `Join request pending — the creator of “${name}” has to approve it first.`
+            : "Join request pending — the creator has to approve it first.",
         );
       } else {
         const name =
           typeof result.group === "object" ? result.group.name : result.group;
         setJoinResult(
-          `Join request for “${name}” queued — it will be decided when it reaches the creator.`,
+          name
+            ? `Join request for “${name}” queued — it will be decided when it reaches the creator.`
+            : "Join request queued — it will be decided when it reaches the creator.",
         );
       }
     } catch (err) {
