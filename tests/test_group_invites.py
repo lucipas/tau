@@ -350,6 +350,48 @@ def test_v1_link_still_verifies():
     assert verified["group_id"] == group_id
 
 
+def test_sealed_links_have_equal_length():
+    """Padding hides the inner token's length: every sealed link
+    is the same length, whether it names a 1-char group, a 48-char
+    group, or a secret group by id."""
+    identity = RNS.Identity()
+    own_hash = RNS.Destination.hash(identity, APP_NAME, ASPECT).hex()
+    short = mint_invite_token(
+        identity, group_name="a", creator_hash=own_hash
+    )
+    long = mint_invite_token(
+        identity, group_name="x" * 48, creator_hash=own_hash
+    )
+    secret = mint_invite_token(
+        identity, group_id="ab" * 16, creator_hash=own_hash
+    )
+    assert len(short) == len(long) == len(secret)
+    # And each still verifies: the length-prefixed padding is
+    # stripped on unseal, before the signature is checked.
+    for link in (short, long):
+        assert verify_invite_link(
+            link,
+            identity=identity,
+            invites={"groups": {"a": {"mode": "open", "generation": 0},
+                                "x" * 48: {"mode": "open", "generation": 0}}},
+        )["group"] in ("a", "x" * 48)
+
+
+def test_sealed_token_too_large_to_seal():
+    identity = RNS.Identity()
+    own_hash = RNS.Destination.hash(identity, APP_NAME, ASPECT).hex()
+    # A generation with hundreds of digits cannot fit the fixed
+    # padded length, so minting refuses instead of leaking a
+    # longer link.
+    with pytest.raises(InviteError):
+        mint_invite_token(
+            identity,
+            group_name="crew",
+            creator_hash=own_hash,
+            generation=10**300,
+        )
+
+
 def test_parse_rejects_garbage_links():
     for bad in ("", "not a link", "tau://invite/", "tau://invite/!!!"):
         with pytest.raises(InviteError):

@@ -28,6 +28,10 @@ function defer<T>() {
 }
 let heldGet: ReturnType<typeof defer<unknown>> | null = null;
 
+/** The next POST /api/groups/join answers with this payload, so a
+ *  join test can stage a named or a label-free queued reply. */
+let nextJoin: unknown = null;
+
 /** Bridge stub with a stateful drafts list: a POSTed draft shows up in
  *  later GETs, like the real bridge once the save lands. Reminders behave
  *  the same way, except a GET past a reminder's due time no longer
@@ -38,6 +42,7 @@ function stubFetch() {
   reminders = [];
   reminderSeq = 0;
   heldGet = null;
+  nextJoin = null;
   vi.stubGlobal(
     "fetch",
     vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
@@ -114,6 +119,9 @@ function stubFetch() {
         payload = { archived: [] };
       } else if (url.includes("/api/beacons")) {
         payload = { beacons: [], count: 0 };
+      } else if (url.includes("/api/groups/join")) {
+        payload =
+          nextJoin ?? { ok: true, status: "queued", group: "" };
       } else if (url.includes("/api/groups") && method === "POST") {
         payload = {
           ok: true,
@@ -551,5 +559,57 @@ describe("ChatSection new group", () => {
     await waitFor(() =>
       expect(window.location.hash).toBe(`#chat?group=${NEW_GROUP_ID}`),
     );
+  });
+});
+
+describe("ChatSection join group", () => {
+  function renderJoin() {
+    window.location.hash = "#chat";
+    render(
+      <TauContext.Provider
+        value={fakeTau({
+          peers: [makePeer({ destination: PEER_HASH, name: "Alice" })],
+          messages: [],
+        })}
+      >
+        <ChatSection />
+      </TauContext.Provider>,
+    );
+  }
+
+  function pasteLinkAndJoin() {
+    fireEvent.click(screen.getByRole("button", { name: "Join a group" }));
+    fireEvent.change(
+      screen.getByLabelText("Paste an invite link to join a group"),
+      { target: { value: "tau://invite/abc" } },
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Join" }));
+  }
+
+  it("names the group when the queued reply carries one", async () => {
+    nextJoin = { ok: true, status: "queued", group: "remote-crew" };
+    renderJoin();
+    pasteLinkAndJoin();
+    await waitFor(() =>
+      expect(
+        screen.getByText(/Join request for “remote-crew” queued/),
+      ).toBeTruthy(),
+    );
+  });
+
+  it("shows a label-free message when the queued reply names no group", async () => {
+    // A sealed link carries no group label: the queued reply's
+    // group is empty, and the banner must not render empty quotes.
+    nextJoin = { ok: true, status: "queued", group: "" };
+    renderJoin();
+    pasteLinkAndJoin();
+    await waitFor(() =>
+      expect(
+        screen.getByText(
+          "Join request queued — it will be decided when it reaches the creator.",
+        ),
+      ).toBeTruthy(),
+    );
+    expect(screen.queryByText(/“”/)).toBeNull();
   });
 });
