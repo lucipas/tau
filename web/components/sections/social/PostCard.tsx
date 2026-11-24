@@ -603,7 +603,10 @@ export default function PostCard({
                     <button
                       type="button"
                       aria-label="Remove attached image"
-                      onClick={() => setQuoteFile(null)}
+                      onClick={() => {
+                        setQuoteFile(null);
+                        if (quoteFileRef.current) quoteFileRef.current.value = "";
+                      }}
                       className="text-zinc-500 hover:text-zinc-200"
                     >
                       ✕
