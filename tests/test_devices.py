@@ -26,7 +26,12 @@ from tau.devices import (
     snapshot_pairing_history,
     verify_pairing_bundle,
 )
-from tau.identity import IdentityError, destination_hash, load_or_create_identity
+from tau.identity import (
+    IdentityError,
+    destination_hash,
+    load_identity,
+    load_or_create_identity,
+)
 from tau.inbox import INBOX_EXPORT_FORMAT, INBOX_EXPORT_VERSION, Inbox
 from tau.mailbox import Mailbox
 from tau.node import InstanceLock
@@ -1028,6 +1033,133 @@ def test_devices_redeem_retry_allowed_when_retraction_is_for_another_sender(
         "skipped": 0,
         "errors": [],
     }
+
+
+def test_devices_redeem_retry_gate_skips_mailbox_when_history_present(
+    tmp_path, capsys, monkeypatch
+):
+    # Qodo Warning on #743: a replay whose history is entirely
+    # present must not wait on the mailbox lock at all — the gate
+    # decides from the inbox alone and never opens the mailbox.
+    node_a = _init_node(tmp_path, "a", "alice")
+    _seed_history(node_a)
+    capsys.readouterr()
+
+    bundle_path = tmp_path / "pairing.json"
+    assert (
+        cli.main(
+            [
+                "devices",
+                "pair",
+                "--to",
+                str(bundle_path),
+                "--data-dir",
+                str(node_a),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    node_b = tmp_path / "b"
+    assert (
+        cli.main(
+            [
+                "devices",
+                "redeem",
+                "--from",
+                str(bundle_path),
+                "--data-dir",
+                str(node_b),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["history"]["imported"] == 3
+
+    # Every snapshot record is stored: the gate must refuse the
+    # retry without constructing a Mailbox at all.
+    class _NoMailbox:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("gate must not open the mailbox")
+
+    monkeypatch.setattr(cli, "Mailbox", _NoMailbox)
+    config = TauConfig.resolve(data_dir=node_b)
+    registry = DeviceRegistry(config.devices_path)
+    identity = load_identity(config.identity_path)
+    bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+    assert cli._history_retry_allowed(config, registry, identity, bundle) is False
+
+
+def test_devices_redeem_retry_gate_falls_back_when_mailbox_lock_held(
+    tmp_path, capsys, monkeypatch
+):
+    # Qodo Warning on #743: when the gate does need the markers and
+    # the mailbox lock cannot be acquired in time, it falls back to
+    # the missing-record check instead of failing the retry.
+    fcntl = pytest.importorskip("fcntl")
+    node_a = _init_node(tmp_path, "a", "alice")
+    _seed_history(node_a)
+    capsys.readouterr()
+
+    bundle_path = tmp_path / "pairing.json"
+    assert (
+        cli.main(
+            [
+                "devices",
+                "pair",
+                "--to",
+                str(bundle_path),
+                "--data-dir",
+                str(node_a),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    node_b = tmp_path / "b"
+    assert (
+        cli.main(
+            [
+                "devices",
+                "redeem",
+                "--from",
+                str(bundle_path),
+                "--data-dir",
+                str(node_b),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["history"]["imported"] == 3
+
+    # One snapshot record is missing, so the gate needs the markers —
+    # but another process holds the mailbox lock.
+    inbox_b = Inbox(node_b / "inbox.json")
+    inbox_b.delete("msg-1")
+    lock_path = node_b / "mailbox.json.lock"
+    handle = open(lock_path, "a")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        monkeypatch.setattr(cli, "_HISTORY_RETRY_LOCK_TIMEOUT", 0.0)
+        config = TauConfig.resolve(data_dir=node_b)
+        registry = DeviceRegistry(config.devices_path)
+        identity = load_identity(config.identity_path)
+        bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+        assert (
+            cli._history_retry_allowed(config, registry, identity, bundle)
+            is True
+        )
+    finally:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
 
 
 def test_devices_pair_redeem_skips_retracted_history(tmp_path, capsys):
