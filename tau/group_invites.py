@@ -9,11 +9,19 @@ and shares it as a link; anyone holding it can ask to join.
 
 A token is a signed payload — group name, creator hash, open/closed
 mode, a generation counter, and the issue time — carried as
-``tau://invite/<base64>``.  The creator's node verifies the
-signature against its own identity, so a token can only be minted
-by the creator, and a token is only honoured while its generation
-matches the stored one: ``tau group invite --revoke`` bumps the
-generation and every token minted before it stops working.
+``tau://invite/<base64>``.  The payload is sealed to the creator:
+it is encrypted with the creator's own identity before it becomes
+a link, so the link itself carries only the creator hash — the
+joiner needs that to address the join-request DM — plus an opaque
+sealed blob.  Anyone holding the link learns nothing about the
+group: no name, no id, no mode, no generation.  The creator's node
+decrypts the token and verifies the signature against its own
+identity, so a token can only be minted by the creator, and a token
+is only honoured while its generation matches the stored one:
+``tau group invite --revoke`` bumps the generation and every token
+minted before it stops working.  Tokens minted before sealing (v1
+links, signed but unencrypted) still parse and verify, so
+outstanding links keep working; new mints are always sealed (v2).
 
 The token names the group by name, not by id: a group's id derives
 from its roster, so the first join already retires the id the token
@@ -37,7 +45,9 @@ usable against the renamed group.  Minting also records an alias
 (the id plus the group's name, creator and birth time) in the
 invite store, so the id still resolves after the group store
 evicts the retired record; a revoke drops the group's aliases
-with its generation bump.
+with its generation bump.  Since sealing, the id itself is hidden
+too: it rides inside the sealed blob, and the link carries only
+the creator hash.
 
 The join itself is a direct message with kind
 ``group-join-request`` whose text is the invite link, sent to the
@@ -152,10 +162,13 @@ def _clean_timestamp(value: Any, label: str) -> float:
 def invite_token_group_label(token: Dict[str, Any]) -> str:
     """The group a token names, for display in a queued-join reply.
 
-    A name-keyed token names the group; an id-keyed token (secret
-    group) has no name, so the opaque id is reported instead — a
-    handler that reads ``token["group"]`` unconditionally raises
-    ``KeyError`` on an id token after the request was queued.
+    A name-keyed v1 token names the group; an id-keyed v1 token
+    (secret group) has no name, so the opaque id is reported
+    instead — a handler that reads ``token["group"]``
+    unconditionally raises ``KeyError`` on an id token after the
+    request was queued.  A sealed (v2) token names nothing in the
+    clear — the joiner learns the group from the creator's reply,
+    not the link — so the label is empty.
     """
     group = token.get("group")
     if isinstance(group, str) and group:
@@ -166,7 +179,7 @@ def invite_token_group_label(token: Dict[str, Any]) -> str:
     return ""
 
 
-def mint_invite_token(
+def _build_signed_invite_token(
     identity: RNS.Identity,
     *,
     group_name: Optional[str] = None,
@@ -175,17 +188,12 @@ def mint_invite_token(
     mode: str = DEFAULT_INVITE_MODE,
     generation: int = 0,
     issued_at: Optional[float] = None,
-) -> str:
-    """Mint a signed invite link for a group.
+) -> Dict[str, Any]:
+    """Build the signed v1 invite payload (plus ``"sig"``).
 
-    The payload is signed with the creator's identity, so only the
-    creator can mint a token anyone will honour.  *generation* is
-    the invite generation the token belongs to; bumping it (see
-    :func:`revoke_invites`) invalidates every token minted before.
-    Exactly one of *group_name* and *group_id* names the group: a
-    name for an ordinary group, an opaque id for a secret group —
-    the id token carries no name, so anyone holding the link learns
-    nothing about the group it opens.
+    This is the plaintext a sealed token protects: exactly one of
+    *group_name* and *group_id* names the group — a name for an
+    ordinary group, an opaque id for a secret group.
     """
     if (group_name is None) == (group_id is None):
         raise InviteError(
@@ -210,43 +218,128 @@ def mint_invite_token(
         raise InviteError("creator identity cannot sign")
     token = dict(payload)
     token["sig"] = base64.b64encode(signature).decode("ascii")
+    return token
+
+
+def _encode_v1_invite_link(token: Dict[str, Any]) -> str:
+    """Carry a signed v1 token as a link (the pre-sealing format)."""
     return INVITE_LINK_PREFIX + base64.urlsafe_b64encode(encode(token)).decode(
         "ascii"
     )
 
 
-def parse_invite_link(link: Any) -> Dict[str, Any]:
-    """Decode an invite link into its signed payload.
+# The sealed plaintext is padded to this fixed size before encryption,
+# so the sealed blob's length does not reveal the group name's length.
+# Worst-case inner JSON (a 48-character UTF-8 name plus the signature)
+# is well under the bucket; a 2-byte big-endian length prefix says how
+# much of it is payload, and the rest is zero padding.
+SEAL_PLAINTEXT_BYTES = 512
+_SEAL_LENGTH_PREFIX_BYTES = 2
 
-    Returns the token dict (payload plus ``"sig"`` as base64 text).
-    The signature itself is not checked here — that needs the
-    creator's identity (see :func:`verify_invite_link`).
+
+def _pad_sealed_plaintext(body: bytes) -> bytes:
+    capacity = SEAL_PLAINTEXT_BYTES - _SEAL_LENGTH_PREFIX_BYTES
+    if len(body) > capacity:
+        raise InviteError("invite token is too large to seal")
+    return (
+        len(body).to_bytes(_SEAL_LENGTH_PREFIX_BYTES, "big")
+        + body
+        + b"\0" * (capacity - len(body))
+    )
+
+
+def _unpad_sealed_plaintext(padded: bytes) -> bytes:
+    """The payload of a padded sealed plaintext, or an error."""
+    if len(padded) != SEAL_PLAINTEXT_BYTES:
+        raise InviteError("invite is not valid for this group")
+    length = int.from_bytes(padded[:_SEAL_LENGTH_PREFIX_BYTES], "big")
+    capacity = SEAL_PLAINTEXT_BYTES - _SEAL_LENGTH_PREFIX_BYTES
+    if length > capacity:
+        raise InviteError("invite is not valid for this group")
+    body = padded[_SEAL_LENGTH_PREFIX_BYTES : _SEAL_LENGTH_PREFIX_BYTES + length]
+    if padded[_SEAL_LENGTH_PREFIX_BYTES + length :].strip(b"\0"):
+        raise InviteError("invite is not valid for this group")
+    return body
+
+
+def _seal_invite_token(identity: RNS.Identity, token: Dict[str, Any]) -> str:
+    """Seal a signed token to the creator's own identity (v2 link).
+
+    The signed payload is padded to a fixed size and encrypted with
+    the creator's identity, so the link carries only the creator
+    hash — the routing info a joiner needs to address the join-request
+    DM — plus an opaque sealed blob of constant length.  No group
+    field of any kind appears in the clear, and the link length does
+    not depend on the group name; a fresh mint seals with a fresh
+    ephemeral key each time.
     """
-    if not isinstance(link, str):
-        raise InviteError("invite link must be a string")
-    text = link.strip()
-    if not text.startswith(INVITE_LINK_PREFIX):
-        raise InviteError("not an invite link")
-    raw = text[len(INVITE_LINK_PREFIX) :].strip()
-    if not raw:
-        raise InviteError("invite link is empty")
-    try:
-        decoded = base64.urlsafe_b64decode(raw)
-    except (binascii.Error, ValueError) as exc:
-        raise InviteError("invite link is not valid base64") from exc
-    try:
-        token = decode(decoded)
-    except Exception as exc:
-        raise InviteError(f"invite link is not a valid token: {exc}") from exc
+    sealed = identity.encrypt(_pad_sealed_plaintext(encode(token)))
+    if not sealed:  # pragma: no cover - RNS encrypt failure
+        raise InviteError("creator identity cannot seal the invite")
+    outer: Dict[str, Any] = {
+        "v": 2,
+        "type": "group-invite",
+        "creator": token["creator"],
+        "sealed": base64.b64encode(sealed).decode("ascii"),
+    }
+    return INVITE_LINK_PREFIX + base64.urlsafe_b64encode(encode(outer)).decode(
+        "ascii"
+    )
+
+
+def mint_invite_token(
+    identity: RNS.Identity,
+    *,
+    group_name: Optional[str] = None,
+    group_id: Optional[str] = None,
+    creator_hash: str,
+    mode: str = DEFAULT_INVITE_MODE,
+    generation: int = 0,
+    issued_at: Optional[float] = None,
+) -> str:
+    """Mint a signed invite link for a group.
+
+    The payload is signed with the creator's identity, so only the
+    creator can mint a token anyone will honour.  *generation* is
+    the invite generation the token belongs to; bumping it (see
+    :func:`revoke_invites`) invalidates every token minted before.
+    Exactly one of *group_name* and *group_id* names the group: a
+    name for an ordinary group, an opaque id for a secret group —
+    the id token carries no name, so anyone holding the link learns
+    nothing about the group it opens.
+
+    The link is sealed (v2): the signed payload is encrypted to
+    the creator's own identity, so the link itself is opaque to
+    anyone but the creator's node — no name, no id, no mode, no
+    generation in the clear.  Only the creator hash rides outside
+    the seal, because the joiner needs it to address the
+    join-request DM.
+    """
+    token = _build_signed_invite_token(
+        identity,
+        group_name=group_name,
+        group_id=group_id,
+        creator_hash=creator_hash,
+        mode=mode,
+        generation=generation,
+        issued_at=issued_at,
+    )
+    return _seal_invite_token(identity, token)
+
+
+def _validate_v1_token_shape(token: Dict[str, Any]) -> Dict[str, Any]:
+    """Check a v1 token's shape; the token itself, or an error.
+
+    Exactly one of ``"group"`` (a name) and ``"group_id"`` (an
+    opaque id, for a secret group) names the group — a token
+    carrying both, or neither, is malformed.  Shared by the v1
+    parse path and the v2 unseal path, so a sealed token's inner
+    payload is held to the same shape as a bare v1 token.
+    """
     if not isinstance(token, dict) or token.get("type") != "group-invite":
         raise InviteError("not a group invite token")
     if token.get("v") != 1:
         raise InviteError("unsupported invite token version")
-    # Validate the shape now so a malformed token fails the same way
-    # everywhere instead of halfway through verification.  Exactly
-    # one of "group" (a name) and "group_id" (an opaque id, for a
-    # secret group) names the group — a token carrying both, or
-    # neither, is malformed.
     has_name = token.get("group") is not None
     has_id = token.get("group_id") is not None
     if has_name == has_id:
@@ -268,6 +361,108 @@ def parse_invite_link(link: Any) -> Dict[str, Any]:
         base64.b64decode(signature_text, validate=True)
     except (binascii.Error, ValueError) as exc:
         raise InviteError("invite token signature is not valid base64") from exc
+    return token
+
+
+def _parse_v2_invite_link(token: Dict[str, Any]) -> Dict[str, Any]:
+    """Check a sealed (v2) token's outer envelope.
+
+    The outer envelope carries only the creator hash — the routing
+    info a joiner needs — plus the sealed blob.  Returns the
+    envelope with the blob decoded to bytes; the inner payload
+    stays sealed until :func:`verify_invite_link` opens it with
+    the creator's identity.
+    """
+    if not isinstance(token, dict) or token.get("type") != "group-invite":
+        raise InviteError("not a group invite token")
+    if token.get("v") != 2:
+        raise InviteError("unsupported invite token version")
+    creator = _clean_hash(token.get("creator"), "creator")
+    sealed_text = token.get("sealed")
+    if not isinstance(sealed_text, str) or not sealed_text:
+        raise InviteError("invite token is missing its sealed payload")
+    try:
+        sealed = base64.b64decode(sealed_text, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise InviteError("invite token sealed payload is not valid base64") from exc
+    if not sealed:
+        raise InviteError("invite token is missing its sealed payload")
+    return {
+        "v": 2,
+        "type": "group-invite",
+        "creator": creator,
+        "sealed": sealed,
+    }
+
+
+def parse_invite_link(link: Any) -> Dict[str, Any]:
+    """Decode an invite link into its signed payload.
+
+    Returns the token dict (payload plus ``"sig"`` as base64 text)
+    for a v1 link, or the outer envelope (``"creator"`` plus the
+    sealed blob as bytes) for a sealed v2 link.  The signature
+    itself is not checked here — that needs the creator's identity
+    (see :func:`verify_invite_link`) — and a v2 link's inner
+    payload is not opened here either: only the creator's node can
+    decrypt it.  A joiner needs nothing more than ``"creator"``
+    from the parsed link, to address the join-request DM.
+    """
+    if not isinstance(link, str):
+        raise InviteError("invite link must be a string")
+    text = link.strip()
+    if not text.startswith(INVITE_LINK_PREFIX):
+        raise InviteError("not an invite link")
+    raw = text[len(INVITE_LINK_PREFIX) :].strip()
+    if not raw:
+        raise InviteError("invite link is empty")
+    try:
+        decoded = base64.urlsafe_b64decode(raw)
+    except (binascii.Error, ValueError) as exc:
+        raise InviteError("invite link is not valid base64") from exc
+    try:
+        token = decode(decoded)
+    except Exception as exc:
+        raise InviteError(f"invite link is not a valid token: {exc}") from exc
+    if not isinstance(token, dict) or token.get("type") != "group-invite":
+        raise InviteError("not a group invite token")
+    version = token.get("v")
+    if version == 1:
+        # Validate the shape now so a malformed token fails the same way
+        # everywhere instead of halfway through verification.
+        return _validate_v1_token_shape(token)
+    if version == 2:
+        return _parse_v2_invite_link(token)
+    raise InviteError("unsupported invite token version")
+
+
+def _unseal_invite_token(
+    identity: RNS.Identity, envelope: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Open a sealed (v2) token's inner payload with the creator's identity.
+
+    Returns the signed v1 token, held to the same shape as a bare
+    v1 link.  The outer creator must match the inner one, so a
+    sealed blob cannot be re-wrapped under another creator's hash.
+    Every failure raises the same generic :class:`InviteError`,
+    so a caller that reports it cannot leak which check failed —
+    or whether the link was sealed at all.
+    """
+    try:
+        plaintext = identity.decrypt(bytes(envelope["sealed"]))
+    except Exception as exc:
+        raise InviteError("invite is not valid for this group") from exc
+    if not plaintext:
+        raise InviteError("invite is not valid for this group")
+    try:
+        inner = decode(_unpad_sealed_plaintext(plaintext))
+    except Exception as exc:
+        raise InviteError("invite is not valid for this group") from exc
+    try:
+        token = _validate_v1_token_shape(inner)
+    except InviteError as exc:
+        raise InviteError("invite is not valid for this group") from exc
+    if token["creator"] != envelope["creator"]:
+        raise InviteError("invite is not valid for this group")
     return token
 
 
@@ -296,11 +491,17 @@ def verify_invite_link(
     ``"group"`` (the name, ``None`` only when the token itself was
     rejected) and ``"group_id"`` (the id, or ``None`` for a
     name-keyed token).
+
+    A sealed (v2) link is opened with the creator's identity
+    first: only this node can decrypt its own tokens, so a wrong
+    identity fails the decrypt before any other check runs.
     """
     token = parse_invite_link(link)
     own_hash = RNS.Destination.hash(identity, APP_NAME, ASPECT).hex()
     if token["creator"] != own_hash:
         raise InviteError("invite was not issued by this node")
+    if token.get("v") == 2:
+        token = _unseal_invite_token(identity, token)
     signature = base64.b64decode(token["sig"])
     unsigned = {k: v for k, v in token.items() if k != "sig"}
     try:

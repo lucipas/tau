@@ -21337,9 +21337,9 @@ def cmd_group_invite(args: argparse.Namespace) -> int:
         group_name=group["name"],
         creator_hash=own_hash,
         mode=mode,
-        # A secret group's link names the group by its opaque id,
-        # never by name — anyone holding it learns nothing about
-        # the group.
+        # A secret group's token names the group by its opaque id,
+        # never by name — and every token is sealed to the creator,
+        # so the link itself carries no group field of any kind.
         group_id=group["id"] if group.get("secret") else None,
         group_created_at=(
             group.get("created_at") if group.get("secret") else None
@@ -21359,8 +21359,8 @@ def cmd_group_invite(args: argparse.Namespace) -> int:
         return _EXIT_OK
     print(f"invite link for {group['name']} ({group['id'][:8]}), {mode} group:")
     print(link)
-    if group.get("secret"):
-        print("The link names the group by its opaque id, not by name.")
+    print("The link is sealed: it names nothing about the group —")
+    print("only this node can open it.")
     if mode == "closed":
         print("Invitees ask to join; review them with `tau group requests`.")
     else:
