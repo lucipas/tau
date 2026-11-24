@@ -1656,8 +1656,10 @@ class TauNode:
         # Same for the automatic-backup worker: a live backup still
         # reading state must finish before the instance lock is
         # released, or a replacement node could start on the data
-        # directory under it.
-        worker = self._auto_backup_thread
+        # directory under it. Guarded like the mail-loop deadline
+        # read: a stub node without one (as in the scheduled-files
+        # stop test) simply has no backup worker to join.
+        worker = getattr(self, "_auto_backup_thread", None)
         if worker is not None and worker is not threading.current_thread():
             if worker.ident is not None:
                 worker.join()
