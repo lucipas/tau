@@ -47,7 +47,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
-from .protocol import ProtocolError, normalize_message, sanitize_file_name
+from .protocol import ProtocolError, clean_location, normalize_message, sanitize_file_name
 from .util import atomic_write_json, ensure_dir
 
 log = logging.getLogger(__name__)
@@ -193,6 +193,28 @@ def _clean_image(value: Any) -> Optional[Dict[str, Any]]:
     }
 
 
+def _clean_location(value: Any) -> Optional[Dict[str, Any]]:
+    """Validate a queued post's place attachment: ``{lat, lon, name?}``.
+
+    The same shape :func:`tau.tangents.tan._clean_location` validates
+    for an immediate post, re-checked here so a hand-edited queue file
+    cannot smuggle a bad pin into the publish pass.  The pin itself is
+    tiny — coordinates plus an optional name — so it rides the queue
+    entry, unlike an image whose bytes live in the media store.
+    ``None`` means no place (and is what old queue files without the
+    field load as).
+    """
+    if value is None:
+        return None
+    cleaned = clean_location(value)
+    if cleaned is None:
+        raise ScheduledPostsError(
+            "scheduled post location must be an object with latitude "
+            "-90..90 and longitude -180..180"
+        )
+    return cleaned
+
+
 def _clean_ttl(value: Any) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ScheduledPostsError(f"not a gossip TTL: {value!r}")
@@ -306,6 +328,10 @@ class ScheduledPost:
     # post scheduled with ``--image``; the bytes live pinned in the
     # local media store, never in the queue.  ``None`` means no image.
     image: Optional[Dict[str, Any]] = None
+    # Place attachment (``{lat, lon, name?}``) for a post scheduled
+    # with ``--location``; the pin is small, so it rides the queue
+    # entry itself.  ``None`` means no place.
+    location: Optional[Dict[str, Any]] = None
 
     def __post_init__(self) -> None:
         # A frozen dataclass still builds through __init__: validate
@@ -330,6 +356,7 @@ class ScheduledPost:
         object.__setattr__(self, "target_post", _clean_reply_to(self.target_post))
         object.__setattr__(self, "options", _clean_options(self.options))
         object.__setattr__(self, "image", _clean_image(self.image))
+        object.__setattr__(self, "location", _clean_location(self.location))
         if self.kind == "poll":
             # A poll is a top-level entry: it has no reply target, and
             # its options are fixed at schedule time.
@@ -339,6 +366,8 @@ class ScheduledPost:
                 raise ScheduledPostsError("a scheduled poll needs 2-8 options")
             if self.image is not None:
                 raise ScheduledPostsError("a scheduled poll cannot carry an image")
+            if self.location is not None:
+                raise ScheduledPostsError("a scheduled poll cannot carry a location")
             if self.target_post is not None:
                 raise ScheduledPostsError(
                     "a scheduled poll cannot carry a target post"
@@ -369,6 +398,10 @@ class ScheduledPost:
                 raise ScheduledPostsError(
                     f"a scheduled {self.kind} cannot carry an image"
                 )
+            if self.location is not None:
+                raise ScheduledPostsError(
+                    f"a scheduled {self.kind} cannot carry a location"
+                )
         else:
             if self.target_post is not None:
                 raise ScheduledPostsError(
@@ -396,6 +429,7 @@ class ScheduledPost:
             "target_post": self.target_post,
             "options": list(self.options),
             "image": self.image,
+            "location": self.location,
         }
 
     @classmethod
@@ -421,6 +455,7 @@ class ScheduledPost:
             target_post=_clean_reply_to(data.get("target_post")),
             options=_clean_options(data.get("options")),
             image=_clean_image(data.get("image")),
+            location=_clean_location(data.get("location")),
         )
 
 
@@ -566,6 +601,7 @@ def schedule_post(
     target_post: Optional[str] = None,
     options: Optional[Sequence[str]] = None,
     image: Optional[Dict[str, Any]] = None,
+    location: Optional[Dict[str, Any]] = None,
 ) -> ScheduledPost:
     """Queue a post for *publish_at*; returns the stored entry.
 
@@ -595,6 +631,13 @@ def schedule_post(
     pinned in the local media store, never in the queue.  An image is
     top-level-only, the same rule as an immediate post, so it is
     refused with a reply target.
+
+    When *location* is given — the ``{lat, lon, name?}`` pin an
+    immediate post carries — it rides the entry itself (it is small)
+    and is signed with the post at publish time.  A location is
+    top-level-only too, the same rule as an immediate post and as an
+    image, so it is refused with a reply target, a poll, a repost,
+    or a quote.
     """
     clean_kind = _clean_kind(kind)
     clean_target = _clean_reply_to(target_post)
@@ -631,11 +674,14 @@ def schedule_post(
         )
     clean_options: Tuple[str, ...] = ()
     clean_image = _clean_image(image)
+    clean_location = _clean_location(location)
     if clean_kind == "poll":
         if reply_to is not None:
             raise ScheduledPostsError("a scheduled poll cannot be a reply")
         if clean_image is not None:
             raise ScheduledPostsError("a scheduled poll cannot carry an image")
+        if clean_location is not None:
+            raise ScheduledPostsError("a scheduled poll cannot carry a location")
         if clean_target is not None:
             raise ScheduledPostsError("a scheduled poll cannot carry a target post")
         from .tangents.tan import _clean_poll_options
@@ -662,12 +708,20 @@ def schedule_post(
             raise ScheduledPostsError(
                 f"a scheduled {clean_kind} cannot carry an image"
             )
+        if clean_location is not None:
+            raise ScheduledPostsError(
+                f"a scheduled {clean_kind} cannot carry a location"
+            )
     else:
         if options:
             raise ScheduledPostsError("a scheduled post cannot carry poll options")
         if clean_image is not None and reply_to is not None:
             raise ScheduledPostsError(
                 "an image can only be attached to a top-level post, not a reply"
+            )
+        if clean_location is not None and reply_to is not None:
+            raise ScheduledPostsError(
+                "a location can only be attached to a top-level post, not a reply"
             )
     if clean_kind != "repost" and clean_kind != "poll":
         try:
@@ -679,6 +733,10 @@ def schedule_post(
                 reply_to=clean_target if clean_kind == "quote" else reply_to,
                 expires=clean_expires_in > 0,
                 image=clean_image,
+                # A pin rides in the signed post too — its name is
+                # short, but a borderline text plus a named place can
+                # still overflow the 8 KiB budget together.
+                location=clean_location,
             )
         except PostError as exc:
             raise ScheduledPostsError(str(exc)) from exc
@@ -695,6 +753,7 @@ def schedule_post(
         target_post=clean_target,
         options=clean_options,
         image=clean_image,
+        location=clean_location,
     )
     with scheduled_posts_lock(path):
         queue = load_scheduled_posts(path)
@@ -828,10 +887,10 @@ def edit_scheduled_post(
     At least one of *text* / *publish_at* must be given.  The new text
     gets the same validation as scheduling does (``normalize_message``
     plus the wire-size preflight against the entry's kind and retained
-    fields — a poll's options, a quote's target, an image descriptor —
-    so an edit cannot queue a post that could never be published.
-    A scheduled repost carries no text, so a text edit on one is
-    refused.  A new publish time must be in the future and within the
+    fields — a poll's options, a quote's target, an image descriptor,
+    a location pin — so an edit cannot queue a post that could never
+    be published.  A scheduled repost carries no text, so a text edit
+    on one is refused.  A new publish time must be in the future and within the
     7-day queue cap; expiry counts from publication, so it does not
     limit how far out the publish time may move.
 
@@ -914,6 +973,7 @@ def edit_scheduled_post(
                         ),
                         expires=post.expires_in > 0,
                         image=post.image,
+                        location=post.location,
                     )
             except PostError as exc:
                 raise ScheduledPostsError(str(exc)) from exc
@@ -1067,6 +1127,7 @@ def publish_due_scheduled_posts(
                                 reply_to=post.reply_to,
                                 expires_at=expires_at,
                                 image=post.image,
+                                location=post.location,
                             )
                         # Persist the signed post's identity before sending, so
                         # a retry after a crash re-sends it rather than signing

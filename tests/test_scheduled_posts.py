@@ -454,6 +454,105 @@ def test_schedule_post_rejects_text_that_only_fits_without_image(tmp_path):
     assert len(load_scheduled_posts(path).posts) == 1
 
 
+def _location() -> dict:
+    return {"lat": 34.05, "lon": -83.88, "name": "Rock Springs Park"}
+
+
+def test_schedule_post_with_location_round_trips(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    post = schedule_post(
+        path, text="morning", publish_at=1000.0, now=900.0, location=_location()
+    )
+    assert post.location == _location()
+    assert load_scheduled_posts(path).posts[0].location == _location()
+    assert load_scheduled_posts(path).posts[0].to_dict()["location"] == _location()
+
+
+def test_schedule_post_without_location_loads_as_none(tmp_path):
+    # Old queue files predate the location field: they load with no place.
+    path = tmp_path / "scheduled-posts.json"
+    post = schedule_post(path, text="plain", publish_at=1000.0, now=900.0)
+    assert post.location is None
+    stored = post.to_dict()
+    del stored["location"]
+    path.write_text(json.dumps({"posts": [stored]}))
+    assert load_scheduled_posts(path).posts[0].location is None
+
+
+def test_schedule_post_rejects_location_on_reply(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    with pytest.raises(ScheduledPostsError, match="top-level"):
+        schedule_post(
+            path,
+            text="reply",
+            publish_at=1000.0,
+            now=900.0,
+            reply_to="b" * 64,
+            location=_location(),
+        )
+    assert load_scheduled_posts(path).posts == ()
+
+
+def test_schedule_post_rejects_location_on_poll_repost_and_quote(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    target = "d" * 64
+    with pytest.raises(ScheduledPostsError, match="cannot carry a location"):
+        schedule_post(
+            path,
+            text="where?",
+            publish_at=1000.0,
+            now=900.0,
+            kind="poll",
+            options=["here", "there"],
+            location=_location(),
+        )
+    with pytest.raises(ScheduledPostsError, match="cannot carry a location"):
+        schedule_post(
+            path, text="", publish_at=1000.0, now=900.0,
+            kind="repost", target_post=target, location=_location(),
+        )
+    with pytest.raises(ScheduledPostsError, match="cannot carry a location"):
+        schedule_post(
+            path, text="look", publish_at=1000.0, now=900.0,
+            kind="quote", target_post=target, location=_location(),
+        )
+    assert load_scheduled_posts(path).posts == ()
+
+
+def test_schedule_post_rejects_bad_location(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    bad_locations = [
+        {"lat": 91.0, "lon": -83.88},
+        {"lat": 34.05, "lon": 181.0},
+        {"lat": 34.05},
+        {"lat": "34.05", "lon": -83.88},
+        {"lat": 34.05, "lon": -83.88, "name": "x" * 201},
+        "not-an-object",
+    ]
+    for bad in bad_locations:
+        with pytest.raises(ScheduledPostsError):
+            schedule_post(
+                path, text="x", publish_at=1000.0, now=900.0, location=bad
+            )
+    assert load_scheduled_posts(path).posts == ()
+
+
+def test_schedule_post_rejects_text_that_only_fits_without_location(tmp_path):
+    # The pin is ~70 bytes of JSON inside the 8 KiB Tan request:
+    # 1,875 four-byte characters fit on their own (the first failure
+    # without a location is 1,891) but not with one attached (the first
+    # failure with a location is 1,875).  Refuse at schedule time,
+    # instead of failing every publish attempt forever.
+    path = tmp_path / "scheduled-posts.json"
+    schedule_post(path, text="😀" * 1875, publish_at=1000.0, now=900.0)
+    with pytest.raises(ScheduledPostsError, match="encoded limit"):
+        schedule_post(
+            path, text="😀" * 1875, publish_at=1000.0, now=900.0,
+            location=_location(),
+        )
+    assert len(load_scheduled_posts(path).posts) == 1
+
+
 def test_cancel_scheduled_post_end_to_end(tmp_path):
     path = tmp_path / "scheduled-posts.json"
     post = schedule_post(path, text="later", publish_at=2000.0, now=1000.0)
@@ -656,6 +755,22 @@ def test_edit_scheduled_post_counts_image_in_size_check(tmp_path):
     assert edited.text == "😀" * 1860
 
 
+def test_edit_scheduled_post_counts_location_in_size_check(tmp_path):
+    # 1,875 four-byte characters fit a plain post, but the pin rides
+    # in the same entry: refuse the edit instead of queueing a post
+    # that could never publish.
+    path = tmp_path / "scheduled-posts.json"
+    post = schedule_post(
+        path, text="morning", publish_at=2000.0, now=1000.0, location=_location()
+    )
+    with pytest.raises(ScheduledPostsError, match="encoded limit"):
+        edit_scheduled_post(path, post.id, text="😀" * 1875, now=1000.0)
+    assert load_scheduled_posts(path).posts[0].text == "morning"
+    plain = schedule_post(path, text="short", publish_at=2000.0, now=1000.0)
+    edited = edit_scheduled_post(path, plain.id, text="😀" * 1875, now=1000.0)
+    assert edited.text == "😀" * 1875
+
+
 def test_edit_scheduled_post_revalidates_time_after_lock(tmp_path, monkeypatch):
     # The requested time was in the future when the edit started, but
     # the clock moved past it while the edit waited for the queue
@@ -713,13 +828,16 @@ class _FakeTanApp:
         self.fail_publish = fail_publish
         self.fail_repost = fail_repost
 
-    def create_post(self, text, *, reply_to=None, expires_at=None, image=None):
+    def create_post(
+        self, text, *, reply_to=None, expires_at=None, image=None, location=None
+    ):
         post = {
             "hash": "c" * 64,
             "text": text,
             "reply_to": reply_to,
             "expires_at": expires_at,
             "image": image,
+            "location": location,
         }
         self.created.append(post)
         return post
@@ -900,6 +1018,20 @@ def test_publish_due_attaches_scheduled_image(tmp_path):
     assert result == {"published": 1, "kept": 0}
     assert app.created[0]["image"] == _image()
     assert app.published[0][0]["image"] == _image()
+    assert load_scheduled_posts(path).posts == ()
+
+
+def test_publish_due_attaches_scheduled_location(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    schedule_post(
+        path, text="morning", publish_at=1000.0, now=900.0, location=_location()
+    )
+    app = _FakeTanApp()
+
+    result = publish_due_scheduled_posts(path, app, now=2000.0)
+    assert result == {"published": 1, "kept": 0}
+    assert app.created[0]["location"] == _location()
+    assert app.published[0][0]["location"] == _location()
     assert load_scheduled_posts(path).posts == ()
 
 

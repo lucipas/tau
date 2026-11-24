@@ -211,7 +211,7 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/tan/reposts  who reposted a Tan post (?target=<post hash>)
     GET  /api/tan/quotes   standing quotes of a Tan post (?target=<post hash>)
     POST /api/tan/posts    publish a Tan post (optional "image" base64 data URL)
-    POST /api/tan/schedule schedule a Tan post, repost or quote — or a poll, with ``"poll_options"`` — for later (optional "image" base64 data URL)
+    POST /api/tan/schedule schedule a Tan post, repost or quote — or a poll, with ``"poll_options"`` — for later (optional "image" base64 data URL, optional "location" pin)
     GET  /api/tan/scheduled queued Tan posts, reposts, quotes and polls, soonest first
     POST /api/tan/cancel-scheduled cancel a queued Tan post
     POST /api/tan/edit-scheduled edit a queued Tan post's text/time
@@ -3993,6 +3993,7 @@ class WebBridge:
         target_post: Optional[str] = None,
         poll_options: Optional[List[str]] = None,
         image: Optional[str] = None,
+        location: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Queue a Tan post for later, like ``tau tan post --delay``.
 
@@ -4003,22 +4004,24 @@ class WebBridge:
         *image* data URL is decoded the same way :meth:`tan_post`
         decodes one — the bytes are stored pinned in the local media
         store at schedule time — and rides the queue entry until the
-        publish pass attaches it.
+        publish pass attaches it.  A *location* pin rides the queue
+        entry itself the same way, and the publish pass attaches it.
 
         With *kind* ``"repost"`` / ``"quote"`` the entry amplifies
         *target_post* instead: a repost carries no text, a quote
         carries its comment as the text, and the target is resolved
         the same way as a reply target.  A repost or quote carries
-        neither an image nor poll options — Tan records allow an image
-        only on a top-level post, and a poll is its own kind — so
-        either field with one of those kinds is refused here, before
-        the image bytes are decoded or pinned, rather than scheduled
-        and silently dropped at publish time.
+        neither an image nor a location nor poll options — Tan records
+        allow an image or a location only on a top-level post, and a
+        poll is its own kind — so any of those fields with one of
+        those kinds is refused here, before the image bytes are
+        decoded or pinned, rather than scheduled and silently dropped
+        at publish time.
 
         With *poll_options* the entry is a poll instead: the text is
         its question, the options ride alongside it, and a reply
         target is refused — polls are top-level entries.  A poll
-        cannot carry an image.
+        cannot carry an image or a location.
         """
         from .scheduled_posts import (
             schedule_poll,
@@ -4034,9 +4037,17 @@ class WebBridge:
             )
         if image is not None and poll_options is not None:
             raise ValueError("a scheduled poll cannot carry an image")
+        if location is not None and reply_to is not None:
+            raise ValueError(
+                "a location can only be attached to a top-level post, not a reply"
+            )
+        if location is not None and poll_options is not None:
+            raise ValueError("a scheduled poll cannot carry a location")
         if kind in ("repost", "quote"):
             if image is not None:
                 raise ValueError(f"a scheduled {kind} cannot carry an image")
+            if location is not None:
+                raise ValueError(f"a scheduled {kind} cannot carry a location")
             if poll_options is not None:
                 raise ValueError(
                     f"a scheduled {kind} cannot carry poll options"
@@ -4104,6 +4115,7 @@ class WebBridge:
             name=getattr(self.node, "name", None),
             expires_in=float(expires_in),
             image=image_attachment,
+            location=location,
         )
         return post.to_dict()
 
@@ -16457,6 +16469,19 @@ class _WebHandler(BaseHTTPRequestHandler):
                         400,
                     )
                     return
+                location = body.get("location")
+                if location is not None and not isinstance(location, dict):
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "field 'location' must be an object "
+                                "with latitude -90..90 and longitude -180..180"
+                            }
+                        },
+                        head_only,
+                        400,
+                    )
+                    return
                 try:
                     scheduled = self.bridge.tan_schedule_post(
                         text,
@@ -16469,6 +16494,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                         target_post=target_post,
                         poll_options=poll_options,
                         image=image,
+                        location=location,
                     )
                 except (ValueError, ProtocolError) as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)

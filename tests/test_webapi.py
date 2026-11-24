@@ -15227,6 +15227,49 @@ def test_tan_schedule_post_via_api(tmp_path):
         bridge.stop()
 
 
+def test_tan_schedule_post_with_location_via_api(tmp_path):
+    from tau.config import TauConfig
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # A pin rides the queue entry, like an image descriptor.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/schedule",
+            method="POST",
+            body={
+                "text": "meet me here tomorrow",
+                "send_in": 3600,
+                "location": {
+                    "lat": 34.05,
+                    "lon": -83.88,
+                    "name": "Rock Springs Park",
+                },
+            },
+        )
+        assert status == 200
+        assert payload["scheduled"]["location"] == {
+            "lat": 34.05,
+            "lon": -83.88,
+            "name": "Rock Springs Park",
+        }
+
+        status, _, payload = _json(bridge, "/api/tan/scheduled")
+        assert status == 200
+        assert payload["count"] == 1
+        assert payload["scheduled"][0]["location"] == {
+            "lat": 34.05,
+            "lon": -83.88,
+            "name": "Rock Springs Park",
+        }
+    finally:
+        bridge.stop()
+
+
 def test_tan_schedule_poll_via_api(tmp_path):
     node = FakeNode()
     node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
@@ -15572,6 +15615,46 @@ def test_tan_schedule_post_rejects_bad_requests(tmp_path):
                     "image": "data:image/png;base64,iVBORw0KGgo=",
                 },
                 "not a reply",
+            ),
+            (
+                {
+                    "text": "reply with pin",
+                    "send_in": 60,
+                    "reply_to": post["hash"][:16],
+                    "location": {"lat": 34.05, "lon": -83.88},
+                },
+                "not a reply",
+            ),
+            (
+                {"text": "hello", "send_in": 60, "location": "34.05,-83.88"},
+                "must be an object",
+            ),
+            (
+                {
+                    "text": "hello",
+                    "send_in": 60,
+                    "location": {"lat": 91.0, "lon": 0},
+                },
+                "latitude",
+            ),
+            (
+                {
+                    "text": "where?",
+                    "send_in": 60,
+                    "poll_options": ["here", "there"],
+                    "location": {"lat": 34.05, "lon": -83.88},
+                },
+                "cannot carry a location",
+            ),
+            (
+                {
+                    "text": "look",
+                    "send_in": 60,
+                    "kind": "quote",
+                    "target_post": post["hash"][:16],
+                    "location": {"lat": 34.05, "lon": -83.88},
+                },
+                "cannot carry a location",
             ),
             (
                 {"text": "hello", "send_in": 60, "image": 42},
