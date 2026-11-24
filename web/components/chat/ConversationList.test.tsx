@@ -17,6 +17,7 @@ function conv(overrides: Partial<Conversation> = {}): Conversation {
     unread: 0,
     muted: false,
     archived: false,
+    ignored: false,
     pinned: false,
     ...overrides,
   };
@@ -27,6 +28,7 @@ describe("ConversationList", () => {
     render(
       <ConversationList
         conversations={[conv({ unread: 2 })]}
+        ignoredGroups={[]}
         archived={[]}
         dmRequests={[]}
         onSelect={() => undefined}
@@ -41,6 +43,7 @@ describe("ConversationList", () => {
     render(
       <ConversationList
         conversations={[conv({ unread: 4, muted: true })]}
+        ignoredGroups={[]}
         archived={[]}
         dmRequests={[]}
         onSelect={() => undefined}
@@ -55,6 +58,7 @@ describe("ConversationList", () => {
     render(
       <ConversationList
         conversations={[conv({ pinned: true }), conv({ key: "b".repeat(32), name: "Bob", pinned: false })]}
+        ignoredGroups={[]}
         archived={[]}
         dmRequests={[]}
         onSelect={() => undefined}
@@ -70,6 +74,7 @@ describe("ConversationList", () => {
     render(
       <ConversationList
         conversations={[]}
+        ignoredGroups={[]}
         archived={[]}
         dmRequests={[{ id: "req-1", sender: "ff".repeat(16), sender_name: "Stranger", text: "hi!" }]}
         onSelect={() => undefined}
@@ -87,6 +92,7 @@ describe("ConversationList", () => {
     render(
       <ConversationList
         conversations={[]}
+        ignoredGroups={[]}
         archived={[conv({ key: " archived".trim(), name: "Old Pal", archived: true })]}
         dmRequests={[]}
         onSelect={onSelect}
@@ -98,5 +104,70 @@ describe("ConversationList", () => {
     expect(screen.getByText("Old Pal")).toBeTruthy();
     fireEvent.click(screen.getByText("Old Pal"));
     expect(onSelect).toHaveBeenCalled();
+  });
+});
+
+describe("ConversationList ignored groups", () => {
+  const ignored = [
+    { id: "g".repeat(32), name: "noisy crew", openable: true },
+    { id: "h".repeat(32), name: "hhhhhhhh", openable: false },
+  ];
+
+  function renderList(props: Record<string, unknown> = {}) {
+    return render(
+      <ConversationList
+        conversations={[]}
+        ignoredGroups={ignored}
+        archived={[]}
+        dmRequests={[]}
+        onSelect={() => undefined}
+        now={1700000100}
+        {...props}
+      />,
+    );
+  }
+
+  it("hides ignored groups behind a toggle", () => {
+    renderList();
+    expect(screen.queryByText("noisy crew")).toBeNull();
+    fireEvent.click(screen.getByText("Ignored groups (2)"));
+    expect(screen.getByText("noisy crew")).toBeTruthy();
+    expect(screen.getByText("hhhhhhhh")).toBeTruthy();
+  });
+
+  it("un-ignores from the row button", () => {
+    const onUnignoreGroup = vi.fn();
+    renderList({ onUnignoreGroup });
+    fireEvent.click(screen.getByText("Ignored groups (2)"));
+    fireEvent.click(screen.getByLabelText("Un-ignore noisy crew"));
+    expect(onUnignoreGroup).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "g".repeat(32) }),
+    );
+  });
+
+  it("opens an openable ignored group on row click, but not an orphan", () => {
+    const onSelectIgnoredGroup = vi.fn();
+    renderList({ onSelectIgnoredGroup });
+    fireEvent.click(screen.getByText("Ignored groups (2)"));
+    fireEvent.click(screen.getByText("noisy crew"));
+    expect(onSelectIgnoredGroup).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "g".repeat(32) }),
+    );
+    fireEvent.click(screen.getByText("hhhhhhhh"));
+    expect(onSelectIgnoredGroup).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows no ignored section when none are ignored", () => {
+    render(
+      <ConversationList
+        conversations={[]}
+        ignoredGroups={[]}
+        archived={[]}
+        dmRequests={[]}
+        onSelect={() => undefined}
+        now={1700000100}
+      />,
+    );
+    expect(screen.queryByText(/Ignored groups/)).toBeNull();
   });
 });

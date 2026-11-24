@@ -4,7 +4,7 @@
 // shown first; verification happens only after a separate "Numbers match"
 // confirm — never automatically), block/unblock, forget, alias, note,
 // archive, mute, pin, disappearing default, mark unread/read.
-// Group: members, topic, mute, mark unread/read, leave. The creator also
+// Group: members, topic, mute, mark unread/read, leave, ignore. The creator also
 // manages the roster here (add/remove members); a roster change rotates
 // the group to a successor id, so the panel follows the new id.
 
@@ -97,6 +97,7 @@ export default function PeerPanel({
   const [error, setError] = useState<string | null>(null);
   const [confirmForget, setConfirmForget] = useState(false);
   const [confirmLeave, setConfirmLeave] = useState(false);
+  const [confirmIgnore, setConfirmIgnore] = useState(false);
   const [disappearing, setDisappearing] = useState<number | null>(null);
   const [invite, setInvite] = useState<GroupInviteStatus | null>(null);
   const [inviteBusy, setInviteBusy] = useState(false);
@@ -141,6 +142,7 @@ export default function PeerPanel({
   useEffect(() => {
     setAddPeer("");
     setConfirmRemove(null);
+    setConfirmIgnore(false);
   }, [groupId]);
 
   // The invite link is creator-managed: only fetch it for groups this
@@ -676,6 +678,18 @@ export default function PeerPanel({
             </ActionButton>
           ) : (
             <ActionButton danger onClick={() => setConfirmLeave(true)}>Leave group</ActionButton>
+          ))}
+        {isGroup &&
+          (conversation.group?.ignored ? (
+            <ActionButton disabled={busy === "unignore"} onClick={() => void run("unignore", () => actions.unignoreGroup(conversation.key))}>
+              Un-ignore group
+            </ActionButton>
+          ) : confirmIgnore ? (
+            <ActionButton danger disabled={busy === "ignore"} onClick={() => void run("ignore", () => actions.ignoreGroup(conversation.key)).then(() => setConfirmIgnore(false))}>
+              Confirm ignore group?
+            </ActionButton>
+          ) : (
+            <ActionButton danger onClick={() => setConfirmIgnore(true)}>Ignore group</ActionButton>
           ))}
       </div>
 

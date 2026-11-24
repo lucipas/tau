@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   buildConversations,
   buildTraffic,
+  mergeIgnoredGroups,
   useBeaconFeed,
   useBeacons,
   useBroadcasts,
@@ -241,6 +242,25 @@ describe("buildConversations", () => {
     expect(list[0].lastMessage).toBeNull();
   });
 
+  it("hides ignored groups by default and keeps them with includeIgnored", () => {
+    const ignoredGroup = { ...group, id: "i".repeat(32), name: "noisy", ignored: true };
+    const messages = [
+      makeMessage({ id: 3, peer: alice.destination, peer_name: "alice", sent_at: 1500, group: ignoredGroup.id, group_name: "noisy" }),
+    ];
+    const list = buildConversations(messages, [alice], [group, ignoredGroup], null);
+    expect(list.map((c) => c.key)).toEqual([group.id]);
+    const withIgnored = buildConversations(messages, [alice], [group, ignoredGroup], null, {
+      includeIgnored: true,
+    });
+    // Newest first: the ignored group carries the message, the other has none.
+    expect(withIgnored.map((c) => c.key)).toEqual([ignoredGroup.id, group.id]);
+    expect(withIgnored[0].ignored).toBe(true);
+    expect(withIgnored[1].ignored).toBe(false);
+    // A message-less ignored group is hidden too.
+    const noMessages = buildConversations([], [alice], [ignoredGroup], null);
+    expect(noMessages).toHaveLength(0);
+  });
+
   it("pinned conversations sort first, then by recency", () => {
     const messages = [
       makeMessage({ id: 1, peer: alice.destination, peer_name: "alice", sent_at: 1000 }),
@@ -266,6 +286,43 @@ describe("buildConversations", () => {
       `dm:${alice.destination}`,
     ]);
     expect(list2[0].pinned).toBe(true);
+  });
+});
+
+describe("mergeIgnoredGroups", () => {
+  const group: Group = {
+    id: "g".repeat(32),
+    name: "crew",
+    members: [],
+    created_at: 900,
+    topic: "",
+    created_by_me: true,
+    can_leave: false,
+    ignored: false,
+  };
+
+  it("takes ignored groups from the snapshot and orphans from /api/groups/left", () => {
+    const ignoredGroup = { ...group, id: "i".repeat(32), name: "noisy", ignored: true };
+    const merged = mergeIgnoredGroups([group, ignoredGroup], [
+      { id: "i".repeat(32), name: "noisy" },
+      { id: "o".repeat(32), name: "" },
+    ]);
+    expect(merged).toEqual([
+      { id: "i".repeat(32), name: "noisy", openable: true },
+      { id: "o".repeat(32), name: "oooooooo", openable: false },
+    ]);
+  });
+
+  it("prefers the snapshot name over the left endpoint's", () => {
+    const merged = mergeIgnoredGroups(
+      [{ ...group, ignored: true }],
+      [{ id: group.id, name: "stale name" }],
+    );
+    expect(merged).toEqual([{ id: group.id, name: "crew", openable: true }]);
+  });
+
+  it("is empty when nothing is ignored", () => {
+    expect(mergeIgnoredGroups([group], [])).toEqual([]);
   });
 });
 
