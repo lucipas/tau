@@ -16025,8 +16025,7 @@ def cmd_backup_verify(args: argparse.Namespace) -> int:
         print(f"node:        {payload['node']}")
         print(f"destination: {payload['destination']}")
         print(f"files:       {len(payload['files'])}")
-        if payload["encrypted"]:
-            print("encrypted:   yes")
+        print(f"encrypted:   {'yes' if payload['encrypted'] else 'no'}")
         print("valid:       yes — this backup would restore")
     return _EXIT_OK
 

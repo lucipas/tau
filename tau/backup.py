@@ -1317,7 +1317,7 @@ def verify_backup(
     source: Path,
     *,
     passphrase: Optional[str] = None,
-) -> Tuple[Dict[str, object], List[str]]:
+) -> Tuple[Dict[str, object], List[str], str]:
     """Check the backup at *source* would restore, without restoring it.
 
     Runs every check :func:`restore_backup` runs before installing

@@ -1675,6 +1675,12 @@ def test_backup_verify_via_cli(tmp_path, capsys):
     assert payload["encrypted"] is False
     assert payload["backup"] == str(archive)
     assert "identity" in payload["files"]
+    # The text summary reports the encryption status either way, so a
+    # plaintext archive is not mistaken for an unchecked one.
+    assert cli.main(["backup-verify", str(archive)]) == 0
+    text = capsys.readouterr().out
+    assert "encrypted:   no" in text
+    assert "valid:       yes" in text
 
 
 def test_backup_verify_rejects_missing_archive(tmp_path):
