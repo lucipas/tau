@@ -228,17 +228,52 @@ def _encode_v1_invite_link(token: Dict[str, Any]) -> str:
     )
 
 
+# The sealed plaintext is padded to this fixed size before encryption,
+# so the sealed blob's length does not reveal the group name's length.
+# Worst-case inner JSON (a 48-character UTF-8 name plus the signature)
+# is well under the bucket; a 2-byte big-endian length prefix says how
+# much of it is payload, and the rest is zero padding.
+SEAL_PLAINTEXT_BYTES = 512
+_SEAL_LENGTH_PREFIX_BYTES = 2
+
+
+def _pad_sealed_plaintext(body: bytes) -> bytes:
+    capacity = SEAL_PLAINTEXT_BYTES - _SEAL_LENGTH_PREFIX_BYTES
+    if len(body) > capacity:
+        raise InviteError("invite token is too large to seal")
+    return (
+        len(body).to_bytes(_SEAL_LENGTH_PREFIX_BYTES, "big")
+        + body
+        + b"\0" * (capacity - len(body))
+    )
+
+
+def _unpad_sealed_plaintext(padded: bytes) -> bytes:
+    """The payload of a padded sealed plaintext, or an error."""
+    if len(padded) != SEAL_PLAINTEXT_BYTES:
+        raise InviteError("invite is not valid for this group")
+    length = int.from_bytes(padded[:_SEAL_LENGTH_PREFIX_BYTES], "big")
+    capacity = SEAL_PLAINTEXT_BYTES - _SEAL_LENGTH_PREFIX_BYTES
+    if length > capacity:
+        raise InviteError("invite is not valid for this group")
+    body = padded[_SEAL_LENGTH_PREFIX_BYTES : _SEAL_LENGTH_PREFIX_BYTES + length]
+    if padded[_SEAL_LENGTH_PREFIX_BYTES + length :].strip(b"\0"):
+        raise InviteError("invite is not valid for this group")
+    return body
+
+
 def _seal_invite_token(identity: RNS.Identity, token: Dict[str, Any]) -> str:
     """Seal a signed token to the creator's own identity (v2 link).
 
-    The signed payload is encrypted with the creator's identity, so
-    the link carries only the creator hash — the routing info a
-    joiner needs to address the join-request DM — plus an opaque
-    sealed blob.  No group field of any kind appears in the clear:
-    the link is ~700 characters, well inside the DM text budget,
-    and a fresh mint seals with a fresh ephemeral key each time.
+    The signed payload is padded to a fixed size and encrypted with
+    the creator's identity, so the link carries only the creator
+    hash — the routing info a joiner needs to address the join-request
+    DM — plus an opaque sealed blob of constant length.  No group
+    field of any kind appears in the clear, and the link length does
+    not depend on the group name; a fresh mint seals with a fresh
+    ephemeral key each time.
     """
-    sealed = identity.encrypt(encode(token))
+    sealed = identity.encrypt(_pad_sealed_plaintext(encode(token)))
     if not sealed:  # pragma: no cover - RNS encrypt failure
         raise InviteError("creator identity cannot seal the invite")
     outer: Dict[str, Any] = {
@@ -419,7 +454,7 @@ def _unseal_invite_token(
     if not plaintext:
         raise InviteError("invite is not valid for this group")
     try:
-        inner = decode(plaintext)
+        inner = decode(_unpad_sealed_plaintext(plaintext))
     except Exception as exc:
         raise InviteError("invite is not valid for this group") from exc
     try:
