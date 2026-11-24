@@ -842,6 +842,194 @@ def test_devices_redeem_retry_refused_when_inbox_full(tmp_path, capsys):
     assert payload["history"]["imported"] >= 1
 
 
+def test_devices_redeem_retry_refused_when_only_missing_record_retracted(
+    tmp_path, capsys
+):
+    # Retraction variant of the capacity gap in #740: a missing
+    # snapshot record its sender retracted is skipped by the import,
+    # so it must not keep the bundle retryable either — each replay
+    # would "succeed" without importing it (see #742).
+    node_a = _init_node(tmp_path, "a", "alice")
+    _seed_history(node_a)
+    capsys.readouterr()
+
+    bundle_path = tmp_path / "pairing.json"
+    assert (
+        cli.main(
+            [
+                "devices",
+                "pair",
+                "--to",
+                str(bundle_path),
+                "--data-dir",
+                str(node_a),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    node_b = tmp_path / "b"
+    assert (
+        cli.main(
+            [
+                "devices",
+                "redeem",
+                "--from",
+                str(bundle_path),
+                "--data-dir",
+                str(node_b),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["history"]["imported"] == 3
+
+    # Lose one snapshot record to a retract: the sender retracted it
+    # after the bundle was minted, so the import would skip it — the
+    # bundle is spent, not retryable.
+    inbox_b = Inbox(node_b / "inbox.json")
+    inbox_b.delete("msg-1")
+    Mailbox(node_b / "mailbox.json").record_retraction("a" * 32, "msg-1")
+
+    code = cli.main(
+        ["devices", "redeem", "--from", str(bundle_path), "--data-dir", str(node_b)]
+    )
+    assert code == 1
+    assert "already redeemed" in capsys.readouterr().err
+
+
+def test_devices_redeem_retry_refused_when_only_missing_group_record_retracted(
+    tmp_path, capsys
+):
+    # Same gate, group leg: a missing group record covered by a live
+    # group-retraction marker (sender, group, send time) must not
+    # keep the bundle retryable either (see #742).
+    node_a = _init_node(tmp_path, "a", "alice")
+    _seed_history(node_a)
+    capsys.readouterr()
+
+    bundle_path = tmp_path / "pairing.json"
+    assert (
+        cli.main(
+            [
+                "devices",
+                "pair",
+                "--to",
+                str(bundle_path),
+                "--data-dir",
+                str(node_a),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    node_b = tmp_path / "b"
+    assert (
+        cli.main(
+            [
+                "devices",
+                "redeem",
+                "--from",
+                str(bundle_path),
+                "--data-dir",
+                str(node_b),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["history"]["imported"] == 3
+
+    inbox_b = Inbox(node_b / "inbox.json")
+    inbox_b.delete("msg-3")
+    Mailbox(node_b / "mailbox.json").record_group_retraction(
+        "c" * 32, "d" * 32, 1004.0
+    )
+
+    code = cli.main(
+        ["devices", "redeem", "--from", str(bundle_path), "--data-dir", str(node_b)]
+    )
+    assert code == 1
+    assert "already redeemed" in capsys.readouterr().err
+
+
+def test_devices_redeem_retry_allowed_when_retraction_is_for_another_sender(
+    tmp_path, capsys
+):
+    # A retraction marker names its sender: one recorded for another
+    # peer must not close the gate for a record that peer never sent
+    # (see #742).  The missing record re-imports on retry.
+    node_a = _init_node(tmp_path, "a", "alice")
+    _seed_history(node_a)
+    capsys.readouterr()
+
+    bundle_path = tmp_path / "pairing.json"
+    assert (
+        cli.main(
+            [
+                "devices",
+                "pair",
+                "--to",
+                str(bundle_path),
+                "--data-dir",
+                str(node_a),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    node_b = tmp_path / "b"
+    assert (
+        cli.main(
+            [
+                "devices",
+                "redeem",
+                "--from",
+                str(bundle_path),
+                "--data-dir",
+                str(node_b),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["history"]["imported"] == 3
+
+    inbox_b = Inbox(node_b / "inbox.json")
+    inbox_b.delete("msg-1")
+    Mailbox(node_b / "mailbox.json").record_retraction("f" * 32, "msg-1")
+
+    code = cli.main(
+        [
+            "devices",
+            "redeem",
+            "--from",
+            str(bundle_path),
+            "--data-dir",
+            str(node_b),
+            "--json",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["history"] == {
+        "imported": 1,
+        "present": 2,
+        "skipped": 0,
+        "errors": [],
+    }
+
+
 def test_devices_pair_redeem_skips_retracted_history(tmp_path, capsys):
     # A message the sender retracted after the bundle was minted must
     # not be resurrected by the stale snapshot: the redeem passes this

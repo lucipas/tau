@@ -14236,6 +14236,39 @@ def _recover_stranded_pairing(
     return True
 
 
+def _snapshot_record_retracted(mailbox: Mailbox, record: Dict[str, Any]) -> bool:
+    """True when the history import would skip *record* as retracted.
+
+    Mirrors the retraction test in
+    :meth:`tau.inbox.Inbox.import_messages` exactly: inbound records
+    only — a sent record names the recipient, not the sender, so it
+    cannot match a marker — file records are never retractable, a DM
+    marker by (destination, id), and, for a group record, a group
+    marker by (destination, group, sent_at) as well.
+    """
+    if record.get("direction") != "in":
+        return False
+    destination = record.get("destination")
+    message_id = record.get("id")
+    if not isinstance(destination, str) or not isinstance(message_id, str):
+        return False
+    if record.get("kind") == "file":
+        return False
+    if mailbox.is_retracted(destination, message_id):
+        return True
+    if record.get("kind") != "group":
+        return False
+    group = record.get("group")
+    sent_at = record.get("sent_at")
+    if (
+        isinstance(group, str)
+        and isinstance(sent_at, (int, float))
+        and not isinstance(sent_at, bool)
+    ):
+        return mailbox.is_group_retracted(destination, group, sent_at)
+    return False
+
+
 def _history_retry_allowed(
     config: TauConfig,
     registry: DeviceRegistry,
@@ -14250,7 +14283,8 @@ def _history_retry_allowed(
     inbox was pruned since).  A plain replay of that bundle must still
     fail as \"already redeemed\", so a retry qualifies only when the
     pairing is recorded for this bundle, the installed identity is the
-    bundle's, and at least one snapshot record is not yet in the inbox.
+    bundle's, and at least one snapshot record is not yet in the inbox
+    and could actually be imported.
     Records are matched the way the import dedupes them, so a retry
     whose import would only count records as present does not qualify.
     """
@@ -14291,17 +14325,35 @@ def _history_retry_allowed(
     # retention cap skips the record, so a full inbox would otherwise
     # keep the bundle replayable forever, each replay "succeeding"
     # without importing anything.  A retry stays allowed when space
-    # frees up later.
+    # frees up later.  The same holds for a record its sender
+    # retracted: the import skips it, so a missing-but-retracted
+    # record would keep the bundle retryable forever too (the
+    # retraction variant of the capacity gap, see #742).  The mailbox
+    # loads its markers lazily, so read them under its transaction,
+    # the way the history import does; a mailbox that cannot be read
+    # leaves the markers unknown, and the gate falls back to the
+    # missing-record check rather than blocking a legitimate retry.
     stored_counts: Dict[Any, int] = {}
     for item in stored:
         if isinstance(item, dict):
             direction = item.get("direction")
             stored_counts[direction] = stored_counts.get(direction, 0) + 1
+    mailbox: Optional[Mailbox] = None
+    try:
+        candidate = Mailbox(config.mailbox_path)
+        with candidate.transaction():
+            mailbox = candidate
+    except (OSError, ValueError, TimeoutError):
+        mailbox = None
     for raw in messages:
         record = _valid_record(raw)
         if record is None:
             continue
         if _dedupe_key(record) not in present:
+            if mailbox is not None and _snapshot_record_retracted(
+                mailbox, record
+            ):
+                continue
             direction = record.get("direction")
             if stored_counts.get(direction, 0) < direction_capacity(direction):
                 return True
