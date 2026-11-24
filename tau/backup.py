@@ -30,6 +30,23 @@ must declare format 1, every member must be an allowlisted regular file
 with no ``..`` segments, the archive must contain an identity, and
 expanded sizes are bounded while streaming.
 
+An encrypted backup (format 2, ``tau backup --passphrase``) wraps the
+same gzipped tar in an envelope: a magic line, one JSON header line
+(scrypt parameters, salt, IV, HMAC), then AES-256-CBC ciphertext with
+PKCS#7 padding.  The key is derived with scrypt and split into an
+encryption key and a MAC key; the HMAC covers IV + ciphertext, so a
+wrong passphrase and a tampered archive both fail before anything is
+decrypted.  The cipher is RNS's ``AES_256_CBC``, which dispatches on
+RNS's active provider (its internal pure-Python AES or PyCA), so
+encryption works on installs without the ``cryptography`` package; the
+KDF, MAC, and padding are stdlib.  Both directions stream in
+``_COPY_CHUNK`` pieces — the plaintext tar is built in a private 0700
+scratch directory, never beside the destination — and restore verifies
+the HMAC in a first pass before decrypting in a second, so no
+unauthenticated plaintext is ever written out.  Restore auto-detects
+the envelope, so a plaintext backup (format 1) restores exactly as
+before.
+
 This module must stay importable without Reticulum: only the identity
 check during restore imports :mod:`tau.identity`.
 """
@@ -37,17 +54,19 @@ check during restore imports :mod:`tau.identity`.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import io
 import json
 import logging
 import os
+import shutil
 import sqlite3
 import tarfile
 import tempfile
 import zlib
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 log = logging.getLogger(__name__)
 
@@ -127,6 +146,356 @@ MAX_MANIFEST_BYTES = 1024 * 1024
 MAX_MEMBER_BYTES = 4 * 1024**3
 MAX_TOTAL_BYTES = 8 * 1024**3
 _COPY_CHUNK = 1024 * 1024
+
+# -- encrypted backups (format 2) -------------------------------------------
+# Envelope layout: magic line, one JSON header line, raw ciphertext.
+# ``{"kdf": "scrypt", "n": ..., "r": ..., "p": ..., "salt": "<hex>",
+# "iv": "<hex>", "hmac": "<hex>"}`` — the HMAC is over IV + ciphertext,
+# so the header's own fields are authenticated only through the salt/IV
+# they carry; a header naming absurd scrypt parameters is rejected
+# before any key derivation, so a hostile file cannot force a huge KDF.
+ENCRYPTED_BACKUP_MAGIC = b"TAU-BACKUP-2\n"
+ENCRYPTED_BACKUP_FORMAT_VERSION = 2
+_BACKUP_KDF_N = 32768
+_BACKUP_KDF_R = 8
+_BACKUP_KDF_P = 1
+_BACKUP_KDF_MAX_N = 2**20
+_BACKUP_KDF_MAX_R = 64
+_BACKUP_KDF_MAX_P = 64
+_BACKUP_SALT_BYTES = 16
+_BACKUP_IV_BYTES = 16
+_BACKUP_KEY_BYTES = 32
+MIN_BACKUP_PASSPHRASE_LENGTH = 8
+# A gzipped tar that expands to MAX_TOTAL_BYTES is at most that large
+# plus gzip overhead, so an encrypted file past this size can never
+# restore — refuse it before streaming it twice (HMAC pass, decrypt pass).
+_MAX_ENCRYPTED_BYTES = MAX_TOTAL_BYTES + 64 * 1024 * 1024
+
+
+def _clean_passphrase(passphrase: object) -> str:
+    """Validate a backup passphrase: a string of at least 8 characters.
+
+    The passphrase is never stripped: leading or trailing spaces are
+    part of it, so a prompt and a file holding the same characters
+    agree exactly.
+    """
+    if not isinstance(passphrase, str) or not passphrase:
+        raise BackupError("backup passphrase must not be empty")
+    if len(passphrase) < MIN_BACKUP_PASSPHRASE_LENGTH:
+        raise BackupError(
+            "backup passphrase must be at least "
+            f"{MIN_BACKUP_PASSPHRASE_LENGTH} characters"
+        )
+    return passphrase
+
+
+def _derive_backup_keys(
+    passphrase: str,
+    salt: bytes,
+    *,
+    n: int = _BACKUP_KDF_N,
+    r: int = _BACKUP_KDF_R,
+    p: int = _BACKUP_KDF_P,
+) -> Tuple[bytes, bytes]:
+    """Split a 64-byte scrypt output into encryption and MAC keys.
+
+    ``maxmem`` is named explicitly: n=32768, r=8 needs 32 MiB, and
+    OpenSSL's default cap is exactly 32 MiB.
+    """
+    try:
+        derived = hashlib.scrypt(
+            passphrase.encode("utf-8"),
+            salt=salt,
+            n=n,
+            r=r,
+            p=p,
+            dklen=2 * _BACKUP_KEY_BYTES,
+            maxmem=64 * 1024 * 1024,
+        )
+    except ValueError as exc:
+        # Parameters needing more than the 64 MiB budget — a hostile
+        # header can name large ones, within the bounds below.
+        raise BackupError("not a valid encrypted tau backup") from exc
+    return derived[:_BACKUP_KEY_BYTES], derived[_BACKUP_KEY_BYTES:]
+
+
+def _pkcs7_pad(data: bytes) -> bytes:
+    pad = 16 - len(data) % 16
+    return data + bytes([pad]) * pad
+
+
+def _pkcs7_unpad(data: bytes) -> bytes:
+    if not data or len(data) % 16:
+        raise BackupError("wrong passphrase or the backup is corrupt")
+    pad = data[-1]
+    if pad < 1 or pad > 16 or data[-pad:] != bytes([pad]) * pad:
+        raise BackupError("wrong passphrase or the backup is corrupt")
+    return data[:-pad]
+
+
+def _aes_encrypt(data: bytes, key: bytes, iv: bytes) -> bytes:
+    """AES-256-CBC encrypt one block-aligned *data* (lazy RNS import).
+
+    ``AES_256_CBC`` dispatches on RNS's active provider — its internal
+    pure-Python AES or PyCA — so this works on installs without the
+    ``cryptography`` package.  CBC chaining across calls is the
+    caller's job: pass the last ciphertext block as the next *iv*.
+    """
+    try:
+        from RNS.Cryptography.AES import AES_256_CBC
+    except ImportError as exc:
+        raise BackupError(
+            "encrypted backups need RNS with AES support; "
+            "this Reticulum install has none"
+        ) from exc
+    try:
+        return AES_256_CBC.encrypt(data, key, iv)
+    except ValueError as exc:
+        raise BackupError("wrong passphrase or the backup is corrupt") from exc
+
+
+def _aes_decrypt(data: bytes, key: bytes, iv: bytes) -> bytes:
+    """AES-256-CBC decrypt one block-aligned *data* (see :func:`_aes_encrypt`)."""
+    try:
+        from RNS.Cryptography.AES import AES_256_CBC
+    except ImportError as exc:
+        raise BackupError(
+            "encrypted backups need RNS with AES support; "
+            "this Reticulum install has none"
+        ) from exc
+    try:
+        return AES_256_CBC.decrypt(data, key, iv)
+    except ValueError as exc:
+        raise BackupError("wrong passphrase or the backup is corrupt") from exc
+
+
+# A header line is ~200 bytes; anything past this is not a header.
+_MAX_ENCRYPTED_HEADER_BYTES = 4096
+
+
+def _validate_encrypted_header(
+    header: object,
+) -> Tuple[int, int, int, bytes, bytes, bytes]:
+    """Return ``(n, r, p, salt, iv, tag)`` for a parsed header dict.
+
+    The KDF fields must be real integers — JSON numbers like ``1e999``
+    parse to floats (``int(float('inf'))`` raises ``OverflowError``)
+    and booleans are ints too, so both are rejected here, before any
+    key derivation.  A header naming absurd scrypt parameters is
+    rejected before derivation as well.
+    """
+    if not isinstance(header, dict):
+        raise BackupError("not a valid encrypted tau backup")
+    if header.get("format") != ENCRYPTED_BACKUP_FORMAT_VERSION:
+        raise BackupError(
+            "unsupported encrypted backup format "
+            f"{header.get('format')!r} (expected {ENCRYPTED_BACKUP_FORMAT_VERSION})"
+        )
+    if header.get("kdf") != "scrypt":
+        raise BackupError(
+            f"unsupported backup key derivation {header.get('kdf')!r}"
+        )
+    for field in ("n", "r", "p"):
+        value = header.get(field)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise BackupError("not a valid encrypted tau backup")
+    try:
+        salt = bytes.fromhex(header["salt"])
+        iv = bytes.fromhex(header["iv"])
+        tag = bytes.fromhex(header["hmac"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise BackupError("not a valid encrypted tau backup") from exc
+    n = header["n"]
+    r = header["r"]
+    p = header["p"]
+    if (
+        n < 1
+        or n > _BACKUP_KDF_MAX_N
+        or r < 1
+        or r > _BACKUP_KDF_MAX_R
+        or p < 1
+        or p > _BACKUP_KDF_MAX_P
+        or len(salt) != _BACKUP_SALT_BYTES
+        or len(iv) != _BACKUP_IV_BYTES
+        or len(tag) != hashlib.sha256().digest_size
+    ):
+        raise BackupError("not a valid encrypted tau backup")
+    return n, r, p, salt, iv, tag
+
+
+def _read_encrypted_header(
+    handle: Any,
+) -> Tuple[Tuple[int, int, int, bytes, bytes, bytes], int]:
+    """Read the magic + header line from *handle* at offset 0.
+
+    Returns ``(fields, ciphertext_offset)`` — the validated
+    ``(n, r, p, salt, iv, tag)`` tuple and the byte offset where the
+    ciphertext starts.
+    """
+    magic = handle.read(len(ENCRYPTED_BACKUP_MAGIC))
+    if magic != ENCRYPTED_BACKUP_MAGIC:
+        raise BackupError("not an encrypted tau backup")
+    line = handle.readline(_MAX_ENCRYPTED_HEADER_BYTES + 1)
+    if not line.endswith(b"\n") or len(line) > _MAX_ENCRYPTED_HEADER_BYTES:
+        raise BackupError("not a valid encrypted tau backup")
+    try:
+        header = json.loads(line)
+    except ValueError as exc:
+        raise BackupError("not a valid encrypted tau backup") from exc
+    fields = _validate_encrypted_header(header)
+    return fields, len(ENCRYPTED_BACKUP_MAGIC) + len(line)
+
+
+def _encrypt_backup_stream(src: Any, dst: Any, passphrase: str) -> Dict[str, object]:
+    """Encrypt *src* to *dst* in ``_COPY_CHUNK`` pieces; return the header.
+
+    Only chunk-sized buffers are held: the plaintext is never loaded
+    whole.  The HMAC covers the IV plus each ciphertext chunk as it is
+    written, and the returned header (with the HMAC) is what the caller
+    writes ahead of the ciphertext.
+    """
+    passphrase = _clean_passphrase(passphrase)
+    salt = os.urandom(_BACKUP_SALT_BYTES)
+    iv = os.urandom(_BACKUP_IV_BYTES)
+    enc_key, mac_key = _derive_backup_keys(passphrase, salt)
+    mac = hmac.new(mac_key, iv, hashlib.sha256)
+    previous = iv
+    pending = b""
+    while True:
+        chunk = src.read(_COPY_CHUNK)
+        if chunk:
+            pending += chunk
+            # Encrypt all complete blocks except the last one, so the
+            # final chunk always has room for its padding.
+            cut = (len(pending) - 16) // 16 * 16
+            if cut > 0:
+                ciphertext = _aes_encrypt(pending[:cut], enc_key, previous)
+                previous = ciphertext[-16:]
+                dst.write(ciphertext)
+                mac.update(ciphertext)
+                pending = pending[cut:]
+        else:
+            ciphertext = _aes_encrypt(_pkcs7_pad(pending), enc_key, previous)
+            dst.write(ciphertext)
+            mac.update(ciphertext)
+            break
+    return {
+        "format": ENCRYPTED_BACKUP_FORMAT_VERSION,
+        "kdf": "scrypt",
+        "n": _BACKUP_KDF_N,
+        "r": _BACKUP_KDF_R,
+        "p": _BACKUP_KDF_P,
+        "salt": salt.hex(),
+        "iv": iv.hex(),
+        "hmac": mac.hexdigest(),
+    }
+
+
+def _decrypt_backup_stream(
+    src: Any,
+    dst: Any,
+    passphrase: str,
+    fields: Tuple[int, int, int, bytes, bytes, bytes],
+    ciphertext_offset: int,
+) -> None:
+    """Verify the HMAC, then decrypt *src* to *dst* (both chunked).
+
+    Two passes over the ciphertext: the first authenticates it, the
+    second decrypts it, so no unauthenticated plaintext is ever
+    written out.  *src* must be seekable and positioned at the
+    ciphertext start for the first pass.
+    """
+    n, r, p, salt, iv, tag = fields
+    passphrase = _clean_passphrase(passphrase)
+    enc_key, mac_key = _derive_backup_keys(passphrase, salt, n=n, r=r, p=p)
+    mac = hmac.new(mac_key, iv, hashlib.sha256)
+    while True:
+        chunk = src.read(_COPY_CHUNK)
+        if not chunk:
+            break
+        mac.update(chunk)
+    if not hmac.compare_digest(mac.digest(), tag):
+        raise BackupError("wrong passphrase or the backup is corrupt")
+    src.seek(ciphertext_offset)
+    previous = iv
+    pending = b""
+    while True:
+        chunk = src.read(_COPY_CHUNK)
+        if not chunk:
+            break
+        if len(chunk) % 16:
+            raise BackupError("wrong passphrase or the backup is corrupt")
+        plaintext = _aes_decrypt(chunk, enc_key, previous)
+        previous = chunk[-16:]
+        pending += plaintext
+        # Hold the final block back so its padding is stripped, not written.
+        dst.write(pending[:-16])
+        pending = pending[-16:]
+    dst.write(_pkcs7_unpad(pending))
+
+
+def _encrypt_backup_file(
+    source: Path, target: Path, passphrase: str
+) -> Dict[str, object]:
+    """Stream-encrypt the file at *source* to *target*; return the header."""
+    with open(source, "rb") as src, open(target, "wb") as dst:
+        return _encrypt_backup_stream(src, dst, passphrase)
+
+
+def _decrypt_backup_file(source: Path, target: Path, passphrase: str) -> None:
+    """Stream-decrypt the envelope at *source* to *target*.
+
+    Raises :class:`BackupError` on a wrong passphrase, a tampered
+    archive, or a malformed envelope — and writes nothing to *target*
+    in that case beyond an empty or partial file the caller discards.
+    """
+    with open(source, "rb") as src:
+        fields, offset = _read_encrypted_header(src)
+        with open(target, "wb") as dst:
+            _decrypt_backup_stream(src, dst, passphrase, fields, offset)
+
+
+def encrypt_backup_archive(plaintext: bytes, passphrase: str) -> bytes:
+    """Wrap a gzipped-tar *plaintext* in the encrypted-backup envelope.
+
+    Holds the archive in memory — for real backups use the streaming
+    file helpers through :func:`create_backup` instead.
+    """
+    src = io.BytesIO(plaintext)
+    dst = io.BytesIO()
+    header = _encrypt_backup_stream(src, dst, passphrase)
+    return (
+        ENCRYPTED_BACKUP_MAGIC
+        + (json.dumps(header, sort_keys=True) + "\n").encode("utf-8")
+        + dst.getvalue()
+    )
+
+
+def decrypt_backup_archive(data: bytes, passphrase: str) -> bytes:
+    """Unwrap an encrypted-backup envelope; raises :class:`BackupError`.
+
+    A wrong passphrase and a tampered archive fail alike, and both fail
+    before any plaintext is returned — the HMAC is verified before the
+    ciphertext is decrypted.  Holds the archive in memory; for real
+    backups use the streaming file helpers through :func:`restore_backup`
+    instead.
+    """
+    src = io.BytesIO(data)
+    fields, offset = _read_encrypted_header(src)
+    dst = io.BytesIO()
+    _decrypt_backup_stream(src, dst, passphrase, fields, offset)
+    return dst.getvalue()
+
+
+def is_encrypted_backup(path: Path) -> bool:
+    """True when *path* starts with the encrypted-backup magic line."""
+    try:
+        with open(Path(path).expanduser(), "rb") as handle:
+            return handle.read(len(ENCRYPTED_BACKUP_MAGIC)) == (
+                ENCRYPTED_BACKUP_MAGIC
+            )
+    except OSError:
+        return False
 
 # Exceptions raised by tarfile/gzip/zlib while reading a damaged archive.
 _READ_ERRORS = (tarfile.TarError, EOFError, zlib.error, OSError)
@@ -346,7 +715,12 @@ def _snapshot_sqlite(source: Path, dest: Path) -> Path:
 
 
 def create_backup(
-    config: TauConfig, target: Path, *, force: bool = False, live: bool = False
+    config: TauConfig,
+    target: Path,
+    *,
+    force: bool = False,
+    live: bool = False,
+    passphrase: Optional[str] = None,
 ) -> Tuple[Path, Dict[str, object]]:
     """Write a backup of *config*'s data directory to *target*.
 
@@ -362,6 +736,14 @@ def create_backup(
     database is captured through SQLite's backup API.  Any other
     caller must leave it off, so a node that starts mid-backup cannot
     mutate the mailbox or the Tan database under the archive.
+
+    Pass ``passphrase`` to wrap the archive in the encrypted-backup
+    envelope (format 2) instead of writing the plaintext tar.  The
+    plaintext tar is then built in a private 0700 scratch directory —
+    never beside the destination, where a sync client could copy it —
+    and streamed through the encryptor into a fresh destination-side
+    temp file, which is renamed onto *target* atomically.  Only
+    chunk-sized buffers are held in memory either way.
     """
     target = Path(target).expanduser()
     if target.is_dir():
@@ -379,6 +761,10 @@ def create_backup(
         raise BackupError(
             f"no identity at {config.identity_path}; run `tau init` first"
         )
+    if passphrase is not None:
+        # Validate before any work — a short passphrase must fail
+        # here, not after the whole archive has been built.
+        _clean_passphrase(passphrase)
 
     destinations = _destinations(config)
 
@@ -459,11 +845,25 @@ def create_backup(
             # A missing parent is created private (0o700); an existing one is
             # left untouched, matching `tau id export`.
             ensure_dir(parent, restrict_existing=False)
-            fd, tmp_name = tempfile.mkstemp(
-                dir=str(parent), prefix=f".{target.name}.", suffix=".tmp"
-            )
+            enc_scratch = None
+            tmp_name = None
+            if passphrase is not None:
+                # The plaintext tar never sits beside the destination:
+                # build it in a private 0700 scratch directory and
+                # encrypt from there into a fresh destination-side temp
+                # file.  A sync client watching the destination folder
+                # can never see the plaintext, and an interruption
+                # leaves no named plaintext archive behind.
+                enc_scratch = tempfile.TemporaryDirectory(prefix="tau-backup-")
+                plain_path = Path(enc_scratch.name) / "backup.tar.gz"
+                tar_handle = open(plain_path, "wb")
+            else:
+                fd, tmp_name = tempfile.mkstemp(
+                    dir=str(parent), prefix=f".{target.name}.", suffix=".tmp"
+                )
+                tar_handle = os.fdopen(fd, "wb")
             try:
-                with os.fdopen(fd, "wb") as handle:
+                with tar_handle as handle:
                     with tarfile.open(fileobj=handle, mode="w:gz") as archive:
                         info = tarfile.TarInfo(MANIFEST_NAME)
                         info.size = len(manifest_bytes)
@@ -521,14 +921,47 @@ def create_backup(
                                     archive.addfile(info, handle_in)
                     handle.flush()
                     os.fsync(handle.fileno())
+                if passphrase is not None:
+                    cipher_path = Path(enc_scratch.name) / "backup.tar.gz.enc"
+                    header = _encrypt_backup_file(
+                        plain_path, cipher_path, passphrase
+                    )
+                    fd, tmp_name = tempfile.mkstemp(
+                        dir=str(parent), prefix=f".{target.name}.", suffix=".tmp"
+                    )
+                    try:
+                        # Written through the retained descriptor, never
+                        # by reopening the pathname: another process
+                        # cannot swap the destination under the write.
+                        with os.fdopen(fd, "wb") as handle:
+                            handle.write(ENCRYPTED_BACKUP_MAGIC)
+                            handle.write(
+                                (json.dumps(header, sort_keys=True) + "\n").encode(
+                                    "utf-8"
+                                )
+                            )
+                            with open(cipher_path, "rb") as cipher:
+                                shutil.copyfileobj(cipher, handle, _COPY_CHUNK)
+                            handle.flush()
+                            os.fsync(handle.fileno())
+                    except BaseException:
+                        try:
+                            os.unlink(tmp_name)
+                        except OSError:
+                            pass
+                        raise
                 os.chmod(tmp_name, 0o600)
                 os.replace(tmp_name, target)
             except BaseException:
-                try:
-                    os.unlink(tmp_name)
-                except OSError:
-                    pass
+                if tmp_name is not None:
+                    try:
+                        os.unlink(tmp_name)
+                    except OSError:
+                        pass
                 raise
+            finally:
+                if enc_scratch is not None:
+                    enc_scratch.cleanup()
     finally:
         if not live:
             lock.release()
@@ -860,7 +1293,11 @@ def _install(staged: Dict[Path, Path], removals: List[Path]) -> None:
 
 
 def restore_backup(
-    config: TauConfig, source: Path, *, force: bool = False
+    config: TauConfig,
+    source: Path,
+    *,
+    force: bool = False,
+    passphrase: Optional[str] = None,
 ) -> Tuple[Dict[str, object], List[str]]:
     """Restore the backup at *source* into *config*'s data directory.
 
@@ -872,6 +1309,11 @@ def restore_backup(
     replaced.  With ``--force``, node state absent from the archive
     (including SQLite sidecars) is removed, so the result reflects only
     the backup.
+
+    An encrypted backup (format 2) is detected by its magic line and
+    streamed through the decryptor into a private scratch file before
+    the tar is opened — chunk by chunk, never held whole in memory;
+    *passphrase* is required for one and ignored for a plaintext backup.
     """
     # Identity locking is the only RNS-dependent helper the restore needs.
     from .identity import _identity_lock
@@ -880,82 +1322,118 @@ def restore_backup(
     if not source.is_file():
         raise BackupError(f"no backup at {source}")
 
+    # The decrypted plaintext lives in a private scratch directory for
+    # exactly as long as the archive is open; a failed or interrupted
+    # restore removes it with the directory.
+    dec_scratch = None
     try:
-        archive = tarfile.open(source, mode="r:gz")
-    except (tarfile.TarError, OSError) as exc:
-        raise BackupError(f"not a valid tau backup: {exc}") from exc
-    with archive:
-        try:
-            manifest = _read_manifest(archive)
-            files = _check_members(archive, manifest)
-        except _READ_ERRORS as exc:
-            raise BackupError(f"not a valid tau backup: {exc}") from exc
-        destinations = _destinations(
-            config,
-            [name for name in files if _is_received_file_member(name)],
-            [name for name in files if _is_scheduled_file_member(name)],
-        )
-        state = _state_paths(destinations)
-        # Create the data directory before taking the lock: the lock
-        # file lives inside it, so acquiring first would fail on a
-        # fresh directory.
-        config.prepare()
-        # Hold the instance lock across the whole restore: a node that
-        # starts after the probe but before the write would load the old
-        # state and then serve with different state than the one on disk.
-        # The identity-creation lock serialises the move-in against a
-        # concurrent `tau init` on the same directory; lock order
-        # (instance, then identity) matches `TauNode.start`.
-        lock = InstanceLock(config.instance_lock_path, config.data_dir)
-        lock.acquire()
-        try:
-            _check_received_dirs(
-                config, [name for name in files if _is_received_file_member(name)]
-            )
-            _check_scheduled_files_dirs(
+        if is_encrypted_backup(source):
+            if passphrase is None:
+                raise BackupError(
+                    "this backup is encrypted; pass its passphrase with "
+                    "--passphrase or --passphrase-file"
+                )
+            try:
+                size = source.stat().st_size
+            except OSError as exc:
+                raise BackupError(f"not a valid tau backup: {exc}") from exc
+            if size > _MAX_ENCRYPTED_BYTES:
+                raise BackupError(
+                    "not a valid tau backup: encrypted backup is too large"
+                )
+            dec_scratch = tempfile.TemporaryDirectory(prefix="tau-backup-")
+            plain_path = Path(dec_scratch.name) / "backup.tar.gz"
+            try:
+                _decrypt_backup_file(source, plain_path, passphrase)
+            except BackupError:
+                raise
+            except OSError as exc:
+                raise BackupError(f"not a valid tau backup: {exc}") from exc
+            try:
+                archive = tarfile.open(plain_path, mode="r:gz")
+            except (tarfile.TarError, OSError) as exc:
+                raise BackupError(f"not a valid tau backup: {exc}") from exc
+        else:
+            try:
+                archive = tarfile.open(source, mode="r:gz")
+            except (tarfile.TarError, OSError) as exc:
+                raise BackupError(f"not a valid tau backup: {exc}") from exc
+        with archive:
+            try:
+                manifest = _read_manifest(archive)
+                files = _check_members(archive, manifest)
+            except _READ_ERRORS as exc:
+                raise BackupError(f"not a valid tau backup: {exc}") from exc
+            destinations = _destinations(
                 config,
+                [name for name in files if _is_received_file_member(name)],
                 [name for name in files if _is_scheduled_file_member(name)],
             )
-            # Received files on disk that the archive does not hold are
-            # stale state too: a --force restore removes them, like any
-            # other included file.  Scanned under the lock so a file a
-            # serving node saves before the lock is taken cannot survive.
-            for name in _received_files(config):
-                state.setdefault(name, config.data_dir / name)
-            # Same for staged scheduled files: a --force restore must
-            # not leave bytes behind that no restored queue entry owns.
-            for name in _scheduled_files(config):
-                state.setdefault(name, config.data_dir / name)
-            with _identity_lock(config.identity_path):
-                existing = [
-                    label for label, path in state.items() if os.path.lexists(path)
-                ]
-                if existing and not force:
-                    raise BackupError(
-                        "node state already exists in "
-                        f"{config.data_dir} ({', '.join(existing)}); "
-                        "pass --force to replace it"
-                    )
-                staged: Dict[Path, Path] = {}
-                try:
-                    _stage(archive, files, destinations, staged)
-                    _verify_scheduled_files(staged, destinations, files)
-                    if "inbox.json" in files:
-                        _rebase_inbox(
-                            staged[destinations["inbox.json"]],
-                            destinations,
-                            files,
-                        )
-                    _verify_identity(staged[destinations["identity"]])
-                    removals = [
-                        path
-                        for label, path in state.items()
-                        if label not in files and os.path.lexists(path)
+            state = _state_paths(destinations)
+            # Create the data directory before taking the lock: the lock
+            # file lives inside it, so acquiring first would fail on a
+            # fresh directory.
+            config.prepare()
+            # Hold the instance lock across the whole restore: a node that
+            # starts after the probe but before the write would load the old
+            # state and then serve with different state than the one on disk.
+            # The identity-creation lock serialises the move-in against a
+            # concurrent `tau init` on the same directory; lock order
+            # (instance, then identity) matches `TauNode.start`.
+            lock = InstanceLock(config.instance_lock_path, config.data_dir)
+            lock.acquire()
+            try:
+                _check_received_dirs(
+                    config, [name for name in files if _is_received_file_member(name)]
+                )
+                _check_scheduled_files_dirs(
+                    config,
+                    [name for name in files if _is_scheduled_file_member(name)],
+                )
+                # Received files on disk that the archive does not hold are
+                # stale state too: a --force restore removes them, like any
+                # other included file.  Scanned under the lock so a file a
+                # serving node saves before the lock is taken cannot survive.
+                for name in _received_files(config):
+                    state.setdefault(name, config.data_dir / name)
+                # Same for staged scheduled files: a --force restore must
+                # not leave bytes behind that no restored queue entry owns.
+                for name in _scheduled_files(config):
+                    state.setdefault(name, config.data_dir / name)
+                with _identity_lock(config.identity_path):
+                    existing = [
+                        label for label, path in state.items() if os.path.lexists(path)
                     ]
-                    _install(staged, removals)
-                finally:
-                    for temp in staged.values():
-                        _unlink_quietly(temp)
-        finally:
-            lock.release()
-    return manifest, files
+                    if existing and not force:
+                        raise BackupError(
+                            "node state already exists in "
+                            f"{config.data_dir} ({', '.join(existing)}); "
+                            "pass --force to replace it"
+                        )
+                    staged: Dict[Path, Path] = {}
+                    try:
+                        _stage(archive, files, destinations, staged)
+                        _verify_scheduled_files(staged, destinations, files)
+                        if "inbox.json" in files:
+                            _rebase_inbox(
+                                staged[destinations["inbox.json"]],
+                                destinations,
+                                files,
+                            )
+                        _verify_identity(staged[destinations["identity"]])
+                        removals = [
+                            path
+                            for label, path in state.items()
+                            if label not in files and os.path.lexists(path)
+                        ]
+                        _install(staged, removals)
+                    finally:
+                        for temp in staged.values():
+                            _unlink_quietly(temp)
+            finally:
+                lock.release()
+        return manifest, files
+    finally:
+        if dec_scratch is not None:
+            dec_scratch.cleanup()
+

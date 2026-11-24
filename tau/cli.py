@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import hashlib
 import json
 import logging
@@ -45,7 +46,9 @@ from .away import (
     load_away,
     save_away,
 )
-from .backup import create_backup, restore_backup
+from .backup import create_backup, is_encrypted_backup, restore_backup
+from .backup import BackupError as _BackupError
+from .backup import _clean_passphrase as _validate_backup_passphrase
 from .blocklist import (
     BlockListError,
     load_blocked_set,
@@ -1847,6 +1850,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="overwrite an existing backup archive",
     )
+    backup_passphrase = backup.add_mutually_exclusive_group()
+    backup_passphrase.add_argument(
+        "--passphrase",
+        action="store_true",
+        help="encrypt the backup with a passphrase (prompted twice)",
+    )
+    backup_passphrase.add_argument(
+        "--passphrase-file",
+        type=Path,
+        metavar="FILE",
+        help="read the backup encryption passphrase from FILE",
+    )
     backup.set_defaults(func=cmd_backup)
 
     restore = subparsers.add_parser(
@@ -1864,6 +1879,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help="replace existing node state in the data directory",
+    )
+    restore_passphrase = restore.add_mutually_exclusive_group()
+    restore_passphrase.add_argument(
+        "--passphrase",
+        action="store_true",
+        help="prompt for the passphrase of an encrypted backup",
+    )
+    restore_passphrase.add_argument(
+        "--passphrase-file",
+        type=Path,
+        metavar="FILE",
+        help="read the passphrase of an encrypted backup from FILE",
     )
     restore.set_defaults(func=cmd_restore)
 
@@ -15781,10 +15808,67 @@ def _send_routes_via_running_node(config: TauConfig) -> bool:
     ) from None
 
 
+def _read_passphrase_file(path: Path) -> str:
+    """Read a backup passphrase from *path*, dropping one trailing newline.
+
+    The file usually ends with a newline from the editor that wrote it;
+    that newline is not part of the passphrase, but any other whitespace
+    is — the value must match exactly what a prompt would have read.
+    """
+    try:
+        content = Path(path).expanduser().read_text(encoding="utf-8")
+    except OSError as exc:
+        raise _BackupError(f"cannot read passphrase file {path}: {exc}") from exc
+    if content.endswith("\r\n"):
+        content = content[:-2]
+    elif content.endswith("\n"):
+        content = content[:-1]
+    return content
+
+
+def _prompt_backup_passphrase(*, confirm: bool) -> str:
+    """Prompt for a backup passphrase on the terminal, twice when confirming."""
+    try:
+        first = getpass.getpass("Backup passphrase: ")
+        if confirm:
+            second = getpass.getpass("Repeat passphrase: ")
+            if first != second:
+                raise _BackupError("passphrases do not match")
+        return first
+    except (EOFError, KeyboardInterrupt) as exc:
+        raise _BackupError(
+            "cannot prompt for a passphrase here; pass --passphrase-file"
+        ) from exc
+
+
+def _resolve_backup_passphrase(args: argparse.Namespace, *, confirm: bool) -> Optional[str]:
+    """Passphrase from --passphrase / --passphrase-file, or None.
+
+    A restore only prompts when the backup is actually encrypted (the
+    caller checks that first); a backup always prompts when asked.
+    The passphrase is validated here so a too-short one fails before
+    any backup work starts.
+    """
+    passphrase = None
+    if getattr(args, "passphrase", False):
+        passphrase = _prompt_backup_passphrase(confirm=confirm)
+    else:
+        passphrase_file = getattr(args, "passphrase_file", None)
+        if passphrase_file is not None:
+            passphrase = _read_passphrase_file(passphrase_file)
+    if passphrase is not None:
+        _validate_backup_passphrase(passphrase)
+    return passphrase
+
+
 def cmd_backup(args: argparse.Namespace) -> int:
     config = _make_config(args)
+    passphrase = _resolve_backup_passphrase(args, confirm=True)
     target, manifest = create_backup(
-        config, args.file, force=getattr(args, "force", False)
+        config,
+        args.file,
+        force=getattr(args, "force", False),
+        passphrase=passphrase,
     )
     identity = load_identity(config.identity_path)
     payload = {
@@ -15792,6 +15876,7 @@ def cmd_backup(args: argparse.Namespace) -> int:
         "node": manifest.get("node"),
         "destination": destination_hash(identity).hex() if identity else None,
         "files": manifest.get("files"),
+        "encrypted": passphrase is not None,
     }
     if _json_mode(args):
         _emit(payload, True)
@@ -15800,13 +15885,25 @@ def cmd_backup(args: argparse.Namespace) -> int:
         print(f"destination: {payload['destination']}")
         print(f"backup:      {payload['backup']}")
         print(f"files:       {len(payload['files'] or [])}")
+        if payload["encrypted"]:
+            print("encrypted:   yes")
     return _EXIT_OK
 
 
 def cmd_restore(args: argparse.Namespace) -> int:
     config = _make_config(args)
+    passphrase = None
+    if is_encrypted_backup(args.file):
+        passphrase = _resolve_backup_passphrase(args, confirm=False)
+        if passphrase is None:
+            # No flag given: prompt on the terminal rather than failing
+            # outright — the file is known to be encrypted at this point.
+            passphrase = _prompt_backup_passphrase(confirm=False)
     manifest, files = restore_backup(
-        config, args.file, force=getattr(args, "force", False)
+        config,
+        args.file,
+        force=getattr(args, "force", False),
+        passphrase=passphrase,
     )
     identity = load_identity(config.identity_path)
     payload = {
