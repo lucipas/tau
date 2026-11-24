@@ -14269,6 +14269,11 @@ def _snapshot_record_retracted(mailbox: Mailbox, record: Dict[str, Any]) -> bool
     return False
 
 
+# Upper bound on waiting for the mailbox lock in the history-retry gate,
+# so a stalled lock holder cannot hang a redeem replay (see #742).
+_HISTORY_RETRY_LOCK_TIMEOUT = 5.0
+
+
 def _history_retry_allowed(
     config: TauConfig,
     registry: DeviceRegistry,
@@ -14338,26 +14343,36 @@ def _history_retry_allowed(
         if isinstance(item, dict):
             direction = item.get("direction")
             stored_counts[direction] = stored_counts.get(direction, 0) + 1
-    mailbox: Optional[Mailbox] = None
-    try:
-        candidate = Mailbox(config.mailbox_path)
-        with candidate.transaction():
-            mailbox = candidate
-    except (OSError, ValueError, TimeoutError):
-        mailbox = None
+    # Find the missing, capacity-eligible records first: a replay whose
+    # history is already present needs no mailbox at all, so it never
+    # waits on the mailbox lock.
+    eligible: List[Dict[str, Any]] = []
     for raw in messages:
         record = _valid_record(raw)
         if record is None:
             continue
-        if _dedupe_key(record) not in present:
-            if mailbox is not None and _snapshot_record_retracted(
-                mailbox, record
-            ):
-                continue
-            direction = record.get("direction")
-            if stored_counts.get(direction, 0) < direction_capacity(direction):
-                return True
-    return False
+        if _dedupe_key(record) in present:
+            continue
+        direction = record.get("direction")
+        if stored_counts.get(direction, 0) < direction_capacity(direction):
+            eligible.append(record)
+    if not eligible:
+        return False
+    # The retraction markers are read and tested under one bounded
+    # mailbox transaction, so a retraction recorded by another process
+    # cannot land between the test and the decision.  If the mailbox
+    # cannot be read in time, the markers are unknown and the gate
+    # falls back to the missing-record check rather than blocking a
+    # legitimate retry.
+    try:
+        mailbox = Mailbox(config.mailbox_path)
+        with mailbox.transaction(timeout=_HISTORY_RETRY_LOCK_TIMEOUT):
+            return any(
+                not _snapshot_record_retracted(mailbox, record)
+                for record in eligible
+            )
+    except (OSError, ValueError, TimeoutError):
+        return True
 
 
 def cmd_devices_redeem(args: argparse.Namespace) -> int:
