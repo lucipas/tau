@@ -519,6 +519,18 @@ def test_registry_revoke_offer_names_redeemed_token(tmp_path):
         registry.revoke_offer("a" * 8, now=1300.0)
 
 
+def test_registry_revoke_offer_refuses_live_but_redeemed_token(tmp_path):
+    # A --force redeem on the issuing node leaves the issued record
+    # in place; revoke must report the redemption, not succeed.
+    now = time.time()
+    registry = DeviceRegistry(tmp_path / "devices.json")
+    registry.record_issued("a" * 32, now, now + 3600.0)
+    registry.record_redeemed("a" * 32, "b" * 32, now + 3600.0, now=now)
+    with pytest.raises(DevicesError, match="already redeemed"):
+        registry.revoke_offer("a" * 8, now=now + 60.0)
+    assert len(registry.issued_offers(now=now + 60.0)) == 1
+
+
 def test_registry_revoke_offer_prunes_expired_offers(tmp_path):
     # The revoke transaction applies the same housekeeping as
     # record_issued: an expired offer goes with the revoked one.

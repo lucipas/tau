@@ -710,6 +710,12 @@ class DeviceRegistry:
                     f"no outstanding pairing offer matches {ref!r}"
                 )
             revoked = dict(matches[0])
+            # A live issued record whose token was already redeemed here
+            # (e.g. a --force redeem on the issuing node) is not outstanding.
+            if any(entry["token"] == revoked["token"] for entry in self._redeemed):
+                raise DevicesError(
+                    f"pairing offer {ref!r} was already redeemed on this node"
+                )
             self._issued = [
                 entry
                 for entry in self._issued
