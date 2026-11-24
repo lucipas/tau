@@ -63,6 +63,11 @@ AUTO_BACKUP_PREFIX = "tau-backup-"
 AUTO_BACKUP_PLAIN_SUFFIX = ".tar.gz"
 AUTO_BACKUP_ENCRYPTED_SUFFIX = ".tau"
 
+# A worker that cannot start (thread exhaustion) is retried after this
+# bounded delay, not immediately: without it the mail loop would spin
+# on a zero-second wait, retrying thread creation every pass.
+START_FAILURE_RETRY_DELAY = 60.0
+
 # A backup filename carries the node name, so backups from several
 # nodes sharing one directory stay distinguishable. Only filename-safe
 # characters survive; anything else becomes a dash.
@@ -245,8 +250,33 @@ class AutoBackupScheduler:
         # failure). None until the first attempt: the schedule then
         # seeds from the newest recorded backup instead.
         self._last_attempt_at: Optional[float] = None
+        # Time the backup worker last failed to start (thread
+        # exhaustion), or None. While the retry delay after such a
+        # failure is running, the scheduler reports not-due, so the
+        # mail loop backs off instead of retrying thread creation
+        # on every pass.
+        self._last_start_failure_at: Optional[float] = None
         # True while run() is executing on the worker thread.
         self._running = False
+
+    def note_start_failure(self, now: Optional[float] = None) -> None:
+        """Record that the backup worker failed to start.
+
+        The failure does not count as a backup attempt — the schedule
+        still owes a backup, just not right now. The next attempt
+        waits out START_FAILURE_RETRY_DELAY (see due() and
+        next_due_in()) instead of retrying at once.
+        """
+        self._last_start_failure_at = time.time() if now is None else now
+
+    def _start_failure_retry_in(self, moment: float) -> float:
+        """Seconds left in the start-failure backoff, or 0 when clear."""
+        if self._last_start_failure_at is None:
+            return 0.0
+        return max(
+            0.0,
+            self._last_start_failure_at + START_FAILURE_RETRY_DELAY - moment,
+        )
 
     def _last_backup_at(self) -> Optional[float]:
         """Last time a backup completed, for scheduling purposes.
@@ -277,6 +307,8 @@ class AutoBackupScheduler:
         interval = backup_interval(self.config.data_dir)
         if interval <= 0:
             return False
+        if self._start_failure_retry_in(moment) > 0:
+            return False
         last = self._last_backup_at()
         if last is None:
             return True
@@ -296,6 +328,9 @@ class AutoBackupScheduler:
             return None
         if self._running:
             return interval
+        retry_in = self._start_failure_retry_in(moment)
+        if retry_in > 0:
+            return retry_in
         last = self._last_backup_at()
         if last is None:
             return 0.0
@@ -312,6 +347,9 @@ class AutoBackupScheduler:
         """
         moment = time.time() if now is None else now
         self._running = True
+        # The worker started, so a recorded start failure is behind
+        # us; a later failure is governed by the attempt time.
+        self._last_start_failure_at = None
         try:
             return self._take_backup(moment)
         finally:

@@ -29,7 +29,7 @@ from .allowlist import (
     load_allowlist_or_deny_all,
     save_allowlist,
 )
-from .auto_backup import AutoBackupScheduler
+from .auto_backup import START_FAILURE_RETRY_DELAY, AutoBackupScheduler
 from .beacons import (
     BEACON_DEFAULT_DURATION,
     BEACON_UPDATE_INTERVAL,
@@ -5504,6 +5504,8 @@ class TauNode:
         is already past it, so the following pass picks it up. A failed
         backup is logged and the schedule advances — see
         ``tau.auto_backup`` — so this never raises into the mail loop.
+        A worker that cannot start at all is recorded with the
+        scheduler, which backs off instead of retrying on every pass.
         """
         thread = self._auto_backup_thread
         if thread is not None and thread.is_alive():
@@ -5522,7 +5524,19 @@ class TauNode:
 
         thread = threading.Thread(target=_run, name="auto-backup", daemon=True)
         self._auto_backup_thread = thread
-        thread.start()
+        try:
+            thread.start()
+        except RuntimeError:
+            # Thread exhaustion: record the failure so the scheduler
+            # backs off for a bounded delay instead of retrying
+            # thread creation on every mail-loop pass.
+            self._auto_backup_scheduler.note_start_failure()
+            log.warning(
+                "Automatic backup worker failed to start; "
+                "retrying in %d seconds",
+                int(START_FAILURE_RETRY_DELAY),
+                exc_info=True,
+            )
 
     def _fire_due_reminders(self) -> None:
         """Re-ping the owner about snoozed messages whose time has come.
