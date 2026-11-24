@@ -23,6 +23,7 @@ from tau.backup import (
     encrypt_backup_archive,
     is_encrypted_backup,
     restore_backup,
+    verify_backup,
 )
 from tau.instance_lock import BackupError
 from tau.channels import (
@@ -1623,3 +1624,186 @@ def test_encrypted_backup_restore_tilde_path(tmp_path, capsys, monkeypatch):
         == 0
     )
     assert json.loads(capsys.readouterr().out)["destination"] == destination_a
+
+
+def test_parser_backup_verify_subcommand():
+    parser = cli.build_parser()
+
+    verify = parser.parse_args(["backup-verify", "node.tar.gz"])
+    assert verify.func is cli.cmd_backup_verify
+    assert str(verify.file) == "node.tar.gz"
+    assert verify.passphrase is False
+    assert verify.passphrase_file is None
+
+
+def test_backup_verify_accepts_plaintext_backup(tmp_path, capsys):
+    node_a = _init_node(tmp_path, "a", "alice")
+    _seed_state(node_a)
+    capsys.readouterr()
+    destination_a = _id_destination(node_a, capsys)
+    archive = tmp_path / "alice.tar.gz"
+    assert (
+        cli.main(["backup", str(archive), "--data-dir", str(node_a), "--json"])
+        == 0
+    )
+    capsys.readouterr()
+
+    # Verify needs no data directory of its own and touches nothing
+    # live: the fresh directory stays absent.
+    manifest, files, destination = verify_backup(archive)
+    assert manifest["node"] == "alice"
+    assert destination == destination_a
+    assert "identity" in files
+    assert not (tmp_path / "b").exists()
+
+
+def test_backup_verify_via_cli(tmp_path, capsys):
+    node_a = _init_node(tmp_path, "a", "alice")
+    _seed_state(node_a)
+    capsys.readouterr()
+    destination_a = _id_destination(node_a, capsys)
+    archive = tmp_path / "alice.tar.gz"
+    assert cli.main(["backup", str(archive), "--data-dir", str(node_a)]) == 0
+    capsys.readouterr()
+    assert (
+        cli.main(["backup-verify", str(archive), "--json"]) == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["valid"] is True
+    assert payload["node"] == "alice"
+    assert payload["destination"] == destination_a
+    assert payload["encrypted"] is False
+    assert payload["backup"] == str(archive)
+    assert "identity" in payload["files"]
+    # The text summary reports the encryption status either way, so a
+    # plaintext archive is not mistaken for an unchecked one.
+    assert cli.main(["backup-verify", str(archive)]) == 0
+    text = capsys.readouterr().out
+    assert "encrypted:   no" in text
+    assert "valid:       yes" in text
+
+
+def test_backup_verify_rejects_missing_archive(tmp_path):
+    with pytest.raises(BackupError, match="no backup at"):
+        verify_backup(tmp_path / "gone.tar.gz")
+
+
+def test_backup_verify_rejects_non_archive(tmp_path):
+    junk = tmp_path / "junk"
+    junk.write_text("this is not a backup\n", encoding="utf-8")
+    with pytest.raises(BackupError, match="not a valid tau backup"):
+        verify_backup(junk)
+
+
+def test_backup_verify_rejects_member_missing_from_manifest(tmp_path):
+    archive = tmp_path / "bad.tar.gz"
+    _write_archive(
+        archive,
+        {"format": 1, "files": ["identity", "peers.json"]},
+        [("identity", b"abc")],
+    )
+    with pytest.raises(BackupError, match="missing members"):
+        verify_backup(archive)
+
+
+def test_backup_verify_rejects_truncated_archive(tmp_path, capsys):
+    node_a = _init_node(tmp_path, "a", "alice")
+    capsys.readouterr()
+    archive = tmp_path / "alice.tar.gz"
+    assert cli.main(["backup", str(archive), "--data-dir", str(node_a)]) == 0
+    capsys.readouterr()
+    raw = archive.read_bytes()
+    truncated = tmp_path / "cut.tar.gz"
+    truncated.write_bytes(raw[: len(raw) // 2])
+    with pytest.raises(BackupError, match="not a valid tau backup"):
+        verify_backup(truncated)
+
+
+def test_backup_verify_rejects_corrupt_identity(tmp_path, capsys):
+    node_a = _init_node(tmp_path, "a", "alice")
+    capsys.readouterr()
+    archive = tmp_path / "alice.tar.gz"
+    assert cli.main(["backup", str(archive), "--data-dir", str(node_a)]) == 0
+    capsys.readouterr()
+    broken = tmp_path / "broken.tar.gz"
+    _rewrite_archive(archive, broken, replace={"identity": b"not a key file"})
+    with pytest.raises(BackupError, match="identity is unreadable"):
+        verify_backup(broken)
+
+
+def test_backup_verify_rejects_tampered_staged_bytes(tmp_path, capsys):
+    node_a = _init_node(tmp_path, "a", "alice")
+    capsys.readouterr()
+    source = tmp_path / "notes.txt"
+    source.write_bytes(b"hello mesh")
+    _schedule_file_on_node(node_a, "alice", source)
+    capsys.readouterr()
+    archive = tmp_path / "alice.tar.gz"
+    assert cli.main(["backup", str(archive), "--data-dir", str(node_a)]) == 0
+    capsys.readouterr()
+    config_a = TauConfig.resolve(data_dir=node_a)
+    from tau.scheduled_files import load_scheduled_files
+
+    entry = load_scheduled_files(config_a.scheduled_files_path).files[0]
+    member = f"scheduled-files/{entry.id}/notes.txt"
+    tampered = tmp_path / "tampered.tar.gz"
+    _rewrite_archive(archive, tampered, replace={member: b"different bytes"})
+    with pytest.raises(BackupError, match="do not match its queue entry"):
+        verify_backup(tampered)
+
+
+def test_backup_verify_encrypted_backup(tmp_path, capsys):
+    node_a, destination_a, _contents = _encrypted_round_trip_setup(
+        tmp_path, capsys
+    )
+    config_a = TauConfig.resolve(data_dir=node_a)
+    archive = tmp_path / "alice.tar.gz"
+    create_backup(config_a, archive, passphrase=PASSPHRASE)
+    with pytest.raises(BackupError, match="encrypted"):
+        verify_backup(archive)
+    with pytest.raises(BackupError, match="wrong passphrase"):
+        verify_backup(archive, passphrase="wrong passphrase here")
+    manifest, _files, destination = verify_backup(
+        archive, passphrase=PASSPHRASE
+    )
+    assert manifest["node"] == "alice"
+    assert destination == destination_a
+
+
+def test_backup_verify_encrypted_backup_via_cli(tmp_path, capsys):
+    node_a, destination_a, _contents = _encrypted_round_trip_setup(
+        tmp_path, capsys
+    )
+    config_a = TauConfig.resolve(data_dir=node_a)
+    archive = tmp_path / "alice.tar.gz"
+    create_backup(config_a, archive, passphrase=PASSPHRASE)
+    pw_file = tmp_path / "pw.txt"
+    pw_file.write_text(PASSPHRASE + "\n", encoding="utf-8")
+    assert (
+        cli.main(
+            [
+                "backup-verify",
+                str(archive),
+                "--passphrase-file",
+                str(pw_file),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["valid"] is True
+    assert payload["encrypted"] is True
+    assert payload["destination"] == destination_a
+    wrong_pw = tmp_path / "wrong.txt"
+    wrong_pw.write_text("wrong passphrase here\n", encoding="utf-8")
+    code = cli.main(
+        [
+            "backup-verify",
+            str(archive),
+            "--passphrase-file",
+            str(wrong_pw),
+        ]
+    )
+    assert code == 1
+    assert "wrong passphrase" in capsys.readouterr().err
