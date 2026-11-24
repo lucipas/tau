@@ -192,6 +192,28 @@ describe("MessageBubble", () => {
     await vi.waitFor(() => expect(screen.getByText(/Added/)).toBeTruthy());
   });
 
+  it("shows the inline error and keeps Add peer when adding fails", async () => {
+    const onAddPeer = vi.fn().mockRejectedValue(new Error("peer did not announce"));
+    render(
+      <MessageBubble
+        message={makeMessage({
+          id: 15,
+          text: "👤 Shared contact: carol (cccccccc…)",
+          contact: { name: "carol", destination_hash: "cc".repeat(16) },
+        })}
+        onAddPeer={onAddPeer}
+        now={1700000060}
+      />,
+    );
+    fireEvent.click(screen.getByText("Add peer"));
+    await vi.waitFor(() =>
+      expect(screen.getByRole("alert").textContent).toMatch(/did not announce/),
+    );
+    // No "Added" line, and the button stays so the user can retry.
+    expect(screen.queryByText(/Added/)).toBeNull();
+    expect(screen.getByText("Add peer")).toBeTruthy();
+  });
+
   it("hides Add peer on your own sent card", () => {
     render(
       <MessageBubble

@@ -10276,6 +10276,24 @@ class WebBridge:
             ) from exc
         known = self.node.registry.get(target) is not None
         peer = self.node.resolve_peer(target, timeout=timeout)
+        if not known:
+            # The discovery above only upserts into the in-memory
+            # registry: persist the peer now, or the contact added
+            # through the console is gone after the node restarts.
+            # A failed save is not a success — the console must say
+            # so instead of reporting the peer added.
+            try:
+                saved = self.node.registry.save()
+            except OSError as exc:
+                raise WebBridgeError(
+                    "could not save the peer registry; the contact "
+                    "was not added"
+                ) from exc
+            if not saved:
+                raise WebBridgeError(
+                    "could not save the peer registry; the contact "
+                    "was not added"
+                )
         return {
             "peer": peer.hexhash,
             "name": peer.display_name,

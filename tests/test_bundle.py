@@ -87,6 +87,43 @@ def _build(tmp_path, sender, recipient, **kwargs):
 # -- round trip ------------------------------------------------------------
 
 
+def test_bundle_roundtrip_queued_contact_keeps_card(tmp_path):
+    # A queued contact share exported in a bundle must arrive with its
+    # structured card, not just the card line as text.
+    sender, recipient, _ = _identities()
+    card = {"name": "carol", "destination_hash": "cc" * 16}
+    mailbox = Mailbox(tmp_path / "mailbox.json")
+    mailbox.enqueue(
+        to=destination_hash(recipient),
+        text="👤 Shared contact: carol (cccccccc…)",
+        to_name="bob",
+        message_id="queued-card",
+        contact=card,
+        now=1000.0,
+    )
+    registry = _registry_with(recipient)
+    document, summary = build_bundle(
+        identity=sender,
+        sender_name="alice",
+        mailbox=mailbox,
+        registry=registry,
+        now=1000.0,
+    )
+    assert summary["mail"] == 1
+    assert summary["skipped"] == []
+
+    parsed = parse_bundle(serialize_bundle(document))
+    receiver_box = Mailbox(tmp_path / "receiver.json")
+    result = apply_bundle(
+        mailbox=receiver_box, tan_conn=None, document=parsed, now=1000.0
+    )
+    assert result["imported"] == 1
+    held = receiver_box.held_list()
+    assert [item.id for item in held] == ["queued-card"]
+    message = open_message(recipient, held[0].blob)
+    assert message["contact"] == card
+
+
 def test_bundle_roundtrip_held_and_outbox(tmp_path):
     sender, recipient, _ = _identities()
     document, summary = _build(tmp_path, sender, recipient)

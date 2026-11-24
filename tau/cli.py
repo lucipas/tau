@@ -5750,11 +5750,12 @@ def _contact_from_args(
 ) -> Optional[Dict[str, Any]]:
     """Resolve a ``--contact`` flag to a card, or ``None`` when it was not given.
 
-    The card names the peer this node knows them as, with their
-    destination hash — the identity the recipient resolves.  An
-    unknown peer, sharing yourself, and sharing a blocked peer are
-    all refused: the recipient already has your hash, and a blocked
-    peer must not be amplified to a third party.
+    The card names the peer by their *announced* name, with their
+    destination hash — the identity the recipient resolves.  A local
+    alias is never shared: it is the owner's private nickname for the
+    peer.  An unknown peer, sharing yourself, and sharing a blocked
+    peer are all refused: the recipient already has your hash, and a
+    blocked peer must not be amplified to a third party.
     """
     raw = getattr(args, "contact", None)
     if raw is None:
@@ -5779,7 +5780,11 @@ def _contact_from_args(
         raise NodeError("cannot share a contact: the block-list could not be read")
     if peer.hexhash in blocked:
         raise NodeError("cannot share a contact for a blocked peer")
-    return {"name": peer.display_name, "destination_hash": peer.hexhash}
+    # The announced name, not display_name: display_name returns the
+    # owner's local alias when one is set, and that private nickname
+    # must never travel to a third party in the card.
+    name = peer.name or short_hash(peer.hexhash)
+    return {"name": name, "destination_hash": peer.hexhash}
 
 
 def _message_text_with_contact(

@@ -490,8 +490,8 @@ export default function ChatSection() {
   }
 
   const handleSend = useCallback(
-    async (text: string, opts: ComposerSendOptions) => {
-      if (!selected) return;
+    async (text: string, opts: ComposerSendOptions): Promise<boolean> => {
+      if (!selected) return false;
       if (editing) {
         const id = editing.id;
         setEditing(null);
@@ -510,7 +510,7 @@ export default function ChatSection() {
             key: selected.key,
           });
         }
-        return;
+        return ok;
       }
       const target = selected.kind === "group" ? { group: selected.key } : { to: selected.key };
       const sendOpts: SendMessageOptions = {
@@ -531,6 +531,7 @@ export default function ChatSection() {
         );
         void refreshDrafts();
       }
+      return sent;
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [selected, editing, pendingSeed, selectedKey, refreshDrafts],
@@ -647,10 +648,12 @@ export default function ChatSection() {
   const handleAddPeer = useCallback(
     async (message: ChatMessage) => {
       if (!message.contact) return;
-      const ok = await run("Add peer failed", () =>
-        addPeer(message.contact!.destination_hash),
-      );
-      if (ok) await tau.refresh();
+      // Errors must reach the bubble's catch: it shows the inline
+      // error and keeps the Add button for a retry. Routing through
+      // `run()` swallows them into a boolean, which marked a failed
+      // add as done and hid the button needed to retry.
+      await addPeer(message.contact.destination_hash);
+      await tau.refresh();
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [],

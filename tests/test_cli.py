@@ -600,6 +600,38 @@ def test_send_contact_reaches_node_and_defaults_text(
     assert node.send_kwargs[0]["kind"] is None
 
 
+def test_send_contact_shares_announced_name_not_alias(
+    tmp_path, capsys, monkeypatch
+):
+    # A local alias is the owner's private nickname: the card must
+    # carry the peer's announced name, never the alias.
+    import io
+    import sys
+
+    class _TtyStdin(io.StringIO):
+        def isatty(self):
+            return True
+
+    monkeypatch.setattr(sys, "stdin", _TtyStdin())
+    config = _seed_contact_peer(tmp_path / "node")
+    registry = PeerRegistry(config.peers_path)
+    registry.set_alias(bytes.fromhex("cc" * 16), "Bob from the bad meetup")
+    registry.save()
+    code = _run_send(
+        tmp_path,
+        monkeypatch,
+        ["--to", "alice", "--contact", "carol"],
+        behaviour={"alice": "delivered"},
+    )
+    assert code == 0
+    node = _FakeSendNode.instances[-1]
+    assert node.calls == [("alice", "👤 Shared contact: carol (cccccccc…)")]
+    assert node.send_kwargs[0]["contact"] == {
+        "name": "carol",
+        "destination_hash": "cc" * 16,
+    }
+
+
 def test_send_contact_with_text_keeps_text(tmp_path, capsys, monkeypatch):
     _seed_contact_peer(tmp_path / "node")
     code = _run_send(

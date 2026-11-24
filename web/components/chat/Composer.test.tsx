@@ -147,6 +147,77 @@ describe("Composer", () => {
     );
   });
 
+  it("clears the contact draft only when the send went through", async () => {
+    const peers = [
+      { key: "cc".repeat(16), name: "carol" },
+      { key: "dd".repeat(16), name: "dave" },
+    ];
+    const share = async (onSend: (text: string, opts: any) => Promise<boolean>) => {
+      const rendered = render(
+        <Composer
+          contactPeers={peers}
+          onSend={onSend}
+          onSendFile={() => undefined}
+        />,
+      );
+      fireEvent.click(screen.getByRole("button", { name: "👤 Contact" }));
+      fireEvent.change(screen.getByLabelText("Peer to share"), {
+        target: { value: "cc".repeat(16) },
+      });
+      fireEvent.change(screen.getByLabelText("Message"), { target: { value: "meet carol" } });
+      fireEvent.click(screen.getByText("Share contact"));
+      return rendered;
+    };
+
+    // A confirmed send clears the text and leaves contact mode.
+    const okSend = vi.fn().mockResolvedValue(true);
+    const { unmount } = await share(okSend);
+    await vi.waitFor(() =>
+      expect((screen.getByLabelText("Message") as HTMLTextAreaElement).value).toBe(""),
+    );
+    expect(screen.queryByLabelText("Peer to share")).toBeNull();
+    unmount();
+
+    // A failed send keeps the text and the picked peer for a retry.
+    const failedSend = vi.fn().mockResolvedValue(false);
+    await share(failedSend);
+    await vi.waitFor(() => expect(failedSend).toHaveBeenCalled());
+    expect((screen.getByLabelText("Message") as HTMLTextAreaElement).value).toBe(
+      "meet carol",
+    );
+    expect(screen.getByLabelText("Peer to share")).toBeTruthy();
+    expect(screen.getByText("Share contact")).toBeTruthy();
+  });
+
+  it("resets the contact draft when the conversation changes", () => {
+    const peers = [{ key: "cc".repeat(16), name: "carol" }];
+    const { rerender } = render(
+      <Composer
+        contactPeers={peers}
+        conversationKey="alice"
+        onSend={() => undefined}
+        onSendFile={() => undefined}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "👤 Contact" }));
+    fireEvent.change(screen.getByLabelText("Peer to share"), {
+      target: { value: "cc".repeat(16) },
+    });
+    expect(screen.getByLabelText("Peer to share")).toBeTruthy();
+
+    // Switching threads drops the picked card instead of carrying it
+    // into the new recipient's composer.
+    rerender(
+      <Composer
+        contactPeers={peers}
+        conversationKey="bob"
+        onSend={() => undefined}
+        onSendFile={() => undefined}
+      />,
+    );
+    expect(screen.queryByLabelText("Peer to share")).toBeNull();
+  });
+
   it("hides the Contact toggle without known peers", () => {
     render(<Composer onSend={() => undefined} onSendFile={() => undefined} />);
     expect(screen.queryByRole("button", { name: "👤 Contact" })).toBeNull();

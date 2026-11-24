@@ -1740,6 +1740,75 @@ def test_peers_add_resolves_contact_card(bridge, node):
     assert "destination_hash" in payload["error"]["message"]
 
 
+def test_peers_add_persists_newly_discovered_peer(bridge, node, monkeypatch):
+    # A peer discovered through identity recall is only in the
+    # in-memory registry until it is saved: add must persist it, or
+    # the contact is gone after the node restarts.
+    from tau.peers import Peer
+
+    new_hash = "dd" * 16
+    discovered = Peer(
+        destination_hash=bytes.fromhex(new_hash),
+        name="dave",
+        public_key=b"\x02" * 32,
+        first_seen=1000.0,
+        last_seen=time.time(),
+        hops=1,
+    )
+
+    def _resolve_with_discovery(target, *, timeout=10.0):
+        # Mirror TauNode.resolve_peer: an unknown hash that recalls
+        # an identity is upserted into the registry.
+        peer = node.registry.get(target)
+        if peer is not None:
+            return peer
+        if target == new_hash:
+            node.registry.restore(discovered)
+            return discovered
+        raise NodeError(f"unknown peer: {target}")
+
+    monkeypatch.setattr(node, "resolve_peer", _resolve_with_discovery)
+    assert node.registry.get(new_hash) is None
+    status, _, payload = _json(
+        bridge,
+        "/api/peers/add",
+        method="POST",
+        body={"destination_hash": new_hash},
+    )
+    assert status == 200
+    assert payload["peer"]["known"] is False
+    assert node.registry.saved is True
+    assert node.registry.get(new_hash) is not None
+
+    # A registry that cannot be saved is a failure, not a success.
+    node.registry.fail_save = True
+    other_hash = "ee" * 16
+    other = Peer(
+        destination_hash=bytes.fromhex(other_hash),
+        name="erin",
+        public_key=b"\x03" * 32,
+        first_seen=1000.0,
+        last_seen=time.time(),
+        hops=1,
+    )
+
+    def _resolve_other(target, *, timeout=10.0):
+        if target == other_hash:
+            node.registry.restore(other)
+            return other
+        raise NodeError(f"unknown peer: {target}")
+
+    monkeypatch.setattr(node, "resolve_peer", _resolve_other)
+    status, _, payload = _json(
+        bridge,
+        "/api/peers/add",
+        method="POST",
+        body={"destination_hash": other_hash},
+    )
+    assert status == 503
+    assert "could not save" in payload["error"]["message"]
+
+
 def test_peers_safety_number_shows_without_verifying(tmp_path):
     import RNS
 

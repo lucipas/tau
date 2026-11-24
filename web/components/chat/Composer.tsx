@@ -77,7 +77,12 @@ export interface ComposerProps {
   draftSeed?: { key: string; text: string } | null;
   /** Park the current text as a draft for this conversation. */
   onSaveDraft?: (text: string) => Promise<void> | void;
-  onSend: (text: string, opts: ComposerSendOptions) => Promise<void> | void;
+  /** Stable key of the open conversation; the contact draft resets when it changes. */
+  conversationKey?: string;
+  onSend: (
+    text: string,
+    opts: ComposerSendOptions,
+  ) => Promise<boolean | void> | boolean | void;
   onSendFile: (file: File, opts: Omit<ComposerSendOptions, "pollOptions">) => Promise<void> | void;
 }
 
@@ -107,6 +112,7 @@ export default function Composer({
   contactPeers,
   draftSeed,
   onSaveDraft,
+  conversationKey,
   onSend,
   onSendFile,
 }: ComposerProps) {
@@ -124,6 +130,17 @@ export default function Composer({
   const [sending, setSending] = useState(false);
   const [savingDraft, setSavingDraft] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
+
+  // A contact picked in one thread must not ride into the next:
+  // the composer is reused across conversations, so reset contact
+  // mode and the selected peer when the conversation changes. (The
+  // text draft is per-conversation already, via draftSeed.)
+  const [contactConversationKey, setContactConversationKey] = useState<string | null>(null);
+  if (conversationKey !== undefined && contactConversationKey !== conversationKey) {
+    setContactConversationKey(conversationKey);
+    setContactPeer("");
+    setMode("message");
+  }
 
   // Editing pre-fills the box; keep local edits once the user starts typing.
   const [editSeed, setEditSeed] = useState<number | null>(null);
@@ -217,12 +234,17 @@ export default function Composer({
       if (!picked) return setError("Choose a peer to share.");
       setSending(true);
       try {
-        await onSend(text.trim(), {
+        const sent = await onSend(text.trim(), {
           contact: { name: picked.name, destination_hash: picked.key },
           expiresIn,
           sendIn,
           replyTo: replyTo?.wire_id,
         });
+        // A failed share keeps the draft: the text and the picked
+        // peer stay put so the user can retry instead of rebuilding
+        // the card. An onSend that reports nothing is treated as a
+        // failure — only a confirmed send clears the draft.
+        if (!sent) return;
         setText("");
         setContactPeer("");
         setMode("message");
