@@ -10065,28 +10065,44 @@ class WebBridge:
         if config is None or getattr(config, "data_dir", None) is None:
             raise WebBridgeError("this node has no data directory to back up")
         data_dir = Path(config.data_dir)
-        registered = load_auto_backup_registry(data_dir)
-        backups = list_auto_backups(
-            backup_dir(data_dir), config.name, registered
+        # A scheduled worker may prune the selected archive between the
+        # snapshot and the open (retention of one).  A vanished archive
+        # is reselected from a fresh registry/directory read, bounded.
+        for _attempt in range(3):
+            registered = load_auto_backup_registry(data_dir)
+            backups = list_auto_backups(
+                backup_dir(data_dir), config.name, registered
+            )
+            if not backups:
+                raise WebBridgeError("no automatic backup yet")
+            newest = backups[-1]
+            try:
+                # Only an encrypted archive needs the passphrase; a
+                # plaintext one must verify even if the file is missing.
+                encrypted = is_encrypted_backup(newest)
+                passphrase = None
+                if encrypted:
+                    passphrase_path = backup_passphrase_file(data_dir)
+                    if passphrase_path is not None:
+                        passphrase = read_passphrase_file(passphrase_path)
+                manifest, files, destination = verify_backup(
+                    newest, passphrase=passphrase
+                )
+            except (BackupError, OSError):
+                if newest.exists():
+                    raise
+                continue
+            return {
+                "backup": newest.name,
+                "node": manifest.get("node"),
+                "destination": destination,
+                "files": files,
+                "encrypted": encrypted,
+                "valid": True,
+            }
+        raise WebBridgeError(
+            "the latest automatic backup was pruned during verification; retry"
         )
-        if not backups:
-            raise WebBridgeError("no automatic backup yet")
-        newest = backups[-1]
-        passphrase = None
-        passphrase_path = backup_passphrase_file(data_dir)
-        if passphrase_path is not None:
-            passphrase = read_passphrase_file(passphrase_path)
-        manifest, files, destination = verify_backup(
-            newest, passphrase=passphrase
-        )
-        return {
-            "backup": newest.name,
-            "node": manifest.get("node"),
-            "destination": destination,
-            "files": files,
-            "encrypted": is_encrypted_backup(newest),
-            "valid": True,
-        }
 
     def _build_backup(self, config: Any) -> Dict[str, Any]:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
