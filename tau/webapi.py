@@ -14861,7 +14861,14 @@ class _WebHandler(BaseHTTPRequestHandler):
             # a chat message or a single action.  A quote may carry an
             # image too, immediate or scheduled, so both quote routes
             # get the file cap as well.
-            if path in ("/api/send-file", "/api/groups/send-file", "/api/broadcasts/send-file", "/api/tan/posts", "/api/tan/quote", "/api/tan/schedule"):
+            if path in (
+                "/api/send-file",
+                "/api/groups/send-file",
+                "/api/broadcasts/send-file",
+                "/api/tan/posts",
+                "/api/tan/quote",
+                "/api/tan/schedule",
+            ):
                 limit = MAX_FILE_BODY_BYTES
             elif path in ("/api/messages/import", "/api/tan/import"):
                 limit = MAX_IMPORT_BYTES
