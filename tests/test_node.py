@@ -229,6 +229,37 @@ def test_send_message_sends_location_on_the_wire(tmp_path, monkeypatch):
     assert parse_message(sent["payload"])["kind"] == "chat"
 
 
+def test_send_message_sends_contact_on_the_wire(tmp_path, monkeypatch):
+    node = make_node(tmp_path)
+    peer = make_peer()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name=peer.name, now=1.0
+    )
+    sent = {}
+
+    def fake_request(peer_arg, path, payload, timeout):
+        sent["payload"] = payload
+        return {"ok": True, "delivered": True}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+    card = {"name": "carol", "destination_hash": "cc" * 16}
+    node.send_message("alice", "meet carol", contact=card)
+    parsed = parse_message(sent["payload"])
+    assert parsed["contact"] == card
+    # A card without an explicit kind is a contact message, so the
+    # receiver can filter on it; an explicit kind wins; and the card
+    # wins over a pin on the same message, which rides along.
+    assert parsed["kind"] == "contact"
+    node.send_message("alice", "meet carol", kind="chat", contact=card)
+    assert parse_message(sent["payload"])["kind"] == "chat"
+    pin = {"lat": 34.05, "lon": -83.88, "name": "Rock Springs Park"}
+    node.send_message("alice", "meet carol", contact=card, location=pin)
+    parsed = parse_message(sent["payload"])
+    assert parsed["kind"] == "contact"
+    assert parsed["contact"] == card
+    assert parsed["location"] == pin
+
+
 def test_send_message_sends_poll_options_on_the_wire(tmp_path, monkeypatch):
     node = make_node(tmp_path)
     peer = make_peer()
@@ -365,6 +396,14 @@ def test_send_message_rejects_invalid_location(tmp_path):
     node = make_node(tmp_path)
     with pytest.raises(NodeError):
         node.send_message("alice", "hi", location={"lat": 91, "lon": 0})
+
+
+def test_send_message_rejects_invalid_contact(tmp_path):
+    node = make_node(tmp_path)
+    with pytest.raises(NodeError):
+        node.send_message(
+            "alice", "hi", contact={"name": "carol", "destination_hash": "zz"}
+        )
 
 
 def test_send_message_queues_location_for_offline_peer(tmp_path, monkeypatch):

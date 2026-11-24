@@ -212,8 +212,10 @@ class FakeNode:
         self.sent = []
         self.group_sent = []
         self.last_location = None
+        self.last_contact = None
         self.last_beacon = None
         self.last_group_location = None
+        self.last_group_contact = None
         self.last_group_beacon = None
         self.group_reactions = []
         self.typing = []
@@ -358,6 +360,7 @@ class FakeNode:
         send_after=None,
         kind=None,
         location=None,
+        contact=None,
         beacon=None,
         poll_options=None,
         poll_vote=None,
@@ -368,6 +371,7 @@ class FakeNode:
         self.last_send_after = send_after
         self.last_kind = kind
         self.last_location = location
+        self.last_contact = contact
         self.last_beacon = beacon
         self.last_poll_options = poll_options
         self.last_poll_vote = poll_vote
@@ -385,7 +389,7 @@ class FakeNode:
     def send_group_message(
         self, group, text, *, timeout=20.0, discover_timeout=None, queue=True,
         expires_at=None, send_after=None, in_reply_to=None,
-        kind=None, location=None, beacon=None,
+        kind=None, location=None, contact=None, beacon=None,
         poll_options=None, poll_vote=None, poll_close=None,
     ):
         self.group_sent.append((group["name"], text))
@@ -394,6 +398,7 @@ class FakeNode:
         self.last_group_in_reply_to = in_reply_to
         self.last_group_kind = kind
         self.last_group_location = location
+        self.last_group_contact = contact
         self.last_group_beacon = beacon
         self.last_group_poll_options = poll_options
         self.last_group_poll_vote = poll_vote
@@ -1693,6 +1698,45 @@ def test_peers_verify_via_api(tmp_path):
         assert "target" in payload["error"]["message"]
     finally:
         bridge.stop()
+
+
+def test_peers_add_resolves_contact_card(bridge, node):
+    status, _, payload = _json(
+        bridge,
+        "/api/peers/add",
+        method="POST",
+        body={"destination_hash": PEER_HASH},
+    )
+    assert status == 200
+    added = payload["peer"]
+    assert added["peer"] == PEER_HASH
+    # The name is the peer's own announced name, not the card's claim.
+    assert added["name"] == "alice"
+    assert added["known"] is True
+    assert added["verified"] is False
+
+    # A peer that is not announcing cannot be resolved.
+    status, _, payload = _json(
+        bridge,
+        "/api/peers/add",
+        method="POST",
+        body={"destination_hash": "cc" * 16},
+    )
+    assert status == 502
+    assert "unknown peer" in payload["error"]["message"]
+
+    # Malformed and missing hashes are bad requests.
+    for bad in ("", "zz", "ab" * 8):
+        status, _, payload = _json(
+            bridge,
+            "/api/peers/add",
+            method="POST",
+            body={"destination_hash": bad},
+        )
+        assert status == 400
+    status, _, payload = _json(bridge, "/api/peers/add", method="POST", body={})
+    assert status == 400
+    assert "destination_hash" in payload["error"]["message"]
 
 
 def test_peers_safety_number_shows_without_verifying(tmp_path):
@@ -17473,6 +17517,7 @@ def test_dm_send_with_poll_options_posts_poll(bridge, node):
 
 
 PIN = {"lat": 34.05, "lon": -83.88, "name": "Rock Springs Park"}
+CARD = {"name": "carol", "destination_hash": "cc" * 16}
 
 
 def test_dm_send_with_location_pins_place(bridge, node):
@@ -17486,6 +17531,73 @@ def test_dm_send_with_location_pins_place(bridge, node):
     assert node.last_location == PIN
     assert payload["message"]["location"] == PIN
     assert payload["message"]["text"] == "meet here"
+
+
+def test_dm_send_with_contact_shares_card(bridge, node):
+    from tau.blocklist import BlockList
+
+    node.blocklist = BlockList()
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"to": "alice", "text": "meet carol", "contact": dict(CARD)},
+    )
+    assert status == 200
+    assert node.last_contact == CARD
+    assert payload["message"]["contact"] == CARD
+    assert payload["message"]["text"] == "meet carol"
+
+
+def test_dm_send_contact_without_text_defaults_to_card_line(bridge, node):
+    from tau.blocklist import BlockList
+
+    node.blocklist = BlockList()
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"to": "alice", "contact": dict(CARD)},
+    )
+    assert status == 200
+    assert node.sent[-1][1] == "👤 Shared contact: carol (cccccccc…)"
+    assert payload["message"]["text"] == "👤 Shared contact: carol (cccccccc…)"
+    assert payload["message"]["contact"] == CARD
+
+
+def test_dm_send_with_bad_contact_is_400(bridge, node):
+    from tau.blocklist import BlockList
+
+    node.blocklist = BlockList()
+    for bad in (
+        {"name": "carol", "destination_hash": "zz"},
+        {"name": "carol"},
+        "carol",
+    ):
+        status, _, payload = _json(
+            bridge,
+            "/api/messages",
+            method="POST",
+            body={"to": "alice", "text": "meet carol", "contact": bad},
+        )
+        assert status == 400
+        assert "contact" in payload["error"]["message"]
+    assert node.sent == []
+
+
+def test_dm_send_contact_for_blocked_peer_is_400(bridge, node):
+    from tau.blocklist import BlockList
+
+    node.blocklist = BlockList(blocked=frozenset({"cc" * 16}))
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"to": "alice", "text": "meet carol", "contact": dict(CARD)},
+    )
+    assert status == 400
+    assert "blocked peer" in payload["error"]["message"]
+    assert node.sent == []
 
 
 def test_dm_send_location_without_text_defaults_to_place_name(bridge, node):
@@ -17539,6 +17651,41 @@ def test_group_send_with_location_pins_place(bridge, node):
     assert node.last_group_location == PIN
     assert payload["messages"]
     assert all(m["location"] == PIN for m in payload["messages"])
+
+
+def test_group_send_with_contact_shares_card(bridge, node):
+    from tau.blocklist import BlockList
+
+    node.blocklist = BlockList()
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"group": "crew", "text": "meet carol", "contact": dict(CARD)},
+    )
+    assert status == 200
+    assert node.last_group_contact == CARD
+    assert payload["messages"]
+    assert all(m["contact"] == CARD for m in payload["messages"])
+
+
+def test_inbound_contact_card_is_recorded(bridge, node):
+    card_message = {
+        "from": "alice",
+        "destination": PEER_HASH,
+        "text": "👤 Shared contact: carol (cccccccc…)",
+        "kind": "contact",
+        "sent_at": 100.0,
+        "received_at": 101.0,
+        "id": "wire-card",
+        "contact": dict(CARD),
+    }
+    node.inbox.append(dict(card_message))
+    bridge.record_inbound(dict(card_message), publish=False)
+    entry = next(
+        entry for entry in bridge.messages() if entry.get("wire_id") == "wire-card"
+    )
+    assert entry["contact"] == CARD
 
 
 def test_inbound_location_pin_is_recorded(bridge, node):

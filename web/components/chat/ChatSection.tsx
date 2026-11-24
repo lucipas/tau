@@ -7,6 +7,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   acceptDmRequest,
+  addPeer,
   addReminder,
   cancelReminder,
   clearReaction,
@@ -518,6 +519,7 @@ export default function ChatSection() {
         sendIn: opts.sendIn,
         pollOptions: opts.pollOptions,
         location: opts.location,
+        contact: opts.contact,
       };
       setReplyTo(null);
       const sent = await run("Send failed", () => sendMessage(target, text, sendOpts));
@@ -640,6 +642,18 @@ export default function ChatSection() {
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [selected],
+  );
+
+  const handleAddPeer = useCallback(
+    async (message: ChatMessage) => {
+      if (!message.contact) return;
+      const ok = await run("Add peer failed", () =>
+        addPeer(message.contact!.destination_hash),
+      );
+      if (ok) await tau.refresh();
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
   );
 
   const forwardTargets = useMemo(
@@ -849,6 +863,8 @@ export default function ChatSection() {
                 onSnooze={handleSnooze}
                 onVotePoll={handleVotePoll}
                 onClosePoll={handleClosePoll}
+                onAddPeer={handleAddPeer}
+                contactPeers={tau.peers.map((p) => ({ key: p.destination, name: p.name }))}
                 onSend={handleSend}
                 onSendFile={handleSendFile}
             draftSeed={pendingSeed}

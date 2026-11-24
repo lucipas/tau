@@ -184,6 +184,7 @@ from .protocol import (
     clean_group_poll_target,
     clean_group_poll_vote,
     clean_in_reply_to,
+    clean_contact,
     clean_location,
     clean_reaction,
     decode,
@@ -199,6 +200,7 @@ from .protocol import (
     encode_profile_request,
     encode_typing,
     generate_message_id,
+    contact_default_text,
     location_default_text,
     normalize_message,
     normalize_message_kind,
@@ -2321,6 +2323,7 @@ class TauNode:
                     expires_at=message.get("expires_at"),
                     in_reply_to=message.get("in_reply_to"),
                     location=message.get("location"),
+                    contact=message.get("contact"),
                     beacon=message.get("beacon"),
                 ),
                 now=received_at,
@@ -2815,6 +2818,8 @@ class TauNode:
                     record["in_reply_to"] = message["in_reply_to"]
                 if message.get("location") is not None:
                     record["location"] = message["location"]
+                if message.get("contact") is not None:
+                    record["contact"] = message["contact"]
                 if message.get("beacon") is not None:
                     record["beacon"] = message["beacon"]
                 if message.get("poll_options") is not None:
@@ -3475,6 +3480,7 @@ class TauNode:
                 message.get("poll_close"),
             )
             message["location"] = None
+            message["contact"] = None
             message["beacon"] = None
             message["in_reply_to"] = None
 
@@ -3512,6 +3518,8 @@ class TauNode:
                 record["in_reply_to"] = message["in_reply_to"]
             if message.get("location") is not None:
                 record["location"] = message["location"]
+            if message.get("contact") is not None:
+                record["contact"] = message["contact"]
             if message.get("beacon") is not None:
                 record["beacon"] = message["beacon"]
             if message.get("poll_options") is not None:
@@ -7992,6 +8000,7 @@ class TauNode:
                 in_reply_to=fresh.in_reply_to,
                 expires_at=fresh.message_expires_at,
                 location=fresh.location,
+                contact=fresh.contact,
                 beacon=fresh.beacon,
                 poll_options=fresh.poll_options,
                 poll_vote=fresh.poll_vote,
@@ -8092,6 +8101,7 @@ class TauNode:
                 expires_at=fresh.message_expires_at,
                 in_reply_to=fresh.in_reply_to,
                 location=fresh.location,
+                contact=fresh.contact,
                 beacon=fresh.beacon,
                 kind=getattr(fresh, "kind", None),
                 poll_options=fresh.poll_options,
@@ -8752,6 +8762,7 @@ class TauNode:
                 expires_at=fresh.message_expires_at,
                 in_reply_to=fresh.in_reply_to,
                 location=fresh.location,
+                contact=fresh.contact,
                 beacon=fresh.beacon,
                 kind=sealed_kind,
                 edited_at=fresh.edited_at,
@@ -9470,6 +9481,7 @@ class TauNode:
                 expires_at=expires_at,
                 in_reply_to=message.get("in_reply_to"),
                 location=message.get("location"),
+                contact=message.get("contact"),
                 beacon=message.get("beacon"),
                 poll_options=message.get("poll_options"),
                 poll_vote=message.get("poll_vote"),
@@ -10205,6 +10217,7 @@ class TauNode:
                     message.get("poll_close"),
                 )
                 message["location"] = None
+                message["contact"] = None
                 message["beacon"] = None
                 message["in_reply_to"] = None
         record = {
@@ -10227,6 +10240,8 @@ class TauNode:
             record["in_reply_to"] = message["in_reply_to"]
         if message.get("location") is not None:
             record["location"] = message["location"]
+        if message.get("contact") is not None:
+            record["contact"] = message["contact"]
         if message.get("beacon") is not None:
             record["beacon"] = message["beacon"]
         if message.get("poll_options") is not None:
@@ -10687,6 +10702,7 @@ class TauNode:
         kind: Optional[str] = None,
         location: Optional[Dict[str, Any]] = None,
         beacon: Optional[Dict[str, Any]] = None,
+        contact: Optional[Dict[str, Any]] = None,
         poll_options: Optional[List[str]] = None,
         poll_vote: Optional[Dict[str, Any]] = None,
         poll_close: Optional[Dict[str, Any]] = None,
@@ -10751,6 +10767,11 @@ class TauNode:
             raise NodeError(
                 "location must have a latitude -90..90 and a longitude -180..180"
             )
+        cleaned_contact = clean_contact(contact)
+        if contact is not None and cleaned_contact is None:
+            raise NodeError(
+                "contact must have a name and a 32 character hex destination hash"
+            )
         cleaned_beacon = clean_beacon(beacon)
         if beacon is not None and cleaned_beacon is None:
             raise NodeError(
@@ -10801,7 +10822,13 @@ class TauNode:
             poll_record["poll_close"] = cleaned_close
         if poll_record:
             poll_record["leg_sent_at"] = wire_sent_at
-        if cleaned_location is not None and kind is None:
+        if cleaned_contact is not None and kind is None:
+            # A card without an explicit kind is a contact message, so
+            # the receiver can filter on it; an explicit kind wins.  It
+            # wins over a pin on the same message: the card is the
+            # message's point, the pin rides along.
+            clean_kind = "contact"
+        elif cleaned_location is not None and kind is None:
             # A pin without an explicit kind is a location message, so
             # the receiver can filter on it; an explicit kind wins.
             clean_kind = "location"
@@ -10858,6 +10885,7 @@ class TauNode:
             expires_at=expires_at,
             in_reply_to=reply_to,
             location=cleaned_location,
+            contact=cleaned_contact,
             beacon=cleaned_beacon,
             poll_options=cleaned_options,
             poll_vote=cleaned_vote,
@@ -10893,6 +10921,7 @@ class TauNode:
                         expires_at=expires_at,
                         in_reply_to=reply_to,
                         location=cleaned_location,
+                        contact=cleaned_contact,
                         beacon=cleaned_beacon,
                         kind=clean_kind,
                         send_after=send_after,
@@ -10931,6 +10960,11 @@ class TauNode:
                         **(
                             {"location": cleaned_location}
                             if cleaned_location is not None
+                            else {}
+                        ),
+                        **(
+                            {"contact": cleaned_contact}
+                            if cleaned_contact is not None
                             else {}
                         ),
                         **(
@@ -11003,6 +11037,11 @@ class TauNode:
                         else {}
                     ),
                     **(
+                        {"contact": cleaned_contact}
+                        if cleaned_contact is not None
+                        else {}
+                    ),
+                    **(
                         {"beacon": cleaned_beacon}
                         if cleaned_beacon is not None
                         else {}
@@ -11051,6 +11090,7 @@ class TauNode:
                 expires_at=expires_at,
                 in_reply_to=reply_to,
                 location=cleaned_location,
+                contact=cleaned_contact,
                 beacon=cleaned_beacon,
                 kind=clean_kind,
                 sent_at=wire_sent_at,
@@ -11077,6 +11117,11 @@ class TauNode:
                     **(
                         {"location": cleaned_location}
                         if cleaned_location is not None
+                        else {}
+                    ),
+                    **(
+                        {"contact": cleaned_contact}
+                        if cleaned_contact is not None
                         else {}
                     ),
                     **(
@@ -11207,6 +11252,7 @@ class TauNode:
         poll_close: Optional[Dict[str, Any]] = None,
         location: Optional[Dict[str, Any]] = None,
         beacon: Optional[Dict[str, Any]] = None,
+        contact: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Fan *text* out to every member of a group except this node.
 
@@ -11266,7 +11312,9 @@ class TauNode:
         ``location`` pins a place on the message (see
         :func:`clean_location`): it rides on every leg, through
         queued legs and sealed relay copies, exactly like a direct
-        message pin.  ``beacon`` marks the message as one update of
+        message pin.  ``contact`` shares a peer's contact card on
+        the message (see :func:`clean_contact`): it rides on every
+        leg the same way.  ``beacon`` marks the message as one update of
         a live beacon (see :func:`clean_beacon`), exactly like a
         direct message: it rides with the pin on every leg.
         """
@@ -11355,6 +11403,11 @@ class TauNode:
             raise NodeError(
                 "location must have a latitude -90..90 and a longitude -180..180"
             )
+        cleaned_contact = clean_contact(contact)
+        if contact is not None and cleaned_contact is None:
+            raise NodeError(
+                "contact must have a name and a 32 character hex destination hash"
+            )
         cleaned_beacon = clean_beacon(beacon)
         if beacon is not None and cleaned_beacon is None:
             raise NodeError(
@@ -11410,6 +11463,7 @@ class TauNode:
                 poll_vote=cleaned_vote,
                 poll_close=cleaned_close,
                 location=cleaned_location,
+                contact=cleaned_contact,
                 beacon=cleaned_beacon,
             )
         except ProtocolError as exc:
@@ -11472,6 +11526,7 @@ class TauNode:
                         send_after=send_after,
                         in_reply_to=reply_to,
                         location=cleaned_location,
+                        contact=cleaned_contact,
                         beacon=cleaned_beacon,
                         poll_options=cleaned_options,
                         poll_vote=cleaned_vote,
@@ -11531,6 +11586,7 @@ class TauNode:
                 poll_vote=cleaned_vote,
                 poll_close=cleaned_close,
                 location=cleaned_location,
+                contact=cleaned_contact,
                 beacon=cleaned_beacon,
             )
             peer: Optional[Peer] = None
@@ -11579,6 +11635,7 @@ class TauNode:
                         sent_at=sent_at,
                         in_reply_to=reply_to,
                         location=cleaned_location,
+                        contact=cleaned_contact,
                         beacon=cleaned_beacon,
                         poll_options=cleaned_options,
                         poll_vote=cleaned_vote,
@@ -11728,6 +11785,7 @@ class TauNode:
                         sent_at=sent_at,
                         in_reply_to=reply_to,
                         location=cleaned_location,
+                        contact=cleaned_contact,
                         beacon=cleaned_beacon,
                         poll_options=cleaned_options,
                         poll_vote=cleaned_vote,
@@ -11810,6 +11868,11 @@ class TauNode:
                     **(
                         {"location": cleaned_location}
                         if cleaned_location is not None
+                        else {}
+                    ),
+                    **(
+                        {"contact": cleaned_contact}
+                        if cleaned_contact is not None
                         else {}
                     ),
                     **(

@@ -126,6 +126,18 @@ def test_enqueue_kind_survives_reload(tmp_path):
     assert reloaded.outbox_list()[0].kind == "ping"
 
 
+def test_enqueue_contact_survives_reload(tmp_path):
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    card = {"name": "carol", "destination_hash": "cc" * 16}
+    entry = box.enqueue(to=BOB, text="meet carol", contact=card, now=1000.0)
+    assert entry.contact == card
+    assert entry.to_dict()["contact"] == card
+
+    reloaded = Mailbox(path)
+    assert reloaded.outbox_list()[0].contact == card
+
+
 def test_enqueue_defaults_to_chat_kind(tmp_path):
     box = Mailbox(tmp_path / "mailbox.json")
     entry = box.enqueue(to=BOB, text="hello")
@@ -2513,6 +2525,33 @@ def test_seal_and_open_keep_kind():
     )
     message = open_message(recipient, blob)
     assert message["kind"] == "ping"
+
+
+def test_seal_and_open_keep_contact_card():
+    sender, recipient = make_identity_pair()
+    card = {"name": "carol", "destination_hash": "cc" * 16}
+    blob = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="msg-card",
+        text="meet carol",
+        sent_at=4242.0,
+        contact=card,
+    )
+    message = open_message(recipient, blob)
+    assert message["contact"] == card
+    # A malformed card is refused to seal, like a malformed pin.
+    with pytest.raises(MailboxError):
+        seal_message(
+            sender,
+            sender_name="alice",
+            recipient_public_key=recipient.get_public_key(),
+            message_id="msg-bad-card",
+            text="meet carol",
+            sent_at=4242.0,
+            contact={"name": "carol", "destination_hash": "zz"},
+        )
 
 
 def test_seal_message_rejects_reaction_without_token():

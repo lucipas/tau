@@ -629,6 +629,7 @@ def encode_group_message(
     poll_close: Optional[Dict[str, Any]] = None,
     location: Optional[Dict[str, Any]] = None,
     beacon: Optional[Dict[str, Any]] = None,
+    contact: Optional[Dict[str, Any]] = None,
     roster_attestation: Optional[Dict[str, Any]] = None,
 ) -> bytes:
     """Encode a group chat message for the ``/tau/group`` request.
@@ -682,6 +683,10 @@ def encode_group_message(
     ``location`` optionally pins a place on the message (see
     :func:`clean_location`): a pin without coordinates is rejected,
     so a caller cannot send a location message that renders nowhere.
+    ``contact`` optionally shares a peer's contact card on the
+    message (see :func:`clean_contact`): a card without a name or a
+    valid destination hash is rejected, so a caller cannot send a
+    contact message that renders nowhere.
     ``beacon`` optionally marks the message as one update of a live
     beacon (see :func:`clean_beacon`), exactly like a direct message:
     it rides with the pin on every leg, so each member can tell a
@@ -782,6 +787,11 @@ def encode_group_message(
         raise ProtocolError("location must have a latitude -90..90 and a longitude -180..180")
     if cleaned_location is not None:
         payload["location"] = cleaned_location
+    cleaned_contact = clean_contact(contact)
+    if contact is not None and cleaned_contact is None:
+        raise ProtocolError("contact must have a name and a 32 character hex destination hash")
+    if cleaned_contact is not None:
+        payload["contact"] = cleaned_contact
     cleaned_beacon = clean_beacon(beacon)
     if beacon is not None and cleaned_beacon is None:
         raise ProtocolError("beacon must have an id, an expiry and a sequence number")
@@ -928,6 +938,7 @@ def parse_group_message(raw: Any) -> Dict[str, Any]:
         "poll_vote": parsed_vote,
         "poll_close": parsed_close,
         "location": clean_location(payload.get("location")),
+        "contact": clean_contact(payload.get("contact")),
         "beacon": clean_beacon(payload.get("beacon")),
     }
 
@@ -1999,6 +2010,50 @@ def location_default_text(location: Dict[str, Any]) -> str:
     return f"📍 {location['lat']}, {location['lon']}"
 
 
+def clean_contact(value: Any) -> Optional[Dict[str, Any]]:
+    """Validate a shared contact card, or ``None`` when absent or malformed.
+
+    A card names a peer by display name and destination hash
+    (``{"name": ..., "destination_hash": <32 hex>}``) — the
+    contact-sharing analogue of a location pin: a structured field
+    riding on a message, so the receiver can render it as a card
+    and add the peer instead of parsing a hash out of the text.  A
+    malformed card drops instead of breaking the message that
+    carries it — the text still reads — exactly like a malformed
+    pin drops.  Callers that must reject a bad card
+    (:func:`encode_message`) check the input was not ``None`` and
+    raise when cleaning returns ``None``.
+
+    The name is the sender's claim, not a verified fact: the
+    recipient's registry names the peer from its own announce, and
+    the card's name is only what the sender called them.  The hash
+    is the identity — a 32-character hex destination hash — so the
+    recipient can resolve the peer and message them.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        return None
+    name = value.get("name")
+    if not isinstance(name, str):
+        return None
+    name = sanitize_name(name, fallback="")
+    if not name:
+        return None
+    try:
+        destination_hash = _clean_hexhash(
+            value.get("destination_hash"), "destination_hash"
+        )
+    except ProtocolError:
+        return None
+    return {"name": name, "destination_hash": destination_hash}
+
+
+def contact_default_text(contact: Dict[str, Any]) -> str:
+    """Message text for a card sent without its own text: the shared peer's name and hash."""
+    return f"👤 Shared contact: {contact['name']} ({contact['destination_hash'][:8]}…)"
+
+
 def encode_message(
     text: str,
     *,
@@ -2009,6 +2064,7 @@ def encode_message(
     location: Optional[Dict[str, Any]] = None,
     kind: Optional[str] = None,
     beacon: Optional[Dict[str, Any]] = None,
+    contact: Optional[Dict[str, Any]] = None,
     poll_options: Optional[List[str]] = None,
     poll_vote: Optional[Dict[str, Any]] = None,
     poll_close: Optional[Dict[str, Any]] = None,
@@ -2024,7 +2080,10 @@ def encode_message(
     quotes.  ``location`` optionally pins a place on the message
     (see :func:`clean_location`): a pin without coordinates is
     rejected, so a caller cannot send a location message that
-    renders nowhere.  ``beacon`` optionally marks the message as one
+    renders nowhere.  ``contact`` optionally shares a peer's contact
+    card on the message (see :func:`clean_contact`): a card without
+    a name or a valid destination hash is rejected, so a caller
+    cannot send a contact message that renders nowhere.  ``beacon`` optionally marks the message as one
     update of a live beacon (see :func:`clean_beacon`): it rides
     with the pin, so the receiver can tell a live update from a
     one-off pin and show the beacon's expiry; a beacon without a
@@ -2084,6 +2143,11 @@ def encode_message(
         raise ProtocolError("location must have a latitude -90..90 and a longitude -180..180")
     if cleaned_location is not None:
         payload["location"] = cleaned_location
+    cleaned_contact = clean_contact(contact)
+    if contact is not None and cleaned_contact is None:
+        raise ProtocolError("contact must have a name and a 32 character hex destination hash")
+    if cleaned_contact is not None:
+        payload["contact"] = cleaned_contact
     cleaned_beacon = clean_beacon(beacon)
     if beacon is not None and cleaned_beacon is None:
         raise ProtocolError("beacon must have an id, an expiry and a sequence number")
@@ -2131,6 +2195,7 @@ def parse_message(raw: Any) -> Dict[str, Any]:
         "poll_vote": parsed_vote,
         "poll_close": parsed_close,
         "location": clean_location(payload.get("location")),
+        "contact": clean_contact(payload.get("contact")),
         "beacon": clean_beacon(payload.get("beacon")),
     }
 

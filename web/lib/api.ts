@@ -14,6 +14,7 @@
 // No UI code lives here — hooks in use-tau.ts / use-tan.ts build on this.
 
 import type {
+  AddPeerResult,
   AllowList,
   ApiErrorBody,
   AwayMessageSettings,
@@ -209,6 +210,11 @@ export async function getSafetyNumber(target: string): Promise<SafetyNumberResul
 /** Mark a peer verified — call only after comparing the safety number out of band. */
 export async function verifyPeer(target: string): Promise<VerifyResult> {
   return post("/api/peers/verify", { target });
+}
+
+/** Add a peer from a shared contact card: resolve the hash into the registry. */
+export async function addPeer(destinationHash: string): Promise<{ peer: AddPeerResult }> {
+  return post("/api/peers/add", { destination_hash: destinationHash });
 }
 
 export async function blockPeer(target: string): Promise<BlockResult> {
@@ -562,6 +568,8 @@ export interface SendMessageOptions {
   pollOptions?: string[];
   /** Pin a place on the message: latitude -90..90, longitude -180..180. */
   location?: { lat: number; lon: number; name?: string };
+  /** Share a peer's contact card: their name and destination hash. */
+  contact?: { name: string; destination_hash: string };
   timeout?: number;
 }
 
@@ -599,6 +607,7 @@ export async function sendMessage(
   if (opts.sendIn !== undefined) body.send_in = opts.sendIn;
   if (opts.pollOptions) body.poll_options = opts.pollOptions;
   if (opts.location) body.location = opts.location;
+  if (opts.contact) body.contact = opts.contact;
   if (opts.timeout !== undefined) body.timeout = opts.timeout;
   return post("/api/messages", body);
 }

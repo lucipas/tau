@@ -38,6 +38,10 @@ export interface ThreadViewProps {
   /** Voting/closing a poll; undefined disables voting in the bubble. */
   onVotePoll?: (message: ChatMessage, option: number) => void;
   onClosePoll?: (message: ChatMessage) => void;
+  /** Add the peer from a received contact card to the registry. */
+  onAddPeer?: (message: ChatMessage) => Promise<void> | void;
+  /** Known peers for the composer's contact picker. */
+  contactPeers?: { key: string; name: string }[];
   onSend: (text: string, opts: ComposerSendOptions) => Promise<void> | void;
   onSendFile: (file: File, opts: Omit<ComposerSendOptions, "pollOptions">) => Promise<void> | void;
   /** A saved draft to load into the composer (set when its conversation opens). */
@@ -64,6 +68,8 @@ export default function ThreadView({
   onSnooze,
   onVotePoll,
   onClosePoll,
+  onAddPeer,
+  contactPeers,
   onSend,
   onSendFile,
   draftSeed,
@@ -152,6 +158,7 @@ export default function ThreadView({
               onSnooze={onSnooze}
               onVotePoll={onVotePoll}
               onClosePoll={onClosePoll}
+              onAddPeer={onAddPeer}
             />
           ))
         )}
@@ -181,6 +188,7 @@ export default function ThreadView({
         disabled={announcementsLocked && !editing}
         draftSeed={draftSeed}
         onSaveDraft={onSaveDraft}
+        contactPeers={contactPeers}
         onSend={onSend}
         onSendFile={onSendFile}
       />

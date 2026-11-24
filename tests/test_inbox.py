@@ -2301,6 +2301,27 @@ def test_record_keeps_location_pin(tmp_path):
     assert entry["location"] == pin
 
 
+def test_record_keeps_contact_card(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    card = {"name": "carol", "destination_hash": "cc" * 16}
+    inbox.append(_record(id="msg-10", contact=card, direction="in"))
+
+    reloaded = Inbox(tmp_path / "inbox.json")
+    entry = reloaded.list_messages()[0]
+    assert entry["contact"] == card
+
+
+def test_record_drops_corrupt_contact_card(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(
+        _record(id="msg-10", contact={"name": "carol", "destination_hash": "zz"})
+    )
+
+    entry = inbox.list_messages()[0]
+    assert "contact" not in entry
+    assert len(inbox) == 1
+
+
 def test_record_drops_corrupt_location_pin(tmp_path):
     inbox = Inbox(tmp_path / "inbox.json")
     inbox.append(_record(id="msg-9", location={"lat": 91, "lon": 0}))

@@ -15,6 +15,7 @@ from tau.protocol import (
     ProtocolError,
     build_announce,
     clean_beacon,
+    clean_contact,
     clean_location,
     decode,
     derive_group_id,
@@ -23,6 +24,7 @@ from tau.protocol import (
     encode_message,
     excerpt_hash,
     generate_group_id,
+    contact_default_text,
     location_maps_url,
     mint_roster_attestation,
     normalize_message,
@@ -207,6 +209,33 @@ def test_clean_location_rejects_out_of_range_and_bad_types():
     assert clean_location("34.05,-83.88") is None
 
 
+def test_clean_contact_accepts_named_cards():
+    card = {"name": "carol", "destination_hash": "cc" * 16}
+    assert clean_contact(card) == card
+    # Whitespace trims and an uppercase hash lowercases, like a pin.
+    assert clean_contact(
+        {"name": "  carol  ", "destination_hash": "CC" * 16}
+    ) == card
+    assert clean_contact(None) is None
+
+
+def test_clean_contact_rejects_malformed_cards():
+    assert clean_contact({"name": "carol", "destination_hash": "zz"}) is None
+    assert clean_contact({"name": "carol", "destination_hash": "cc" * 8}) is None
+    assert clean_contact({"name": "carol"}) is None
+    assert clean_contact({"destination_hash": "cc" * 16}) is None
+    assert clean_contact({"name": "", "destination_hash": "cc" * 16}) is None
+    assert clean_contact({"name": "   ", "destination_hash": "cc" * 16}) is None
+    assert clean_contact({"name": 42, "destination_hash": "cc" * 16}) is None
+    assert clean_contact({"name": "carol", "destination_hash": 42}) is None
+    assert clean_contact("carol") is None
+
+
+def test_contact_default_text_names_peer_and_short_hash():
+    card = {"name": "carol", "destination_hash": "cc" * 16}
+    assert contact_default_text(card) == "👤 Shared contact: carol (cccccccc…)"
+
+
 def test_parse_location_arg():
     assert parse_location_arg("34.05,-83.88 Rock Springs Park") == {
         "lat": 34.05,
@@ -236,6 +265,31 @@ def test_message_roundtrip_with_location():
     parsed = parse_message(data)
     assert parsed["text"] == "meet here"
     assert parsed["location"] == pin
+
+
+def test_message_roundtrip_with_contact():
+    card = {"name": "carol", "destination_hash": "cc" * 16}
+    data = encode_message("meet carol", message_id="b" * 32, contact=card)
+    parsed = parse_message(data)
+    assert parsed["text"] == "meet carol"
+    assert parsed["contact"] == card
+    # A malformed card on the wire drops instead of the message.
+    dropped = parse_message(
+        encode(
+            {
+                "type": "message",
+                "text": "hi",
+                "contact": {"name": "carol", "destination_hash": "zz"},
+            }
+        )
+    )
+    assert dropped["contact"] is None
+    assert dropped["text"] == "hi"
+    # A card given to encode must be valid.
+    with pytest.raises(ProtocolError):
+        encode_message("hi", contact={"name": "carol", "destination_hash": "zz"})
+    # A message without a card carries none.
+    assert parse_message(encode_message("hi", message_id="c" * 32))["contact"] is None
 
 
 def test_clean_beacon_accepts_valid_marker():
@@ -314,6 +368,32 @@ def test_group_message_roundtrip_with_location():
             creator=members[0],
             members=members,
             location={"lat": 91, "lon": 0},
+        )
+
+
+def test_group_message_roundtrip_with_contact():
+    members = ["ab" * 16, "cd" * 16, "ef" * 16]
+    card = {"name": "carol", "destination_hash": "cc" * 16}
+    data = encode_group_message(
+        "meet carol",
+        message_id="b" * 32,
+        group_id=derive_group_id(members[0], "weekend", members),
+        group_name="weekend",
+        creator=members[0],
+        members=members,
+        contact=card,
+    )
+    parsed = parse_group_message(data)
+    assert parsed["text"] == "meet carol"
+    assert parsed["contact"] == card
+    with pytest.raises(ProtocolError):
+        encode_group_message(
+            "hi",
+            group_id=derive_group_id(members[0], "weekend", members),
+            group_name="weekend",
+            creator=members[0],
+            members=members,
+            contact={"name": "carol", "destination_hash": "zz"},
         )
 
 

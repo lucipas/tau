@@ -547,6 +547,137 @@ def test_parser_send_location():
     assert args.location == "34.05,-83.88 Park"
 
 
+def test_parser_send_contact():
+    parser = cli.build_parser()
+    args = parser.parse_args(["send", "--to", "alice", "--contact", "carol"])
+    assert args.contact == "carol"
+    args = parser.parse_args(
+        ["group", "send", "weekend", "meet carol", "--contact", "carol"]
+    )
+    assert args.contact == "carol"
+
+
+def _seed_contact_peer(data_dir, name="carol", hash_hex="cc" * 16):
+    """Register a peer the --contact flag can resolve, in *data_dir*."""
+    from pathlib import Path
+
+    Path(data_dir).mkdir(parents=True, exist_ok=True)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(bytes.fromhex(hash_hex), b"\x03" * 64, name=name, now=1.0)
+    registry.save()
+    return config
+
+
+def test_send_contact_reaches_node_and_defaults_text(
+    tmp_path, capsys, monkeypatch
+):
+    # A bare card needs no message text: the card line becomes the
+    # text, and the card rides as a structured field.  stdin is not a
+    # TTY under pytest, so stand in a TTY for the default-text branch.
+    import io
+    import sys
+
+    class _TtyStdin(io.StringIO):
+        def isatty(self):
+            return True
+
+    monkeypatch.setattr(sys, "stdin", _TtyStdin())
+    _seed_contact_peer(tmp_path / "node")
+    code = _run_send(
+        tmp_path,
+        monkeypatch,
+        ["--to", "alice", "--contact", "carol"],
+        behaviour={"alice": "delivered"},
+    )
+    assert code == 0
+    node = _FakeSendNode.instances[-1]
+    assert node.calls == [("alice", "👤 Shared contact: carol (cccccccc…)")]
+    assert node.send_kwargs[0]["contact"] == {
+        "name": "carol",
+        "destination_hash": "cc" * 16,
+    }
+    assert node.send_kwargs[0]["kind"] is None
+
+
+def test_send_contact_with_text_keeps_text(tmp_path, capsys, monkeypatch):
+    _seed_contact_peer(tmp_path / "node")
+    code = _run_send(
+        tmp_path,
+        monkeypatch,
+        ["--to", "alice", "--contact", "carol", "meet carol"],
+        behaviour={"alice": "delivered"},
+    )
+    assert code == 0
+    node = _FakeSendNode.instances[-1]
+    assert node.calls == [("alice", "meet carol")]
+    assert node.send_kwargs[0]["contact"] == {
+        "name": "carol",
+        "destination_hash": "cc" * 16,
+    }
+
+
+def test_send_contact_refuses_unknown_peer(tmp_path, capsys, monkeypatch):
+    code = _run_send(
+        tmp_path, monkeypatch, ["--to", "alice", "--contact", "nobody", "hi"]
+    )
+    assert code == 1
+    assert "unknown peer" in capsys.readouterr().err
+
+
+def test_send_contact_refuses_blocked_peer(tmp_path, capsys, monkeypatch):
+    config = _seed_contact_peer(tmp_path / "node")
+    save_blocklist(
+        config.blocklist_path, BlockList(blocked=frozenset({"cc" * 16}))
+    )
+    code = _run_send(
+        tmp_path,
+        monkeypatch,
+        ["--to", "alice", "--contact", "carol", "hi"],
+    )
+    assert code == 1
+    assert "blocked peer" in capsys.readouterr().err
+
+
+def test_send_contact_refuses_sharing_yourself(tmp_path, capsys, monkeypatch):
+    data_dir = _init_node(tmp_path, "node", "bob")
+    capsys.readouterr()  # drain the --json output of `tau init`
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    identity = load_identity(config.identity_path)
+    own_hash = destination_hash(identity).hex()
+    _seed_contact_peer(data_dir, name="me", hash_hex=own_hash)
+    code = _run_send(
+        tmp_path, monkeypatch, ["--to", "alice", "--contact", "me", "hi"]
+    )
+    assert code == 1
+    assert "cannot share your own contact" in capsys.readouterr().err
+
+
+def test_group_send_contact_reaches_node(tmp_path, capsys, monkeypatch):
+    data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
+    _seed_contact_peer(data_dir)
+    monkeypatch.setattr(cli, "TauNode", _FakeGroupSendNode)
+    _FakeGroupSendNode.instances.clear()
+    code = cli.main(
+        [
+            "group",
+            "send",
+            "--data-dir",
+            str(data_dir),
+            "weekend",
+            "meet carol",
+            "--contact",
+            "carol",
+        ]
+    )
+    assert code == 0
+    node = _FakeGroupSendNode.instances[-1]
+    assert node.send_kwargs[0]["contact"] == {
+        "name": "carol",
+        "destination_hash": "cc" * 16,
+    }
+
+
 def test_send_location_reaches_node_and_defaults_text(
     tmp_path, capsys, monkeypatch
 ):
@@ -629,6 +760,31 @@ def test_print_message_entry_shows_location_pin(tmp_path, capsys):
     assert "📍 Rock Springs Park — 34.05, -83.88" in out
     assert "openstreetmap.org" in out
     assert "mlat=34.05&mlon=-83.88" in out
+
+
+def test_print_message_entry_shows_contact_card(tmp_path, capsys):
+    from tau.inbox import Inbox
+    from tau.peers import PeerRegistry
+
+    config = TauConfig.resolve(data_dir=tmp_path / "node", name="bob")
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    entry = {
+        "from": "alice",
+        "destination": "ab" * 16,
+        "text": "👤 Shared contact: carol (cccccccc…)",
+        "kind": "contact",
+        "sent_at": 10.0,
+        "received_at": 20.0,
+        "id": "msg-1",
+        "direction": "in",
+        "contact": {"name": "carol", "destination_hash": "cc" * 16},
+    }
+    cli._print_message_entry(
+        inbox, registry, entry, blocked=set(), own_hash="00" * 16
+    )
+    out = capsys.readouterr().out
+    assert "👤 carol (cccccccccccccccccccccccccccccccc)" in out
 
 
 def test_outbox_lists_scheduled_entry_next_try(tmp_path, capsys):

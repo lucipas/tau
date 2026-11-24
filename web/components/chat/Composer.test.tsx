@@ -1,6 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
-import Composer, { MAX_FILE_BYTES, validateFile, validateLocation, validatePoll } from "./Composer";
+import Composer, {
+  MAX_FILE_BYTES,
+  validateContact,
+  validateFile,
+  validateLocation,
+  validatePoll,
+} from "./Composer";
 describe("validateFile", () => {
   it("accepts files at or under 10 MiB", () => {
     const ok = new File([new ArrayBuffer(MAX_FILE_BYTES)], "ok.bin");
@@ -35,6 +41,13 @@ describe("validateLocation", () => {
     expect(validateLocation("34.05", "-83.88", "x".repeat(201))).toMatch(/at most 200/);
     expect(validateLocation("34.05", "-83.88", "Rock Springs Park")).toBeNull();
     expect(validateLocation("34.05", "-83.88", "")).toBeNull();
+  });
+});
+
+describe("validateContact", () => {
+  it("requires a peer picked from the list", () => {
+    expect(validateContact("")).toMatch(/Choose a peer/);
+    expect(validateContact("cc".repeat(16))).toBeNull();
   });
 });
 
@@ -102,6 +115,41 @@ describe("Composer", () => {
         location: { lat: 34.05, lon: -83.88, name: "Rock Springs Park" },
       }),
     );
+  });
+
+  it("shares a contact card from the picker", async () => {
+    const onSend = vi.fn();
+    render(
+      <Composer
+        contactPeers={[
+          { key: "cc".repeat(16), name: "carol" },
+          { key: "dd".repeat(16), name: "dave" },
+        ]}
+        onSend={onSend}
+        onSendFile={() => undefined}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "👤 Contact" }));
+    fireEvent.click(screen.getByText("Share contact"));
+    expect(screen.getByRole("alert").textContent).toMatch(/Choose a peer/);
+    expect(onSend).not.toHaveBeenCalled();
+
+    fireEvent.change(screen.getByLabelText("Peer to share"), {
+      target: { value: "cc".repeat(16) },
+    });
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "meet carol" } });
+    fireEvent.click(screen.getByText("Share contact"));
+    expect(onSend).toHaveBeenCalledWith(
+      "meet carol",
+      expect.objectContaining({
+        contact: { name: "carol", destination_hash: "cc".repeat(16) },
+      }),
+    );
+  });
+
+  it("hides the Contact toggle without known peers", () => {
+    render(<Composer onSend={() => undefined} onSendFile={() => undefined} />);
+    expect(screen.queryByRole("button", { name: "👤 Contact" })).toBeNull();
   });
 
   it("passes the chosen disappearing expiry to onSend", async () => {
