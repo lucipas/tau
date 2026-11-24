@@ -14376,9 +14376,14 @@ def _history_retry_allowed(
     # cannot land between the test and the decision.  If the mailbox
     # cannot be read in time, the markers are unknown and the gate
     # falls back to the missing-record check rather than blocking a
-    # legitimate retry.
+    # legitimate retry.  The mailbox is constructed with its load
+    # deferred: an eager load would rewrite a file carrying duplicate
+    # ids under an unbounded transaction before this bounded one
+    # starts, hanging the gate despite the timeout (see #744).  The
+    # bounded transaction reloads the mailbox before checking the
+    # markers, so nothing is read from the empty initial state.
     try:
-        mailbox = Mailbox(config.mailbox_path)
+        mailbox = Mailbox(config.mailbox_path, defer_load=True)
         with mailbox.transaction(timeout=_HISTORY_RETRY_LOCK_TIMEOUT):
             return any(
                 not _snapshot_record_retracted(mailbox, record)
