@@ -293,6 +293,7 @@ describe("PeerPanel group members", () => {
     // rotated the id. Null (the default) is a failed refresh: the
     // successor is not in any snapshot, so the panel must not navigate.
     successor: Group | null = null,
+    onSuccessorPending: (successorId: string, originHash: string) => void = () => {},
   ) {
     const tau = fakeTauSections({ peers });
     const snap = tau.snapshot;
@@ -301,7 +302,7 @@ describe("PeerPanel group members", () => {
     );
     return render(
       <TauContext.Provider value={tau}>
-        <PeerPanel conversation={conversation} />
+        <PeerPanel conversation={conversation} onSuccessorPending={onSuccessorPending} />
       </TauContext.Provider>,
     );
   }
@@ -447,6 +448,39 @@ describe("PeerPanel group members", () => {
       ).toBeTruthy(),
     );
     expect(window.location.hash).toBe("");
+    expect(
+      calls.some(
+        (c) =>
+          c.method === "POST" && c.url.includes("/api/groups/remove-member"),
+      ),
+    ).toBe(true);
+  });
+
+  it("hands the successor to the parent when the refresh cannot load it", async () => {
+    // The roster change landed but the snapshot fetch failed: the
+    // successor id lives only in this request, so the panel reports it
+    // up so a later refresh can still follow it.
+    const onSuccessorPending = vi.fn();
+    const { calls } = mockFetchBodies((url, method) => {
+      if (url.includes("/api/groups/remove-member")) {
+        return {
+          group: { ...memberGroup().group, id: NEW_ID },
+          previous_id: GROUP_ID,
+        };
+      }
+      return inviteOnly(url);
+    });
+    window.location.hash = `#chat?group=${GROUP_ID}`;
+    renderGroupPanel(memberGroup(), undefined, null, onSuccessorPending);
+    await waitFor(() => expect(screen.getByText("Members")).toBeTruthy());
+    fireEvent.click(screen.getByLabelText("Remove bob from group"));
+    fireEvent.click(screen.getByText("Confirm remove?"));
+    await waitFor(() =>
+      expect(onSuccessorPending).toHaveBeenCalledWith(
+        NEW_ID,
+        `#chat?group=${GROUP_ID}`,
+      ),
+    );
     expect(
       calls.some(
         (c) =>

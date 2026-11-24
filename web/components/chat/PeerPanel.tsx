@@ -74,7 +74,17 @@ function ActionButton({
   );
 }
 
-export default function PeerPanel({ conversation }: { conversation: Conversation | null }) {
+export default function PeerPanel({
+  conversation,
+  onSuccessorPending,
+}: {
+  conversation: Conversation | null;
+  // Called when a roster change rotated the group id but the refresh
+  // could not load the successor yet: the parent keeps the successor
+  // id + origin route as a pending navigation, so a later snapshot
+  // that contains the successor can still follow it.
+  onSuccessorPending?: (successorId: string, originHash: string) => void;
+}) {
   const tau = useTauContext();
   const actions = usePeerActions();
   const now = useNow();
@@ -207,6 +217,11 @@ export default function PeerPanel({ conversation }: { conversation: Conversation
           setError(
             "Members updated, but the new group couldn't be loaded yet — it will appear when the connection recovers.",
           );
+          // Hand the successor to the parent: the id lives only in
+          // this request, so without it a later successful refresh
+          // could never follow the successor and the retired thread
+          // would stay selected forever.
+          onSuccessorPending?.(result.group.id, startedAt);
         }
       }
     } catch (err) {
