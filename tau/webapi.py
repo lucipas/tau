@@ -160,6 +160,16 @@ script) can read what arrives from the mesh and send messages back:
                            "send_in": <seconds from now>}`` — at least one
                            of "text" / "send_in" is required
     GET  /api/backup       download a backup archive of the data directory
+    GET  /api/devices      this device and the pairing offers it issued
+                           (loopback only — a bundle holds the identity)
+    POST /api/devices/pair mint a pairing bundle for a second device
+                           (``{"history": true}`` by default, optional
+                           ``"ttl_seconds"``) and return its download URL
+    GET  /api/devices/bundle/<token> download a minted bundle, once
+                           (loopback only; the staged file is deleted
+                           after the download)
+    POST /api/devices/revoke cancel an outstanding pairing offer
+                           ``{"token": "<token or unique prefix>"}``
     GET  /api/doctor       health verdicts for the data directory (``tau doctor``)
     POST /api/bundle/export build a signed sneakernet bundle
                            ``{"include_tan": true}`` for Tan posts too
@@ -312,6 +322,13 @@ from .archive import (
     load_archive,
     load_archived_set,
     save_archive,
+)
+from .devices import (
+    DEFAULT_PAIRING_TTL_SECONDS,
+    DeviceRegistry,
+    DevicesError,
+    build_pairing_bundle,
+    snapshot_pairing_history,
 )
 from .disappearing import (
     DisappearingError,
@@ -521,6 +538,9 @@ MAX_SUBSCRIBERS = 32
 # Backup archives in flight at once (being built or still streaming).  Each
 # one is a full copy of the data directory in temporary storage.
 MAX_CONCURRENT_BACKUPS = 2
+# Pairing bundles staged for download at once.  Each holds a private
+# identity in temporary storage until it is downloaded or expires.
+MAX_STAGED_DEVICE_BUNDLES = 4
 # How long shutdown waits for an archive build to finish before cleanup.
 _BACKUP_SHUTDOWN_WAIT = 3.0
 SUBSCRIBER_QUEUE_SIZE = 256
@@ -1456,6 +1476,15 @@ class WebBridge:
         self._backup_idle = threading.Condition(self._backup_lock)
         self._backups_building = 0
         self._backup_artifacts: Set[Path] = set()
+        # Pairing bundles minted for download, guarded by _backup_lock
+        # like the archives: each holds the private identity, keyed by
+        # token, with its download filename and expiry, and deleted on
+        # download, revoke, expiry, or stop.
+        self._device_bundles: Dict[str, Tuple[Path, str, float]] = {}
+        # Bundles claimed for download, guarded by _backup_lock like
+        # the staged map: a claimed file is still the only copy of the
+        # private identity, so stop() deletes these too.
+        self._device_bundles_in_flight: Set[Path] = set()
         self._started_at = time.time()
 
     # -- lifecycle ---------------------------------------------------------
@@ -1539,7 +1568,15 @@ class WebBridge:
             )
             leftovers = list(self._backup_artifacts)
             self._backup_artifacts.clear()
+            device_leftovers = [
+                path for path, _name, _expires in self._device_bundles.values()
+            ]
+            self._device_bundles.clear()
+            device_leftovers.extend(self._device_bundles_in_flight)
+            self._device_bundles_in_flight.clear()
         for path in leftovers:
+            _unlink_quietly(path)
+        for path in device_leftovers:
             _unlink_quietly(path)
 
     def finish_backup(self, path: Path) -> None:
@@ -1547,6 +1584,216 @@ class WebBridge:
         with self._backup_lock:
             self._backup_artifacts.discard(path)
         _unlink_quietly(path)
+
+    def finish_device_bundle(self, token: str) -> None:
+        """Release a bundle staged by :meth:`pair_device` and delete it."""
+        with self._backup_lock:
+            staged = self._device_bundles.pop(token, None)
+        if staged is not None:
+            _unlink_quietly(staged[0])
+
+    def finish_claimed_device_bundle(self, path: Path) -> None:
+        """Remove a bundle claimed by :meth:`claim_device_bundle` and delete it."""
+        with self._backup_lock:
+            self._device_bundles_in_flight.discard(path)
+        _unlink_quietly(path)
+
+    def _prune_device_bundles_locked(self) -> None:
+        """Delete staged bundles past expiry; caller holds ``_backup_lock``.
+
+        A bundle whose offer expired is no longer redeemable, so its
+        staged file must not linger in the temp directory waiting for
+        a download that can never succeed.
+        """
+        now = time.time()
+        expired = [
+            token
+            for token, (_path, _name, expires) in self._device_bundles.items()
+            if expires <= now
+        ]
+        for token in expired:
+            path, _name, _expires = self._device_bundles.pop(token)
+            _unlink_quietly(path)
+
+    # -- linked devices ----------------------------------------------------
+
+    def _devices_registry(self) -> DeviceRegistry:
+        """This node's device registry, or raise when there is none."""
+        config = getattr(self.node, "config", None)
+        if config is None or getattr(config, "devices_path", None) is None:
+            raise WebBridgeError(
+                "this node has no data directory for linked devices"
+            )
+        return DeviceRegistry(config.devices_path)
+
+    def devices(self) -> Dict[str, Any]:
+        """This device and the pairing offers it issued (#759).
+
+        Mirrors ``tau devices list``: the identity hash, the
+        destination, the pairing this node itself redeemed (when it
+        is a second device), and every unexpired offer it minted.
+        """
+        from .identity import destination_hash
+
+        identity = getattr(self.node, "identity", None)
+        registry = self._devices_registry()
+        return {
+            "identity": identity.hexhash if identity is not None else None,
+            "destination": (
+                destination_hash(identity).hex()
+                if identity is not None
+                else None
+            ),
+            "paired_from": registry.paired_from,
+            "issued_offers": registry.issued_offers(),
+        }
+
+    def pair_device(
+        self,
+        *,
+        history: bool = True,
+        ttl_seconds: float = DEFAULT_PAIRING_TTL_SECONDS,
+    ) -> Dict[str, Any]:
+        """Mint a pairing bundle for a second device, staged for download.
+
+        The same bundle ``tau devices pair`` writes to a file
+        (identity + bounded history snapshot by default, 1-hour TTL),
+        recorded as an issued offer first — so a failed mint never
+        leaves a redeemable bundle the console cannot see, and a
+        recorded offer never points at a bundle that was never
+        staged.  The bridge runs inside the serving node, so the
+        instance lock is skipped: this process already holds it,
+        exactly like :meth:`backup`.  Returns the token, expiry,
+        history size, download URL and filename; the caller claims
+        the staged file with :meth:`claim_device_bundle` and deletes
+        it after the transfer attempt.
+        """
+        identity = getattr(self.node, "identity", None)
+        if identity is None:
+            raise WebBridgeError(
+                "no identity yet; run `tau init` first"
+            )
+        registry = self._devices_registry()
+        history_doc = None
+        if history:
+            inbox = getattr(self.node, "inbox", None)
+            if inbox is not None:
+                history_doc = snapshot_pairing_history(
+                    inbox.export_document()
+                )
+        # A bad TTL or an unsignable identity raises DevicesError, a
+        # ValueError, so the route reports it as a 400 like the other
+        # bridge calls.
+        bundle = build_pairing_bundle(
+            identity, ttl_seconds=float(ttl_seconds), history=history_doc
+        )
+        # Stage the bundle beside nothing: the temp file is the only
+        # copy, owner-only, and it is removed on any failure below so
+        # a mint that never completes leaves no redeemable bundle
+        # behind — the same discipline `tau devices pair` applies to
+        # its staging file (see #717).
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        filename = f"tau-pairing-{bundle['token'][:8]}-{stamp}.json"
+        fd, tmp_name = tempfile.mkstemp(prefix="tau-pairing-", suffix=".json")
+        staging = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(bundle, indent=2, sort_keys=True, ensure_ascii=False)
+                    + "\n"
+                )
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(staging, 0o600)
+        except BaseException:
+            staging.unlink(missing_ok=True)
+            raise
+        # The shutdown check, the staged-bundle cap, the offer record and
+        # the staging registration all happen under one lock section, so
+        # stop() either sees this bundle to delete or the mint is refused
+        # with no offer recorded.  Nothing after record_issued can fail,
+        # so a recorded offer always has its staged bundle.
+        with self._backup_lock:
+            if self._closing.is_set():
+                staging.unlink(missing_ok=True)
+                raise WebBridgeError("the web console is shutting down")
+            self._prune_device_bundles_locked()
+            if len(self._device_bundles) >= MAX_STAGED_DEVICE_BUNDLES:
+                staging.unlink(missing_ok=True)
+                raise WebBridgeError(
+                    "too many pairing bundles waiting for download; "
+                    "try again after one expires or is downloaded"
+                )
+            try:
+                registry.record_issued(
+                    bundle["token"],
+                    bundle["created_at"],
+                    bundle["expires_at"],
+                    owner=bundle["primary"],
+                )
+            except BaseException:
+                staging.unlink(missing_ok=True)
+                raise
+            self._device_bundles[bundle["token"]] = (
+                staging,
+                filename,
+                float(bundle["expires_at"]),
+            )
+        history_doc = bundle.get("history") or {}
+        return {
+            "token": bundle["token"],
+            "expires_at": bundle["expires_at"],
+            "history_messages": len(history_doc.get("messages", [])),
+            "download": f"/api/devices/bundle/{bundle['token']}",
+            "filename": filename,
+        }
+
+    def device_bundle(self, token: str) -> Tuple[Path, str, float]:
+        """Staged bundle file, filename and expiry for *token*, or raise.
+
+        A read-only peek for HEAD requests: it does not consume the
+        bundle, so a HEAD never destroys the only copy.
+        """
+        with self._backup_lock:
+            staged = self._device_bundles.get(token)
+        if staged is None:
+            raise WebBridgeError(
+                "no pairing bundle staged for that token; mint a new one"
+            )
+        return staged
+
+    def claim_device_bundle(self, token: str) -> Tuple[Path, str]:
+        """Atomically take the staged bundle for *token* for download.
+
+        The entry is popped under the lock before streaming, so a
+        second concurrent GET for the same token gets a missing-bundle
+        response instead of streaming the same single-use bundle twice.
+        The claimed file is tracked in flight until the caller deletes
+        it after the transfer attempt, so stop() can still clean it up
+        if shutdown overlaps a stalled download.
+        """
+        with self._backup_lock:
+            staged = self._device_bundles.pop(token, None)
+            if staged is not None:
+                self._device_bundles_in_flight.add(staged[0])
+        if staged is None:
+            raise WebBridgeError(
+                "no pairing bundle staged for that token; mint a new one"
+            )
+        return staged[0], staged[1]
+
+    def revoke_device_offer(self, token: str) -> Dict[str, Any]:
+        """Cancel an outstanding pairing offer, like ``tau devices revoke``.
+
+        The staged bundle for the offer is deleted with it: a revoked
+        offer must not leave a downloadable copy behind.  A bundle
+        file already downloaded still redeems until it expires — the
+        caller must say so, like ``tau devices revoke`` does.
+        """
+        registry = self._devices_registry()
+        revoked = registry.revoke_offer(token)
+        self.finish_device_bundle(revoked["token"])
+        return revoked
 
     # -- message history ---------------------------------------------------
 
@@ -13464,6 +13711,25 @@ class _WebHandler(BaseHTTPRequestHandler):
                 groups = self.bridge.groups()
                 self._send_json({"groups": groups, "count": len(groups)}, head_only)
                 return
+            if path == "/api/devices":
+                # The list names issued offers by token, and a token
+                # alone cannot redeem a bundle — but the offers and the
+                # pairing itself are owner-only state, so this stays
+                # loopback-only like the bundle download.
+                if not _is_loopback_client(self.client_address[0]):
+                    self._send_error(
+                        HTTPStatus.FORBIDDEN,
+                        "linked devices are only available from localhost",
+                        head_only,
+                    )
+                    return
+                try:
+                    self._send_json(self.bridge.devices(), head_only)
+                except WebBridgeError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 503
+                    )
+                return
             if path == "/api/groups/left":
                 self._send_json(self.bridge.left_groups(), head_only)
                 return
@@ -13753,6 +14019,65 @@ class _WebHandler(BaseHTTPRequestHandler):
                     # The archive holds the node identity: never leave
                     # the temp file behind after the download.
                     self.bridge.finish_backup(archive)
+            if path.startswith("/api/devices/bundle/"):
+                # A pairing bundle holds the private identity: it goes
+                # only to the local machine, like the backup archive.
+                if not _is_loopback_client(self.client_address[0]):
+                    self._send_error(
+                        HTTPStatus.FORBIDDEN,
+                        "pairing bundles are only available from localhost",
+                        head_only,
+                    )
+                    return
+                token = path[len("/api/devices/bundle/"):]
+                try:
+                    if head_only:
+                        # A HEAD peeks without consuming the download.
+                        staged, filename, _expires = self.bridge.device_bundle(
+                            token
+                        )
+                    else:
+                        # Claim before streaming, so a second concurrent
+                        # GET gets a missing-bundle response instead of
+                        # streaming the same single-use bundle twice.
+                        staged, filename = self.bridge.claim_device_bundle(token)
+                except WebBridgeError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 404
+                    )
+                    return
+                try:
+                    self._send_file(
+                        staged, filename, head_only, content_type="application/json"
+                    )
+                except FileNotFoundError:
+                    # Only a missing file reads as gone: the open
+                    # happens before any header is committed, so a
+                    # permissions or I/O failure is not this case — it
+                    # reaches the logged internal-error path instead.
+                    # A missing file means a concurrent download already
+                    # consumed the bundle, or shutdown deleted it.
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": (
+                                    "pairing bundle is no longer available; "
+                                    "mint a new one"
+                                )
+                            }
+                        },
+                        head_only,
+                        404,
+                    )
+                    return
+                finally:
+                    # The staged file is the only copy of the bundle:
+                    # delete it after the download attempt, so a bundle
+                    # never lingers in the temp directory — except on a
+                    # HEAD, which must not consume the download.
+                    if not head_only:
+                        self.bridge.finish_claimed_device_bundle(staged)
+                return
             if path == "/api/doctor":
                 try:
                     self._send_json(self.bridge.doctor(), head_only)
@@ -14784,6 +15109,102 @@ class _WebHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": {"message": str(exc)}}, head_only, 503)
                     return
                 self._send_json({"ok": True, "group": group}, head_only)
+                return
+            if path == "/api/devices/pair":
+                # Minting a bundle hands out the private identity, so
+                # only the local machine may do it — like the backup
+                # and private-note endpoints.
+                if not _is_loopback_client(self.client_address[0]):
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": (
+                                    "pairing bundles are only available "
+                                    "from localhost"
+                                )
+                            }
+                        },
+                        head_only,
+                        403,
+                    )
+                    return
+                history = body.get("history", True)
+                if not isinstance(history, bool):
+                    self._send_json(
+                        {"error": {"message": "field 'history' must be a boolean"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                ttl_seconds = body.get(
+                    "ttl_seconds", DEFAULT_PAIRING_TTL_SECONDS
+                )
+                if (
+                    isinstance(ttl_seconds, bool)
+                    or not isinstance(ttl_seconds, (int, float))
+                ):
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "field 'ttl_seconds' must be a number"
+                            }
+                        },
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    result = self.bridge.pair_device(
+                        history=history, ttl_seconds=ttl_seconds
+                    )
+                except (ValueError, DevicesError) as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 400
+                    )
+                    return
+                except WebBridgeError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 503
+                    )
+                    return
+                self._send_json({"ok": True, **result}, head_only)
+                return
+            if path == "/api/devices/revoke":
+                if not _is_loopback_client(self.client_address[0]):
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": (
+                                    "linked devices are only available "
+                                    "from localhost"
+                                )
+                            }
+                        },
+                        head_only,
+                        403,
+                    )
+                    return
+                token = body.get("token")
+                if not isinstance(token, str) or not token.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'token' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    revoked = self.bridge.revoke_device_offer(token.strip())
+                except (ValueError, DevicesError) as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 400
+                    )
+                    return
+                except WebBridgeError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 503
+                    )
+                    return
+                self._send_json({"ok": True, "revoked": revoked}, head_only)
                 return
             if path == "/api/groups/delete":
                 target = body.get("group")
@@ -18783,7 +19204,12 @@ class _WebHandler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Expose-Headers", "Content-Disposition")
 
     def _send_file(
-        self, path: Path, filename: str, head_only: bool = False
+        self,
+        path: Path,
+        filename: str,
+        head_only: bool = False,
+        *,
+        content_type: str = "application/gzip",
     ) -> None:
         """Stream *path* as a download named *filename*."""
         # Open before any header is committed: a missing or unreadable
@@ -18791,7 +19217,7 @@ class _WebHandler(BaseHTTPRequestHandler):
         with path.open("rb") as handle:
             size = os.fstat(handle.fileno()).st_size
             self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", "application/gzip")
+            self.send_header("Content-Type", content_type)
             self.send_header(
                 "Content-Disposition", f'attachment; filename="{filename}"'
             )

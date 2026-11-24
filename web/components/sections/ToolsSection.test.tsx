@@ -8,9 +8,13 @@ import { mockFetch } from "./test-utils";
 
 let calls: string[] = [];
 let allowlistEntries: { destination: string; name: string }[] = [];
+let deviceOffers: { token: string; created_at: number; expires_at: number; owner: string | null }[] = [];
 
 beforeEach(() => {
   allowlistEntries = [{ destination: "c".repeat(32), name: "carol" }];
+  deviceOffers = [
+    { token: "ab".repeat(16), created_at: 1700000000, expires_at: 1794000000, owner: null },
+  ];
   const router = mockFetch((url, method) => {
     if (url.includes("/api/doctor")) {
       return {
@@ -33,6 +37,31 @@ beforeEach(() => {
       return { enabled: true, entries: allowlistEntries };
     }
     if (url.includes("/api/bundle/export")) return { bundle: true };
+    if (url.includes("/api/devices/pair")) {
+      return {
+        ok: true,
+        token: "ab".repeat(16),
+        expires_at: 1794000000,
+        history_messages: 0,
+        download: `/api/devices/bundle/${"ab".repeat(16)}`,
+        filename: "tau-pairing-abababab-20261124-035800.json",
+      };
+    }
+    if (url.includes("/api/devices/revoke")) {
+      deviceOffers = [];
+      return {
+        ok: true,
+        revoked: { token: "ab".repeat(16), created_at: 1700000000, expires_at: 1794000000, owner: null },
+      };
+    }
+    if (url.includes("/api/devices")) {
+      return {
+        identity: "cd".repeat(32),
+        destination: "ef".repeat(32),
+        paired_from: null,
+        issued_offers: deviceOffers,
+      };
+    }
     return { ok: true };
   });
   calls = router.calls;
@@ -81,5 +110,54 @@ describe("ToolsSection", () => {
     render(<ToolsSection />);
     const link = await screen.findByRole("link", { name: /Download backup/ });
     expect(link.getAttribute("href")).toContain("/api/backup");
+  });
+
+  it("lists this device and its outstanding pairing offers", async () => {
+    render(<ToolsSection />);
+    expect(await screen.findByText("token abababab…")).toBeTruthy();
+    expect(screen.getByText(`This device: ${"cd".repeat(32)}`)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Revoke" })).toBeTruthy();
+  });
+
+  it("pairs a new device and revokes an offer", async () => {
+    render(<ToolsSection />);
+    await screen.findByText("token abababab…");
+    fireEvent.click(screen.getByRole("button", { name: "Pair a new device" }));
+    await waitFor(() => expect(calls).toContain("POST /api/devices/pair"));
+    expect(
+      await screen.findByText(/Pairing bundle downloaded/),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Revoke" }));
+    await waitFor(() => expect(calls).toContain("POST /api/devices/revoke"));
+    expect(
+      await screen.findByText(/still redeems until it expires/),
+    ).toBeTruthy();
+    await waitFor(() =>
+      expect(screen.queryByText("token abababab…")).toBeNull(),
+    );
+  });
+
+  it("shows the server error when linked devices fail", async () => {
+    mockFetch((url) => {
+      if (url.includes("/api/devices")) {
+        throw new Error("this node has no data directory for linked devices");
+      }
+      if (url.includes("/api/doctor")) {
+        return {
+          ok: true,
+          checks: [{ name: "Node running", ok: true, message: "up" }],
+        };
+      }
+      if (url.includes("/api/allowlist")) {
+        return { enabled: true, entries: allowlistEntries };
+      }
+      return { ok: true };
+    });
+    render(<ToolsSection />);
+    expect(
+      await screen.findByText(
+        "this node has no data directory for linked devices",
+      ),
+    ).toBeTruthy();
   });
 });

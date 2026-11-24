@@ -1,23 +1,36 @@
 // ToolsSection.tsx — node tools: doctor / health report, backup
-// download, sneakernet bundle export/import, Tan export/import, and the
-// allowlist (add / remove / enable / disable). Built on api.ts.
+// download, sneakernet bundle export/import, Tan export/import, linked
+// devices (pair / list / revoke), and the allowlist (add / remove /
+// enable / disable). Built on api.ts.
 
 "use client";
 
 import { useEffect, useState } from "react";
 import {
+  ApiError,
   allowlistAdd,
   allowlistRemove,
   allowlistSetEnabled,
   backupUrl,
+  deviceBundleUrl,
   exportBundle,
   exportTan,
   getAllowlist,
+  getDevices,
   getDoctor,
   importBundle,
   importTan,
+  pairDevice,
+  revokeDeviceOffer,
 } from "@/lib/api";
-import type { AllowList, DoctorReport } from "@/lib/types";
+import type { AllowList, DevicesInfo, DoctorReport } from "@/lib/types";
+
+function downloadBundleFile(url: string, filename: string) {
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+}
 
 function downloadJson(filename: string, doc: unknown) {
   const blob = new Blob([JSON.stringify(doc, null, 2)], {
@@ -38,12 +51,15 @@ async function readJsonFile(file: File): Promise<unknown> {
 export default function ToolsSection() {
   const [doctor, setDoctor] = useState<DoctorReport | null>(null);
   const [allowlist, setAllowlist] = useState<AllowList | null>(null);
+  const [devices, setDevices] = useState<DevicesInfo | null>(null);
+  const [devicesError, setDevicesError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [addTarget, setAddTarget] = useState("");
   const [includeTan, setIncludeTan] = useState(false);
+  const [includeHistory, setIncludeHistory] = useState(true);
 
   const refresh = async () => {
     try {
@@ -53,6 +69,24 @@ export default function ToolsSection() {
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+    }
+    // Linked devices are loopback-only: a remote console gets a 403
+    // here, which must not fail the whole Tools page — and a local
+    // failure (no data directory, transient error) must not hide
+    // behind the localhost explanation either: the 403 keeps the
+    // localhost text, any other failure shows the server's message.
+    try {
+      setDevices(await getDevices());
+      setDevicesError(null);
+    } catch (err) {
+      setDevices(null);
+      setDevicesError(
+        err instanceof ApiError && err.status === 403
+          ? null
+          : err instanceof Error
+            ? err.message
+            : String(err),
+      );
     } finally {
       setLoading(false);
     }
@@ -249,6 +283,102 @@ export default function ToolsSection() {
             />
           </label>
         </div>
+      </section>
+
+      <section className="border-b border-zinc-800 px-3 py-4 sm:px-4" aria-label="Linked devices">
+        <h2 className="text-sm font-bold text-zinc-100">Linked devices</h2>
+        <p className="mt-1 text-xs leading-relaxed text-zinc-500">
+          Pair a second device with this identity, or cancel a pairing offer you no
+          longer need. A bundle carries the private identity — treat the downloaded
+          file like an identity backup, and redeem it before it expires.
+        </p>
+        {devices === null && (
+          <p className="py-2 text-sm text-zinc-500">
+            {loading
+              ? "Loading linked devices…"
+              : (devicesError ??
+                "Linked devices are available when the console runs on the same machine as the node.")}
+          </p>
+        )}
+        {devices !== null && (
+          <>
+            <p className="mt-2 truncate font-mono text-xs text-zinc-400">
+              This device: {devices.identity ?? "no identity yet"}
+            </p>
+            {devices.paired_from && (
+              <p className="mt-0.5 text-xs text-zinc-500">
+                Paired from {devices.paired_from.primary.slice(0, 8)}… on{" "}
+                {new Date(devices.paired_from.paired_at * 1000).toLocaleString()}
+              </p>
+            )}
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              <label className="flex items-center gap-1.5 text-xs text-zinc-300">
+                <input
+                  type="checkbox"
+                  checked={includeHistory}
+                  onChange={(e) => setIncludeHistory(e.target.checked)}
+                />
+                Include recent history in the bundle
+              </label>
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() =>
+                  void run(
+                    async () => {
+                      const result = await pairDevice({ history: includeHistory });
+                      downloadBundleFile(
+                        deviceBundleUrl(result.token),
+                        result.filename,
+                      );
+                      setDevices(await getDevices());
+                    },
+                    "Pairing bundle downloaded — copy it to the second device and run `tau devices redeem --from <file>` before it expires.",
+                  )
+                }
+                className="rounded-full bg-cyan-500 px-4 py-1.5 text-sm font-bold text-zinc-950 hover:bg-cyan-400 disabled:opacity-50"
+              >
+                Pair a new device
+              </button>
+            </div>
+            {devices.issued_offers.length === 0 && (
+              <p className="py-2 text-sm text-zinc-500">No outstanding pairing offers.</p>
+            )}
+            <ul className="mt-3 flex flex-col gap-2">
+              {devices.issued_offers.map((offer) => (
+                <li
+                  key={offer.token}
+                  className="flex items-center gap-2 rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-2"
+                >
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate font-mono text-sm font-semibold text-zinc-100">
+                      token {offer.token.slice(0, 8)}…
+                    </p>
+                    <p className="text-xs text-zinc-500">
+                      Expires {new Date(offer.expires_at * 1000).toLocaleString()}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() =>
+                      void run(
+                        async () => {
+                          await revokeDeviceOffer(offer.token);
+                          setDevices(await getDevices());
+                        },
+                        "Pairing offer revoked. A bundle file already downloaded still redeems until it expires — delete it.",
+                      )
+                    }
+                    className="shrink-0 rounded-full border border-red-800 px-3 py-1 text-xs text-red-400 hover:bg-red-950 disabled:opacity-50"
+                  >
+                    Revoke
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </>
+        )}
       </section>
 
       <section className="px-3 py-4 sm:px-4" aria-label="Allowlist">
