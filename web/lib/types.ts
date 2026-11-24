@@ -604,6 +604,36 @@ export interface DoctorReport {
   checks: DoctorCheck[];
 }
 
+/** One outstanding pairing offer this node issued (`tau devices list`). */
+export interface DeviceOffer {
+  token: string;
+  created_at: number;
+  expires_at: number;
+  owner: string | null;
+}
+
+/** Linked-devices state: this device, the pairing it redeemed, offers issued. */
+export interface DevicesInfo {
+  identity: string | null;
+  destination: string | null;
+  paired_from: {
+    token: string;
+    primary: string;
+    paired_at: number;
+  } | null;
+  issued_offers: DeviceOffer[];
+}
+
+/** Result of minting a pairing bundle: token, expiry, and its download URL. */
+export interface PairDeviceResult {
+  ok: boolean;
+  token: string;
+  expires_at: number;
+  history_messages: number;
+  download: string;
+  filename: string;
+}
+
 // ------------------------------------------------------------------ Tan --
 
 export type TanKind =
