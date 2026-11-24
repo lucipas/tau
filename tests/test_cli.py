@@ -14363,6 +14363,78 @@ def test_tan_post_with_image_stores_attachment(tmp_path, capsys):
     assert digest[:12] in out
 
 
+def test_tan_quote_with_image_stores_attachment(tmp_path, capsys):
+    import hashlib
+    import json
+
+    from tau.tangents.tan import feed, init_db, media_path
+
+    data_dir, png, digest = _post_image_fixture(tmp_path, capsys)
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        target = feed(conn)[0]["hash"]
+    finally:
+        conn.close()
+    code = cli.main(
+        [
+            "tan",
+            "quote",
+            "--data-dir",
+            str(data_dir),
+            "--no-publish",
+            target,
+            "with a picture",
+            "--image",
+            str(png),
+        ]
+    )
+    assert code == 0
+    capsys.readouterr()
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        posts = feed(conn)
+    finally:
+        conn.close()
+    assert len(posts) == 2
+    quote = posts[0]
+    assert quote["kind"] == "quote"
+    assert quote["target"] == target
+    assert quote["image"] == {
+        "sha256": digest,
+        "size": len(png.read_bytes()),
+        "mime": "image/png",
+        "name": "photo.png",
+    }
+    assert media_path(data_dir, digest) is not None
+
+    # --delay with --image queues the quote with the attachment.
+    code = cli.main(
+        [
+            "tan",
+            "quote",
+            "--data-dir",
+            str(data_dir),
+            target,
+            "later, with a picture",
+            "--image",
+            str(png),
+            "--delay",
+            "5m",
+        ]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "scheduled" in out
+    code = cli.main(
+        ["tan", "scheduled", "--data-dir", str(data_dir), "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert len(payload["scheduled"]) == 1
+    assert payload["scheduled"][0]["kind"] == "quote"
+    assert payload["scheduled"][0]["image"]["sha256"] == digest
+
+
 def test_tan_post_image_rejects_bad_input(tmp_path, capsys):
     data_dir = tmp_path / "node"
     assert cli.main(["init", "--data-dir", str(data_dir), "--json"]) == 0

@@ -702,18 +702,28 @@ def _normalize_post(mesg: Dict[str, Any], *, now: Optional[float] = None) -> Dic
             raise PostError("only polls can carry options")
         options = None
 
-    if kind == KIND_POST:
+    if kind in (KIND_POST, KIND_QUOTE):
+        # A quote is a standalone timeline item like a post, not a
+        # reply, so it may carry an image — the same signed descriptor
+        # and on-demand bytes as a post's.  A location stays post-only:
+        # a quote already names the place it answers through its
+        # target, and a second pin would fight the embedded original.
         image = (
             _clean_image(mesg["image"]) if mesg.get("image") is not None else None
         )
-        location = (
-            _clean_location(mesg["location"])
-            if mesg.get("location") is not None
-            else None
-        )
+        if kind == KIND_POST:
+            location = (
+                _clean_location(mesg["location"])
+                if mesg.get("location") is not None
+                else None
+            )
+        else:
+            if mesg.get("location") is not None:
+                raise PostError("only posts can carry a location")
+            location = None
     else:
         if mesg.get("image") is not None:
-            raise PostError("only posts can carry an image")
+            raise PostError("only posts and quotes can carry an image")
         if mesg.get("location") is not None:
             raise PostError("only posts can carry a location")
         image = None
@@ -2037,6 +2047,7 @@ def create_quote(
     name: str = "anonymous",
     now: Optional[float] = None,
     previous: Optional[str] = None,
+    image: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Create, sign and store a quote of the post *target*.
 
@@ -2053,7 +2064,12 @@ def create_quote(
     post the author has seen in full.  Quotes received from peers for
     parents that have not arrived yet are still stored through the
     sync path (:func:`store_post`) and shown without the embedded
-    original until the parent arrives.
+    original until the parent arrives.  When *image* is given — the
+    ``{sha256, size, mime, name}`` descriptor a post carries — the
+    quote carries it the same way: a quote is a top-level entry, so
+    the top-level-only image rule bars replies, not quotes.  Peers
+    on releases from before quotes could carry images reject such a
+    quote outright, the same way they reject expiring posts.
     """
     target = _require_hex(target, HASH_HEX_LENGTH, "target")
     timestamp = round(float(now if now is not None else time.time()), 3)
@@ -2070,6 +2086,7 @@ def create_quote(
     if _is_deleted(conn, existing):
         raise TanError("post has been deleted")
     clean_text = normalize_message(text)
+    clean_image = _clean_image(image) if image is not None else None
     # The head read and the append must be one atomic step: see
     # _chain_write — two writers racing this window would fork the chain.
     with _chain_write(conn):
@@ -2091,6 +2108,8 @@ def create_quote(
             "kind": KIND_QUOTE,
             "target": target,
         }
+        if clean_image is not None:
+            body["image"] = clean_image
         digest = hash(body, previous=prev)
         mesg = dict(body)
         mesg["hash"] = digest
@@ -9027,12 +9046,19 @@ class TanApp:
         publish: bool = False,
         targets: Optional[Sequence[Any]] = None,
         ttl: int = MAX_GOSSIP_TTL,
+        image: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Create a quote of *target* carrying *text* as the comment."""
+        """Create a quote of *target* carrying *text* as the comment.
+
+        When *image* is given — the ``{sha256, size, mime, name}``
+        descriptor a post carries — the quote carries it the same way;
+        the bytes live pinned in the local media store, never in the
+        quote.
+        """
         conn = self.connect()
         try:
             record = create_quote(
-                conn, self.identity, target, text, name=self.name
+                conn, self.identity, target, text, name=self.name, image=image
             )
         finally:
             conn.close()

@@ -112,12 +112,13 @@ export interface UseTanFeedResult {
   like: (target: string) => Promise<void>;
   unlike: (target: string) => Promise<void>;
   repost: (target: string) => Promise<void>;
-  quote: (target: string, text: string) => Promise<TanPost>;
+  quote: (target: string, text: string, opts?: { image?: { dataUrl: string } }) => Promise<TanPost>;
   scheduleRepost: (target: string, sendIn: number) => Promise<void>;
   scheduleQuote: (
     target: string,
     text: string,
     sendIn: number,
+    opts?: { image?: { dataUrl: string } },
   ) => Promise<ScheduledTanPost>;
   vote: (target: string, option: number) => Promise<void>;
   share: (
@@ -193,15 +194,15 @@ export function useTanFeed(opts: UseTanFeedOptions = {}): UseTanFeedResult {
     like: (target) => mutate(() => likeTanPost(target)),
     unlike: (target) => mutate(() => unlikeTanPost(target)),
     repost: (target) => mutate(() => repostTanPost(target)),
-    quote: async (target, text) => {
-      const post = await quoteTanPost(target, text);
+    quote: async (target, text, opts) => {
+      const post = await quoteTanPost(target, text, opts);
       await load();
       return post;
     },
     scheduleRepost: (target, sendIn) =>
       mutate(() => scheduleTanRepost(target, sendIn)),
-    scheduleQuote: async (target, text, sendIn) => {
-      const scheduled = await scheduleTanQuote(target, text, sendIn);
+    scheduleQuote: async (target, text, sendIn, opts) => {
+      const scheduled = await scheduleTanQuote(target, text, sendIn, opts);
       await load();
       return scheduled;
     },

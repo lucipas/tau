@@ -3950,6 +3950,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     tan_quote.add_argument("--file", type=Path, help="read the comment from a file")
     tan_quote.add_argument(
+        "--image",
+        type=Path,
+        default=None,
+        metavar="IMAGE",
+        help="attach one image to the quote (JPEG, PNG, GIF or WebP, at most "
+        "2 MiB) — the signed quote carries its hash, size, mime and name, "
+        "and the bytes are fetched on demand with `tau tan media`",
+    )
+    tan_quote.add_argument(
         "--to",
         action="append",
         default=None,
@@ -6831,7 +6840,7 @@ def _publish_local_post(
     elif quote_of is not None:
         if text is None:
             raise TanError("nothing to publish")
-        post = publisher.quote(quote_of, text)
+        post = publisher.quote(quote_of, text, image=image)
     else:
         if text is None:
             raise TanError("nothing to publish")
@@ -7661,6 +7670,10 @@ def cmd_tan_quote(args: argparse.Namespace) -> int:
     finally:
         conn.close()
 
+    image = None
+    if getattr(args, "image", None) is not None:
+        image = _read_image(args.image, config.data_dir)
+
     delay_text = getattr(args, "delay", None)
     if delay_text is not None:
         if getattr(args, "no_publish", False):
@@ -7688,6 +7701,7 @@ def cmd_tan_quote(args: argparse.Namespace) -> int:
                 to=getattr(args, "to", None),
                 ttl=int(getattr(args, "ttl", MAX_GOSSIP_TTL)),
                 name=config.name,
+                image=image,
             )
         except ScheduledPostsError as exc:
             raise NodeError(str(exc)) from exc
@@ -7704,7 +7718,7 @@ def cmd_tan_quote(args: argparse.Namespace) -> int:
 
     if getattr(args, "no_publish", False):
         app = TanApp(config, _tan_identity(config), name=config.name)
-        post = app.quote(target, text)
+        post = app.quote(target, text, image=image)
         published = None
     else:
         node = TauNode(config, name=config.name)
@@ -7713,11 +7727,20 @@ def cmd_tan_quote(args: argparse.Namespace) -> int:
         except InstanceAlreadyRunning:
             from .local_publish import publish_running
 
-            result = publish_running(
-                config.data_dir, text=text, quote_of=target,
+            # The image rides the IPC request only when there is one:
+            # a plain quote must still publish through a running node
+            # from before this flag existed.
+            request = dict(
+                text=text,
+                quote_of=target,
                 to=getattr(args, "to", None),
                 ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
                 timeout=float(getattr(args, "timeout", 15.0)),
+            )
+            if image is not None:
+                request["image"] = image
+            result = publish_running(
+                config.data_dir, **request
             )
             post, published = result["post"], result["published"]
         else:
@@ -7732,6 +7755,7 @@ def cmd_tan_quote(args: argparse.Namespace) -> int:
                     to=getattr(args, "to", None),
                     ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
                     timeout=float(getattr(args, "timeout", 15.0)),
+                    image=image,
                 )
                 post, published = result["post"], result["published"]
             finally:

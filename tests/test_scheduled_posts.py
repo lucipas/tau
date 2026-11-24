@@ -406,6 +406,38 @@ def test_schedule_post_with_image_round_trips(tmp_path):
     assert load_scheduled_posts(path).posts[0].to_dict()["image"] == _image()
 
 
+def test_schedule_quote_with_image_round_trips(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    quote = schedule_quote(
+        path,
+        target_post="d" * 64,
+        text="look at this",
+        publish_at=1000.0,
+        now=900.0,
+        image=_image(),
+    )
+    assert quote.image == _image()
+    assert load_scheduled_posts(path).posts[0].image == _image()
+    assert load_scheduled_posts(path).posts[0].to_dict()["image"] == _image()
+
+
+def test_schedule_quote_rejects_image_on_repost_but_not_quote(tmp_path):
+    # A quote is a top-level entry, so it may carry an image; a
+    # repost has no comment of its own and still cannot.
+    path = tmp_path / "scheduled-posts.json"
+    with pytest.raises(ScheduledPostsError, match="cannot carry an image"):
+        schedule_post(
+            path, text="", publish_at=1000.0, now=900.0,
+            kind="repost", target_post="d" * 64, image=_image(),
+        )
+    quote = schedule_post(
+        path, text="look", publish_at=1000.0, now=900.0,
+        kind="quote", target_post="d" * 64, image=_image(),
+    )
+    assert quote.image == _image()
+    assert load_scheduled_posts(path).posts[0].image == _image()
+
+
 def test_schedule_post_without_image_loads_as_none(tmp_path):
     # Old queue files predate the image field: they load with no image.
     path = tmp_path / "scheduled-posts.json"
@@ -871,12 +903,13 @@ class _FakeTanApp:
         self.reposted.append(record)
         return record
 
-    def quote(self, target, text):
+    def quote(self, target, text, *, image=None):
         record = {
             "hash": "b" * 64,
             "kind": "quote",
             "target": target,
             "text": text,
+            "image": image,
         }
         self.quoted.append(record)
         return record
@@ -977,6 +1010,28 @@ def test_publish_due_publishes_scheduled_repost_and_quote(tmp_path):
     assert app.published[0][0] is app.reposted[0]
     assert app.published[1][0] is app.quoted[0]
     assert repost.id != quote.id
+
+
+def test_publish_due_publishes_scheduled_quote_with_image(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    quote = schedule_quote(
+        path,
+        target_post="e" * 64,
+        text="look at this",
+        publish_at=1000.0,
+        now=900.0,
+        image=_image(),
+    )
+    app = _FakeTanApp()
+
+    result = publish_due_scheduled_posts(path, app, now=2000.0)
+    assert result == {"published": 1, "kept": 0}
+    assert [(record["target"], record["text"], record["image"]) for record in app.quoted] == [
+        ("e" * 64, "look at this", _image())
+    ]
+    assert app.published[0][0] is app.quoted[0]
+    assert load_scheduled_posts(path).posts == ()
+    assert quote.id is not None
 
 
 def test_publish_due_keeps_failed_poll_queued(tmp_path):

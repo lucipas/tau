@@ -1274,12 +1274,14 @@ export async function scheduleTanQuote(
   target: string,
   text: string,
   sendIn: number,
+  opts: { image?: { dataUrl: string } } = {},
 ): Promise<ScheduledTanPost> {
   return post("/api/tan/schedule", {
     kind: "quote",
     target_post: target,
     text,
     send_in: sendIn,
+    image: opts.image?.dataUrl,
   });
 }
 
@@ -1326,8 +1328,12 @@ export async function deleteTanDraft(id: number): Promise<unknown> {
   return post("/api/tan/drafts/delete", { id });
 }
 
-export async function quoteTanPost(target: string, text: string): Promise<TanPost> {
-  return post("/api/tan/quote", { target, text });
+export async function quoteTanPost(
+  target: string,
+  text: string,
+  opts: { image?: { dataUrl: string } } = {},
+): Promise<TanPost> {
+  return post("/api/tan/quote", { target, text, image: opts.image?.dataUrl });
 }
 
 export async function likeTanPost(target: string): Promise<unknown> {

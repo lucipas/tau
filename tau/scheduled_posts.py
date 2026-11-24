@@ -394,10 +394,11 @@ class ScheduledPost:
                 raise ScheduledPostsError(
                     f"a scheduled {self.kind} cannot carry poll options"
                 )
-            if self.image is not None:
-                raise ScheduledPostsError(
-                    f"a scheduled {self.kind} cannot carry an image"
-                )
+            # A quote is a top-level entry, so it may carry an image
+            # like a post; a repost has no comment of its own and
+            # still cannot.
+            if self.kind == "repost" and self.image is not None:
+                raise ScheduledPostsError("a scheduled repost cannot carry an image")
             if self.location is not None:
                 raise ScheduledPostsError(
                     f"a scheduled {self.kind} cannot carry a location"
@@ -642,7 +643,8 @@ def schedule_post(
     the entry and signed with the post at publish time; the bytes live
     pinned in the local media store, never in the queue.  An image is
     top-level-only, the same rule as an immediate post, so it is
-    refused with a reply target.
+    refused with a reply target, a poll, or a repost — but a quote is
+    a top-level entry, so it may carry one, exactly like a post.
 
     When *location* is given — the ``{lat, lon, name?}`` pin an
     immediate post carries — it rides the entry itself (it is small)
@@ -716,10 +718,8 @@ def schedule_post(
             raise ScheduledPostsError(
                 f"a scheduled {clean_kind} cannot carry poll options"
             )
-        if clean_image is not None:
-            raise ScheduledPostsError(
-                f"a scheduled {clean_kind} cannot carry an image"
-            )
+        if clean_kind == "repost" and clean_image is not None:
+            raise ScheduledPostsError("a scheduled repost cannot carry an image")
         if clean_location is not None:
             raise ScheduledPostsError(
                 f"a scheduled {clean_kind} cannot carry a location"
@@ -811,12 +811,16 @@ def schedule_quote(
     ttl: int = 3,
     now: Optional[float] = None,
     name: Optional[str] = None,
+    image: Optional[Dict[str, Any]] = None,
 ) -> ScheduledPost:
     """Queue a quote of *target_post* carrying *text* for *publish_at*.
 
     Thin wrapper over :func:`schedule_post` with ``kind="quote"``:
     the text is the comment, and it gets the same wire-size preflight
-    as a scheduled post.
+    as a scheduled post.  When *image* is given — the ``{sha256,
+    size, mime, name}`` descriptor an immediate quote carries — the
+    attachment is stored on the entry and signed with the quote at
+    publish time, exactly like a scheduled post's image.
     """
     return schedule_post(
         path,
@@ -828,6 +832,7 @@ def schedule_quote(
         name=name,
         kind="quote",
         target_post=target_post,
+        image=image,
     )
 
 
@@ -1132,7 +1137,9 @@ def publish_due_scheduled_posts(
                         elif post.kind == "repost":
                             created = app.repost(post.target_post)
                         elif post.kind == "quote":
-                            created = app.quote(post.target_post, post.text)
+                            created = app.quote(
+                                post.target_post, post.text, image=post.image
+                            )
                         else:
                             created = app.create_post(
                                 post.text,
