@@ -409,6 +409,18 @@ class ScheduledPost:
                 )
             if self.options:
                 raise ScheduledPostsError("a scheduled post cannot carry poll options")
+            # The write path refuses both combinations, and the publish
+            # pass drops them silently (a reply is created without the
+            # attachment) — so a hand-edited queue file carrying either
+            # must fail to load, not publish a stripped reply.
+            if self.image is not None and self.reply_to is not None:
+                raise ScheduledPostsError(
+                    "an image can only be attached to a top-level post, not a reply"
+                )
+            if self.location is not None and self.reply_to is not None:
+                raise ScheduledPostsError(
+                    "a location can only be attached to a top-level post, not a reply"
+                )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
