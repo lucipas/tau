@@ -25164,7 +25164,9 @@ def cmd_config(args: argparse.Namespace) -> int:
             _validate_backup_passphrase(passphrase)
         except _BackupError as exc:
             raise NodeError(str(exc)) from exc
-        stored = str(Path(path_arg).expanduser())
+        # Store an absolute path: `tau serve` may start from another
+        # directory, and a relative path would resolve differently there.
+        stored = str(Path(path_arg).expanduser().resolve())
         set_node_setting(config.data_dir, "backup_passphrase_file", stored)
         if json_output:
             _emit({"backup_passphrase_file": stored}, True)
