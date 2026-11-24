@@ -5544,11 +5544,13 @@ def test_devices_claimed_bundle_cleaned_up_on_stop(tmp_path, capsys):
     # flight, so bridge shutdown still deletes the private-identity
     # file instead of stranding it in the temp directory.
     _, bridge = _devices_bridge(tmp_path, capsys)
-    _, _, minted = _json(bridge, "/api/devices/pair", method="POST", body={})
-    staged, _name = bridge.claim_device_bundle(minted["token"])
-    assert staged.exists()
-    assert staged in bridge._device_bundles_in_flight
-    bridge.stop()
+    try:
+        _, _, minted = _json(bridge, "/api/devices/pair", method="POST", body={})
+        staged, _name = bridge.claim_device_bundle(minted["token"])
+        assert staged.exists()
+        assert staged in bridge._device_bundles_in_flight
+    finally:
+        bridge.stop()
     assert not staged.exists()
     assert not bridge._device_bundles_in_flight
 
