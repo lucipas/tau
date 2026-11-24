@@ -33,6 +33,7 @@ from tau.beacons import (
 )
 from tau.blocklist import BlockList, load_blocklist, save_blocklist
 from tau.config import TauConfig
+from tau.devices import verify_pairing_bundle
 from tau.groups import GroupStore
 from tau.identity import destination_hash, load_identity
 from tau.inbox import Inbox
@@ -5314,6 +5315,177 @@ def test_backup_missing_archive_is_a_clean_error(bridge, monkeypatch):
     status, _, payload = _json(bridge, "/api/backup")
     assert status == 500
     assert payload["error"]["message"] == "internal error"
+
+
+def _devices_bridge(tmp_path, capsys):
+    """A live bridge whose node has a real data dir (identity + devices.json)."""
+    data_dir = tmp_path / "node"
+    assert (
+        cli.main(["init", "--data-dir", str(data_dir), "--name", "alice", "--json"])
+        == 0
+    )
+    capsys.readouterr()
+    node = FakeNode(tmp_path / "mailbox.json")
+    node.config = TauConfig.resolve(data_dir=data_dir)
+    web_dir = tmp_path / "out"
+    web_dir.mkdir()
+    (web_dir / "index.html").write_text("<html>tau console</html>", encoding="utf-8")
+    bridge = WebBridge(node, host="127.0.0.1", port=0, web_dir=web_dir)
+    bridge.start()
+    return data_dir, bridge
+
+
+def test_devices_lists_this_device_and_offers(tmp_path, capsys):
+    _, bridge = _devices_bridge(tmp_path, capsys)
+    try:
+        status, _, payload = _json(bridge, "/api/devices")
+    finally:
+        bridge.stop()
+    assert status == 200
+    assert payload["identity"]
+    assert payload["destination"]
+    assert payload["paired_from"] is None
+    assert payload["issued_offers"] == []
+
+
+def test_devices_pair_mints_a_verifiable_bundle(tmp_path, capsys):
+    _, bridge = _devices_bridge(tmp_path, capsys)
+    try:
+        status, _, payload = _json(bridge, "/api/devices/pair", method="POST", body={})
+        assert status == 200
+        assert payload["ok"] is True
+        token = payload["token"]
+        assert len(token) == 32
+        assert payload["expires_at"] > time.time()
+        assert payload["download"] == f"/api/devices/bundle/{token}"
+        assert payload["filename"].startswith(f"tau-pairing-{token[:8]}-")
+        assert payload["filename"].endswith(".json")
+
+        # The offer is listed until it is revoked.
+        _, _, listed = _json(bridge, "/api/devices")
+        assert [offer["token"] for offer in listed["issued_offers"]] == [token]
+
+        # The bundle downloads once and verifies as a real pairing bundle.
+        status, headers, body = _request(bridge, payload["download"])
+        assert status == 200
+        assert headers["Content-Type"] == "application/json"
+        assert headers["Content-Disposition"].endswith(f'"{payload["filename"]}"')
+        bundle = json.loads(body)
+        identity, cleaned = verify_pairing_bundle(bundle)
+        assert cleaned["token"] == token
+        assert destination_hash(identity).hex() == listed["destination"]
+
+        # The download consumed the only copy: a second fetch is a 404.
+        status, _, missing = _json(bridge, payload["download"])
+        assert status == 404
+        assert "no pairing bundle" in missing["error"]["message"]
+    finally:
+        bridge.stop()
+
+
+def test_devices_pair_without_history_carries_no_snapshot(tmp_path, capsys):
+    _, bridge = _devices_bridge(tmp_path, capsys)
+    try:
+        status, _, payload = _json(
+            bridge, "/api/devices/pair", method="POST", body={"history": False}
+        )
+        assert status == 200
+        assert payload["history_messages"] == 0
+        _, _, body = _request(bridge, payload["download"])
+        bundle = json.loads(body)
+        _, cleaned = verify_pairing_bundle(bundle)
+        assert cleaned["history"] is None
+    finally:
+        bridge.stop()
+
+
+def test_devices_pair_rejects_bad_fields(tmp_path, capsys):
+    _, bridge = _devices_bridge(tmp_path, capsys)
+    try:
+        status, _, payload = _json(
+            bridge, "/api/devices/pair", method="POST", body={"history": "yes"}
+        )
+        assert status == 400
+        assert "history" in payload["error"]["message"]
+        status, _, payload = _json(
+            bridge, "/api/devices/pair", method="POST", body={"ttl_seconds": "soon"}
+        )
+        assert status == 400
+        assert "ttl_seconds" in payload["error"]["message"]
+        status, _, payload = _json(
+            bridge, "/api/devices/pair", method="POST", body={"ttl_seconds": 0}
+        )
+        assert status == 400
+        assert "TTL" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
+def test_devices_revoke_cancels_the_offer(tmp_path, capsys):
+    _, bridge = _devices_bridge(tmp_path, capsys)
+    try:
+        _, _, minted = _json(bridge, "/api/devices/pair", method="POST", body={})
+        token = minted["token"]
+        status, _, payload = _json(
+            bridge, "/api/devices/revoke", method="POST", body={"token": token[:8]}
+        )
+        assert status == 200
+        assert payload["ok"] is True
+        assert payload["revoked"]["token"] == token
+        _, _, listed = _json(bridge, "/api/devices")
+        assert listed["issued_offers"] == []
+        # Revoking twice fails: the offer is already gone.
+        status, _, payload = _json(
+            bridge, "/api/devices/revoke", method="POST", body={"token": token}
+        )
+        assert status == 400
+        # A missing token field is a 400, not a revoke of nothing.
+        status, _, payload = _json(
+            bridge, "/api/devices/revoke", method="POST", body={}
+        )
+        assert status == 400
+        assert "token" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
+def test_devices_endpoints_reject_remote_clients(tmp_path, capsys, monkeypatch):
+    import tau.webapi as webapi
+
+    _, bridge = _devices_bridge(tmp_path, capsys)
+    monkeypatch.setattr(webapi, "_is_loopback_client", lambda client: False)
+    try:
+        status, _, payload = _json(bridge, "/api/devices")
+        assert status == 403
+        status, _, payload = _json(
+            bridge, "/api/devices/pair", method="POST", body={}
+        )
+        assert status == 403
+        status, _, payload = _json(
+            bridge, "/api/devices/revoke", method="POST", body={"token": "ab" * 16}
+        )
+        assert status == 403
+        status, _, payload = _json(bridge, "/api/devices/bundle/" + "ab" * 16)
+        assert status == 403
+    finally:
+        bridge.stop()
+
+
+def test_devices_without_a_data_directory_is_unavailable(bridge):
+    status, _, payload = _json(bridge, "/api/devices")
+    assert status == 503
+    assert "no data directory" in payload["error"]["message"]
+    status, _, payload = _json(bridge, "/api/devices/pair", method="POST", body={})
+    assert status == 503
+
+
+def test_bridge_stop_removes_unclaimed_pairing_bundle(tmp_path, capsys):
+    _, bridge = _devices_bridge(tmp_path, capsys)
+    result = bridge.pair_device()
+    staged, _name = bridge.device_bundle(result["token"])
+    assert staged.exists()
+    bridge.stop()
+    assert not staged.exists()
 
 
 def test_static_console_and_assets(bridge):

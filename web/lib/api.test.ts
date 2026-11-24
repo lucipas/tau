@@ -51,7 +51,11 @@ import {
   revokeGroupInvites,
   saveTanDraft,
   closeDmPoll,
+  deviceBundleUrl,
   editOutbox,
+  getDevices,
+  pairDevice,
+  revokeDeviceOffer,
   saveDraft,
   renameBroadcast,
   sendBroadcast,
@@ -883,6 +887,57 @@ describe("URL helpers", () => {
     expect(eventsUrl()).toBe("/api/events");
     expect(eventsUrl(42)).toBe("/api/events?since=42");
     expect(wsUrl()).toBe("ws://example.com/ws");
+  });
+});
+
+describe("linked devices", () => {
+  it("fetches this device and its issued offers", async () => {
+    nextJson = {
+      identity: "ab".repeat(32),
+      destination: "cd".repeat(32),
+      paired_from: null,
+      issued_offers: [],
+    };
+    const result = await getDevices();
+    expect(captured[0].url).toBe("/api/devices");
+    expect(result.issued_offers).toEqual([]);
+  });
+
+  it("mints a bundle with history by default", async () => {
+    nextJson = {
+      ok: true,
+      token: "ab".repeat(16),
+      expires_at: 1794000000,
+      history_messages: 3,
+      download: `/api/devices/bundle/${"ab".repeat(16)}`,
+      filename: "tau-pairing-abababab-20261124-035800.json",
+    };
+    const result = await pairDevice();
+    expect(captured[0].url).toBe("/api/devices/pair");
+    expect(bodyOf(0)).toEqual({ history: true });
+    expect(result.filename).toContain("tau-pairing-");
+  });
+
+  it("mints an identity-only bundle and passes a TTL through", async () => {
+    nextJson = { ok: true, token: "cd".repeat(16), expires_at: 1794000000, history_messages: 0, download: "/api/devices/bundle/x", filename: "tau-pairing-x.json" };
+    await pairDevice({ history: false, ttl_seconds: 600 });
+    expect(bodyOf(0)).toEqual({ history: false, ttl_seconds: 600 });
+  });
+
+  it("builds the single-use bundle download URL", () => {
+    expect(deviceBundleUrl("ab".repeat(16))).toBe(
+      `/api/devices/bundle/${"ab".repeat(16)}`,
+    );
+  });
+
+  it("revokes an offer by token", async () => {
+    nextJson = {
+      ok: true,
+      revoked: { token: "ab".repeat(16), created_at: 1, expires_at: 2, owner: null },
+    };
+    await revokeDeviceOffer("ab".repeat(16));
+    expect(captured[0].url).toBe("/api/devices/revoke");
+    expect(bodyOf(0)).toEqual({ token: "ab".repeat(16) });
   });
 });
 

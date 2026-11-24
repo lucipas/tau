@@ -25,6 +25,8 @@ import type {
   ChannelMessage,
   ChannelTopic,
   ChatMessage,
+  DeviceOffer,
+  DevicesInfo,
   DoctorReport,
   DmRequest,
   DisappearingDefaults,
@@ -43,6 +45,7 @@ import type {
   OutboxRetryResult,
   OwnProfile,
   PageList,
+  PairDeviceResult,
   Peer,
   PeerInfo,
   PingResult,
@@ -271,6 +274,34 @@ export async function getDoctor(): Promise<DoctorReport> {
 /** Download URL for a full backup archive of the data directory (loopback only). */
 export function backupUrl(): string {
   return `${API_BASE}/api/backup`;
+}
+
+/** Linked devices: this device and the pairing offers it issued (loopback only). */
+export async function getDevices(): Promise<DevicesInfo> {
+  return get("/api/devices");
+}
+
+/** Mint a pairing bundle for a second device; download it via the returned URL. */
+export async function pairDevice(opts?: {
+  history?: boolean;
+  ttl_seconds?: number;
+}): Promise<PairDeviceResult> {
+  return post("/api/devices/pair", {
+    history: opts?.history ?? true,
+    ...(opts?.ttl_seconds !== undefined ? { ttl_seconds: opts.ttl_seconds } : {}),
+  });
+}
+
+/** Download URL for a minted pairing bundle (loopback only; single use). */
+export function deviceBundleUrl(token: string): string {
+  return `${API_BASE}/api/devices/bundle/${encodeURIComponent(token)}`;
+}
+
+/** Cancel an outstanding pairing offer by token (or unique prefix). */
+export async function revokeDeviceOffer(
+  token: string,
+): Promise<{ ok: boolean; revoked: DeviceOffer }> {
+  return post("/api/devices/revoke", { token });
 }
 
 export async function getAllowlist(): Promise<AllowList> {
