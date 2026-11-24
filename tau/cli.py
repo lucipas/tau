@@ -48,6 +48,7 @@ from .away import (
 )
 from .backup import create_backup, is_encrypted_backup, restore_backup
 from .backup import BackupError as _BackupError
+from .backup import _clean_passphrase as _validate_backup_passphrase
 from .blocklist import (
     BlockListError,
     load_blocked_set,
@@ -15845,13 +15846,19 @@ def _resolve_backup_passphrase(args: argparse.Namespace, *, confirm: bool) -> Op
 
     A restore only prompts when the backup is actually encrypted (the
     caller checks that first); a backup always prompts when asked.
+    The passphrase is validated here so a too-short one fails before
+    any backup work starts.
     """
+    passphrase = None
     if getattr(args, "passphrase", False):
-        return _prompt_backup_passphrase(confirm=confirm)
-    passphrase_file = getattr(args, "passphrase_file", None)
-    if passphrase_file is not None:
-        return _read_passphrase_file(passphrase_file)
-    return None
+        passphrase = _prompt_backup_passphrase(confirm=confirm)
+    else:
+        passphrase_file = getattr(args, "passphrase_file", None)
+        if passphrase_file is not None:
+            passphrase = _read_passphrase_file(passphrase_file)
+    if passphrase is not None:
+        _validate_backup_passphrase(passphrase)
+    return passphrase
 
 
 def cmd_backup(args: argparse.Namespace) -> int:

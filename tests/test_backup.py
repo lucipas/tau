@@ -1446,6 +1446,12 @@ def test_encrypted_backup_restore_round_trip(tmp_path, capsys):
     assert payload["destination"] == destination_a
     assert is_encrypted_backup(archive)
     assert stat.S_IMODE(os.stat(archive).st_mode) == 0o600
+    # No plaintext copy beside the destination: only the archive and
+    # the passphrase file sit in the target folder.
+    assert sorted(p.name for p in tmp_path.iterdir() if p.is_file()) == [
+        "alice.tar.gz",
+        "pw.txt",
+    ]
     # The identity and the node name are inside the envelope, never in
     # the clear: the archive file holds no readable trace of either.
     raw = archive.read_bytes()
@@ -1541,3 +1547,79 @@ def test_plaintext_backup_ignores_a_passphrase(tmp_path, capsys):
     )
     assert manifest["node"] == "alice"
     _assert_restored(node_a, node_b, destination_a, contents_before, capsys)
+
+
+def _envelope_with_header(passphrase, **overrides):
+    """An envelope whose header fields are replaced after encryption."""
+    envelope = encrypt_backup_archive(b"secret", passphrase)
+    header_end = envelope.index(b"\n", len(ENCRYPTED_BACKUP_MAGIC))
+    header = json.loads(envelope[len(ENCRYPTED_BACKUP_MAGIC):header_end])
+    header.update(overrides)
+    return (
+        ENCRYPTED_BACKUP_MAGIC
+        + json.dumps(header, sort_keys=True).encode("utf-8")
+        + b"\n"
+        + envelope[header_end + 1:]
+    )
+
+
+@pytest.mark.parametrize("bad_n", [True, 32768.0, "32768"])
+def test_decrypt_backup_archive_rejects_non_integer_kdf(bad_n):
+    # A boolean, a float, or a string where an int belongs must fail as
+    # a malformed header, never reach key derivation.
+    envelope = _envelope_with_header(PASSPHRASE, n=bad_n)
+    with pytest.raises(BackupError, match="not a valid encrypted tau backup"):
+        decrypt_backup_archive(envelope, PASSPHRASE)
+
+
+def test_decrypt_backup_archive_rejects_overflowing_kdf_number():
+    # JSON 1e999 parses to float('inf'); int() on it raises
+    # OverflowError, which must surface as a BackupError, not a crash.
+    envelope = encrypt_backup_archive(b"secret", PASSPHRASE)
+    header_end = envelope.index(b"\n", len(ENCRYPTED_BACKUP_MAGIC))
+    raw = envelope[len(ENCRYPTED_BACKUP_MAGIC):header_end]
+    raw = raw.replace(b'"n": 32768', b'"n": 1e999')
+    rebuilt = ENCRYPTED_BACKUP_MAGIC + raw + b"\n" + envelope[header_end + 1:]
+    with pytest.raises(BackupError, match="not a valid encrypted tau backup"):
+        decrypt_backup_archive(rebuilt, PASSPHRASE)
+
+
+@pytest.mark.parametrize(
+    "size",
+    [0, 1, 15, 16, 17, 1023, 1024 * 1024 - 1, 1024 * 1024, 1024 * 1024 + 1, 3 * 1024 * 1024 + 7],
+)
+def test_encrypt_decrypt_archive_chunk_boundaries(size):
+    # Sizes around the block size and the 1 MiB streaming chunk, so the
+    # hold-back-a-block padding logic is exercised on both sides.
+    plaintext = bytes((i * 7) % 256 for i in range(size))
+    envelope = encrypt_backup_archive(plaintext, PASSPHRASE)
+    assert decrypt_backup_archive(envelope, PASSPHRASE) == plaintext
+
+
+def test_encrypted_backup_restore_tilde_path(tmp_path, capsys, monkeypatch):
+    # The CLI detects the envelope on the unexpanded path, like restore
+    # does — a ~/... backup restores with its passphrase flags honoured.
+    node_a, destination_a, _contents = _encrypted_round_trip_setup(
+        tmp_path, capsys
+    )
+    config_a = TauConfig.resolve(data_dir=node_a)
+    archive = tmp_path / "alice.tar.gz"
+    create_backup(config_a, archive, passphrase=PASSPHRASE)
+    pw_file = tmp_path / "pw.txt"
+    pw_file.write_text(PASSPHRASE + "\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert (
+        cli.main(
+            [
+                "restore",
+                "~/alice.tar.gz",
+                "--data-dir",
+                str(tmp_path / "b"),
+                "--passphrase-file",
+                str(pw_file),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out)["destination"] == destination_a
