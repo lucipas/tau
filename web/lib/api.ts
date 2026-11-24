@@ -307,11 +307,21 @@ export async function getJoinRequests(): Promise<JoinRequest[]> {
   return data.requests;
 }
 
-export async function createGroup(name: string, members: string[]): Promise<Group> {
+export async function createGroup(
+  name: string,
+  members: string[],
+  opts?: { secret?: boolean },
+): Promise<Group> {
   // The bridge wraps the created group: POST /api/groups returns
   // {ok: true, group: {...}}, so unwrap it — returning the raw
   // payload would leave callers reading `.id` off the wrapper.
-  const data = await post<{ ok: boolean; group: Group }>("/api/groups", { name, members });
+  // `secret` rides only when true, so an ordinary create sends the
+  // same payload it always did.
+  const data = await post<{ ok: boolean; group: Group }>("/api/groups", {
+    name,
+    members,
+    ...(opts?.secret ? { secret: true } : {}),
+  });
   return data.group;
 }
 
