@@ -14843,7 +14843,14 @@ class _WebHandler(BaseHTTPRequestHandler):
             # base64 image, and an import carries a whole message history
             # or a whole signed chain, so each gets a larger body cap than
             # a chat message or a single action.
-            if path in ("/api/send-file", "/api/groups/send-file", "/api/broadcasts/send-file", "/api/tan/posts"):
+            if path in (
+                "/api/send-file",
+                "/api/groups/send-file",
+                "/api/broadcasts/send-file",
+                "/api/tan/posts",
+                "/api/tan/quote",
+                "/api/tan/schedule",
+            ):
                 limit = MAX_FILE_BODY_BYTES
             elif path in ("/api/messages/import", "/api/tan/import"):
                 limit = MAX_IMPORT_BYTES
