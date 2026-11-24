@@ -538,6 +538,9 @@ MAX_SUBSCRIBERS = 32
 # Backup archives in flight at once (being built or still streaming).  Each
 # one is a full copy of the data directory in temporary storage.
 MAX_CONCURRENT_BACKUPS = 2
+# Pairing bundles staged for download at once.  Each holds a private
+# identity in temporary storage until it is downloaded or expires.
+MAX_STAGED_DEVICE_BUNDLES = 4
 # How long shutdown waits for an archive build to finish before cleanup.
 _BACKUP_SHUTDOWN_WAIT = 3.0
 SUBSCRIBER_QUEUE_SIZE = 256
@@ -1475,8 +1478,9 @@ class WebBridge:
         self._backup_artifacts: Set[Path] = set()
         # Pairing bundles minted for download, guarded by _backup_lock
         # like the archives: each holds the private identity, keyed by
-        # token, with its download filename, and deleted on stop.
-        self._device_bundles: Dict[str, Tuple[Path, str]] = {}
+        # token, with its download filename and expiry, and deleted on
+        # download, revoke, expiry, or stop.
+        self._device_bundles: Dict[str, Tuple[Path, str, float]] = {}
         self._started_at = time.time()
 
     # -- lifecycle ---------------------------------------------------------
@@ -1561,7 +1565,7 @@ class WebBridge:
             leftovers = list(self._backup_artifacts)
             self._backup_artifacts.clear()
             device_leftovers = [
-                path for path, _name in self._device_bundles.values()
+                path for path, _name, _expires in self._device_bundles.values()
             ]
             self._device_bundles.clear()
         for path in leftovers:
@@ -1672,20 +1676,40 @@ class WebBridge:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.chmod(staging, 0o600)
-            registry.record_issued(
-                bundle["token"],
-                bundle["created_at"],
-                bundle["expires_at"],
-                owner=bundle["primary"],
-            )
         except BaseException:
             staging.unlink(missing_ok=True)
             raise
-        if self._closing.is_set():
-            staging.unlink(missing_ok=True)
-            raise WebBridgeError("the web console is shutting down")
+        # The shutdown check, the staged-bundle cap, the offer record and
+        # the staging registration all happen under one lock section, so
+        # stop() either sees this bundle to delete or the mint is refused
+        # with no offer recorded.  Nothing after record_issued can fail,
+        # so a recorded offer always has its staged bundle.
         with self._backup_lock:
-            self._device_bundles[bundle["token"]] = (staging, filename)
+            if self._closing.is_set():
+                staging.unlink(missing_ok=True)
+                raise WebBridgeError("the web console is shutting down")
+            self._prune_device_bundles_locked()
+            if len(self._device_bundles) >= MAX_STAGED_DEVICE_BUNDLES:
+                staging.unlink(missing_ok=True)
+                raise WebBridgeError(
+                    "too many pairing bundles waiting for download; "
+                    "try again after one expires or is downloaded"
+                )
+            try:
+                registry.record_issued(
+                    bundle["token"],
+                    bundle["created_at"],
+                    bundle["expires_at"],
+                    owner=bundle["primary"],
+                )
+            except BaseException:
+                staging.unlink(missing_ok=True)
+                raise
+            self._device_bundles[bundle["token"]] = (
+                staging,
+                filename,
+                float(bundle["expires_at"]),
+            )
         history_doc = bundle.get("history") or {}
         return {
             "token": bundle["token"],
@@ -13956,25 +13980,6 @@ class _WebHandler(BaseHTTPRequestHandler):
                     self._send_file(
                         staged, filename, head_only, content_type="application/json"
                     )
-                except OSError:
-                    # The open happens before any header is committed,
-                    # so this can only mean the staged file is gone —
-                    # a concurrent download already consumed it, or
-                    # bridge shutdown deleted it. Report it as gone,
-                    # not as a server error.
-                    self._send_json(
-                        {
-                            "error": {
-                                "message": (
-                                    "pairing bundle is no longer available; "
-                                    "mint a new one"
-                                )
-                            }
-                        },
-                        head_only,
-                        404,
-                    )
-                    return
                 finally:
                     # The staged file is the only copy of the bundle:
                     # delete it after the download attempt, so a bundle
