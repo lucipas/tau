@@ -26,7 +26,12 @@ from tau.devices import (
     snapshot_pairing_history,
     verify_pairing_bundle,
 )
-from tau.identity import IdentityError, destination_hash, load_or_create_identity
+from tau.identity import (
+    IdentityError,
+    destination_hash,
+    load_identity,
+    load_or_create_identity,
+)
 from tau.inbox import INBOX_EXPORT_FORMAT, INBOX_EXPORT_VERSION, Inbox
 from tau.mailbox import Mailbox
 from tau.node import InstanceLock
@@ -840,6 +845,321 @@ def test_devices_redeem_retry_refused_when_inbox_full(tmp_path, capsys):
     assert code == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["history"]["imported"] >= 1
+
+
+def test_devices_redeem_retry_refused_when_only_missing_record_retracted(
+    tmp_path, capsys
+):
+    # Retraction variant of the capacity gap in #740: a missing
+    # snapshot record its sender retracted is skipped by the import,
+    # so it must not keep the bundle retryable either — each replay
+    # would "succeed" without importing it (see #742).
+    node_a = _init_node(tmp_path, "a", "alice")
+    _seed_history(node_a)
+    capsys.readouterr()
+
+    bundle_path = tmp_path / "pairing.json"
+    assert (
+        cli.main(
+            [
+                "devices",
+                "pair",
+                "--to",
+                str(bundle_path),
+                "--data-dir",
+                str(node_a),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    node_b = tmp_path / "b"
+    assert (
+        cli.main(
+            [
+                "devices",
+                "redeem",
+                "--from",
+                str(bundle_path),
+                "--data-dir",
+                str(node_b),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["history"]["imported"] == 3
+
+    # Lose one snapshot record to a retract: the sender retracted it
+    # after the bundle was minted, so the import would skip it — the
+    # bundle is spent, not retryable.
+    inbox_b = Inbox(node_b / "inbox.json")
+    inbox_b.delete("msg-1")
+    Mailbox(node_b / "mailbox.json").record_retraction("a" * 32, "msg-1")
+
+    code = cli.main(
+        ["devices", "redeem", "--from", str(bundle_path), "--data-dir", str(node_b)]
+    )
+    assert code == 1
+    assert "already redeemed" in capsys.readouterr().err
+
+
+def test_devices_redeem_retry_refused_when_only_missing_group_record_retracted(
+    tmp_path, capsys
+):
+    # Same gate, group leg: a missing group record covered by a live
+    # group-retraction marker (sender, group, send time) must not
+    # keep the bundle retryable either (see #742).
+    node_a = _init_node(tmp_path, "a", "alice")
+    _seed_history(node_a)
+    capsys.readouterr()
+
+    bundle_path = tmp_path / "pairing.json"
+    assert (
+        cli.main(
+            [
+                "devices",
+                "pair",
+                "--to",
+                str(bundle_path),
+                "--data-dir",
+                str(node_a),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    node_b = tmp_path / "b"
+    assert (
+        cli.main(
+            [
+                "devices",
+                "redeem",
+                "--from",
+                str(bundle_path),
+                "--data-dir",
+                str(node_b),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["history"]["imported"] == 3
+
+    inbox_b = Inbox(node_b / "inbox.json")
+    inbox_b.delete("msg-3")
+    Mailbox(node_b / "mailbox.json").record_group_retraction(
+        "c" * 32, "d" * 32, 1004.0
+    )
+
+    code = cli.main(
+        ["devices", "redeem", "--from", str(bundle_path), "--data-dir", str(node_b)]
+    )
+    assert code == 1
+    assert "already redeemed" in capsys.readouterr().err
+
+
+def test_devices_redeem_retry_allowed_when_retraction_is_for_another_sender(
+    tmp_path, capsys
+):
+    # A retraction marker names its sender: one recorded for another
+    # peer must not close the gate for a record that peer never sent
+    # (see #742).  The missing record re-imports on retry.
+    node_a = _init_node(tmp_path, "a", "alice")
+    _seed_history(node_a)
+    capsys.readouterr()
+
+    bundle_path = tmp_path / "pairing.json"
+    assert (
+        cli.main(
+            [
+                "devices",
+                "pair",
+                "--to",
+                str(bundle_path),
+                "--data-dir",
+                str(node_a),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    node_b = tmp_path / "b"
+    assert (
+        cli.main(
+            [
+                "devices",
+                "redeem",
+                "--from",
+                str(bundle_path),
+                "--data-dir",
+                str(node_b),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["history"]["imported"] == 3
+
+    inbox_b = Inbox(node_b / "inbox.json")
+    inbox_b.delete("msg-1")
+    Mailbox(node_b / "mailbox.json").record_retraction("f" * 32, "msg-1")
+
+    code = cli.main(
+        [
+            "devices",
+            "redeem",
+            "--from",
+            str(bundle_path),
+            "--data-dir",
+            str(node_b),
+            "--json",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["history"] == {
+        "imported": 1,
+        "present": 2,
+        "skipped": 0,
+        "errors": [],
+    }
+
+
+def test_devices_redeem_retry_gate_skips_mailbox_when_history_present(
+    tmp_path, capsys, monkeypatch
+):
+    # Qodo Warning on #743: a replay whose history is entirely
+    # present must not wait on the mailbox lock at all — the gate
+    # decides from the inbox alone and never opens the mailbox.
+    node_a = _init_node(tmp_path, "a", "alice")
+    _seed_history(node_a)
+    capsys.readouterr()
+
+    bundle_path = tmp_path / "pairing.json"
+    assert (
+        cli.main(
+            [
+                "devices",
+                "pair",
+                "--to",
+                str(bundle_path),
+                "--data-dir",
+                str(node_a),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    node_b = tmp_path / "b"
+    assert (
+        cli.main(
+            [
+                "devices",
+                "redeem",
+                "--from",
+                str(bundle_path),
+                "--data-dir",
+                str(node_b),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["history"]["imported"] == 3
+
+    # Every snapshot record is stored: the gate must refuse the
+    # retry without constructing a Mailbox at all.
+    class _NoMailbox:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("gate must not open the mailbox")
+
+    monkeypatch.setattr(cli, "Mailbox", _NoMailbox)
+    config = TauConfig.resolve(data_dir=node_b)
+    registry = DeviceRegistry(config.devices_path)
+    identity = load_identity(config.identity_path)
+    bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+    assert cli._history_retry_allowed(config, registry, identity, bundle) is False
+
+
+def test_devices_redeem_retry_gate_falls_back_when_mailbox_lock_held(
+    tmp_path, capsys, monkeypatch
+):
+    # Qodo Warning on #743: when the gate does need the markers and
+    # the mailbox lock cannot be acquired in time, it falls back to
+    # the missing-record check instead of failing the retry.
+    fcntl = pytest.importorskip("fcntl")
+    node_a = _init_node(tmp_path, "a", "alice")
+    _seed_history(node_a)
+    capsys.readouterr()
+
+    bundle_path = tmp_path / "pairing.json"
+    assert (
+        cli.main(
+            [
+                "devices",
+                "pair",
+                "--to",
+                str(bundle_path),
+                "--data-dir",
+                str(node_a),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    node_b = tmp_path / "b"
+    assert (
+        cli.main(
+            [
+                "devices",
+                "redeem",
+                "--from",
+                str(bundle_path),
+                "--data-dir",
+                str(node_b),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["history"]["imported"] == 3
+
+    # One snapshot record is missing, so the gate needs the markers —
+    # but another process holds the mailbox lock.
+    inbox_b = Inbox(node_b / "inbox.json")
+    inbox_b.delete("msg-1")
+    lock_path = node_b / "mailbox.json.lock"
+    handle = open(lock_path, "a")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        monkeypatch.setattr(cli, "_HISTORY_RETRY_LOCK_TIMEOUT", 0.0)
+        config = TauConfig.resolve(data_dir=node_b)
+        registry = DeviceRegistry(config.devices_path)
+        identity = load_identity(config.identity_path)
+        bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+        assert (
+            cli._history_retry_allowed(config, registry, identity, bundle)
+            is True
+        )
+    finally:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
 
 
 def test_devices_pair_redeem_skips_retracted_history(tmp_path, capsys):
