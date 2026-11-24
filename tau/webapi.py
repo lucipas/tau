@@ -10276,12 +10276,15 @@ class WebBridge:
             ) from exc
         known = self.node.registry.get(target) is not None
         peer = self.node.resolve_peer(target, timeout=timeout)
-        if not known:
-            # The discovery above only upserts into the in-memory
-            # registry: persist the peer now, or the contact added
-            # through the console is gone after the node restarts.
-            # A failed save is not a success — the console must say
-            # so instead of reporting the peer added.
+        # Persist on every successful add, not only when the peer was
+        # unknown at the start of the request: a failed save leaves
+        # the discovered peer in memory, and a retry would otherwise
+        # treat it as known and report success without ever saving
+        # it.  The save runs under the node's save lock, like the
+        # periodic save, so a concurrent Add peer or periodic save
+        # cannot write a stale snapshot over this one.
+        lock = getattr(self.node, "_save_lock", None) or nullcontext()
+        with lock:
             try:
                 saved = self.node.registry.save()
             except OSError as exc:

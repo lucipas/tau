@@ -1809,6 +1809,59 @@ def test_peers_add_persists_newly_discovered_peer(bridge, node, monkeypatch):
     assert "could not save" in payload["error"]["message"]
 
 
+def test_peers_add_retry_after_failed_save_persists(bridge, node, monkeypatch):
+    # A failed save leaves the discovered peer in memory: the retry
+    # must save it instead of treating it as known-and-done and
+    # reporting success for a peer that vanishes on restart.
+    from tau.peers import Peer
+
+    new_hash = "cc" * 16
+    discovered = Peer(
+        destination_hash=bytes.fromhex(new_hash),
+        name="carol",
+        public_key=b"\x02" * 32,
+        first_seen=1000.0,
+        last_seen=time.time(),
+        hops=1,
+    )
+
+    def _resolve_with_discovery(target, *, timeout=10.0):
+        peer = node.registry.get(target)
+        if peer is not None:
+            return peer
+        if target == new_hash:
+            node.registry.restore(discovered)
+            return discovered
+        raise NodeError(f"unknown peer: {target}")
+
+    monkeypatch.setattr(node, "resolve_peer", _resolve_with_discovery)
+    node.registry.fail_save = True
+    status, _, payload = _json(
+        bridge,
+        "/api/peers/add",
+        method="POST",
+        body={"destination_hash": new_hash},
+    )
+    assert status == 503
+    assert "could not save" in payload["error"]["message"]
+    # The peer is in memory but not on disk after the failed save.
+    assert node.registry.get(new_hash) is discovered
+    assert node.registry.saved is False
+
+    # The registry is writable again: the retry must persist the peer
+    # it now finds already known.
+    node.registry.fail_save = False
+    status, _, payload = _json(
+        bridge,
+        "/api/peers/add",
+        method="POST",
+        body={"destination_hash": new_hash},
+    )
+    assert status == 200
+    assert payload["peer"]["known"] is True
+    assert node.registry.saved is True
+
+
 def test_peers_safety_number_shows_without_verifying(tmp_path):
     import RNS
 
