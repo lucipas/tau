@@ -15,8 +15,12 @@ token redeemed once cannot be redeemed again on the same node.
 History catch-up on first connect is slice 2 (#736): the bundle
 optionally carries a bounded snapshot of the primary's inbox, so
 the second device replays recent history on redeem.  ``devices
-revoke`` is a later slice — this one only pairs the identity and,
-by default, its recent history.  The registry
+revoke`` is slice 3 (#745): it cancels an outstanding offer in
+this node's registry.  A bundle file already copied still redeems
+until it expires — redeem verifies the bundle itself and never
+consults the primary — so revoke is record-keeping on the primary,
+not invalidation of a copied file; the command says so and tells
+the owner to delete the bundle file too.  The registry
 (``devices.json`` in the data directory) records offers this node
 issued, tokens it redeemed, and — when this node was itself paired
 — the primary it paired from, so ``tau devices list`` can show it.
@@ -644,6 +648,81 @@ class DeviceRegistry:
             self._redeemed = [
                 entry for entry in self._redeemed if entry["token"] != wanted
             ]
+
+    def revoke_offer(
+        self, ref: str, *, now: Optional[float] = None
+    ) -> Dict[str, Any]:
+        """Cancel an outstanding pairing offer this node issued (#745).
+
+        *ref* is a full token or a unique prefix — ``devices list``
+        shows the first 8 characters, the same convention as ``tau
+        outbox cancel``.  Returns a copy of the revoked offer.
+        Raises :class:`DevicesError` when no outstanding offer
+        matches, when the prefix is ambiguous, or when the token
+        names an offer that already expired or a token already
+        redeemed on this node (each named, so the owner is not left
+        guessing whether they mistyped it).  Expired offers are
+        pruned alongside, the same housekeeping
+        :meth:`record_issued` applies.
+
+        This cancels this node's record of the offer only: a bundle
+        file already copied still redeems until it expires, because
+        redeem verifies the bundle itself and never consults the
+        primary — the caller must say so.
+        """
+        if not isinstance(ref, str) or not ref.strip():
+            raise DevicesError("pairing offer reference must not be empty")
+        value = ref.strip().lower()
+        moment = time.time() if now is None else float(now)
+        with self._transaction():
+            live = [entry for entry in self._issued if entry["expires_at"] > moment]
+            if len(value) == 32:
+                matches = [entry for entry in live if entry["token"] == value]
+            else:
+                matches = [
+                    entry for entry in live if entry["token"].startswith(value)
+                ]
+            if len(matches) > 1:
+                raise DevicesError(
+                    f"{len(matches)} pairing offers match prefix {ref!r}"
+                )
+            if not matches:
+                # Name the specific dead end when the token is known
+                # but no longer outstanding: a redeemed token means
+                # the pairing already happened on this node, an
+                # expired offer means the window already closed.
+                if any(
+                    entry["token"].startswith(value)
+                    for entry in self._redeemed
+                ):
+                    raise DevicesError(
+                        f"pairing offer {ref!r} was already redeemed "
+                        "on this node"
+                    )
+                if any(
+                    entry["token"].startswith(value)
+                    for entry in self._issued
+                ):
+                    raise DevicesError(
+                        f"pairing offer {ref!r} already expired"
+                    )
+                raise DevicesError(
+                    f"no outstanding pairing offer matches {ref!r}"
+                )
+            revoked = dict(matches[0])
+            # A live issued record whose token was already redeemed here
+            # (e.g. a --force redeem on the issuing node) is not outstanding.
+            if any(entry["token"] == revoked["token"] for entry in self._redeemed):
+                raise DevicesError(
+                    f"pairing offer {ref!r} was already redeemed on this node"
+                )
+            self._issued = [
+                entry
+                for entry in self._issued
+                if entry["expires_at"] > moment
+                and entry["token"] != revoked["token"]
+            ]
+            return revoked
 
     def record_paired_from(
         self, token: str, primary: str, *, now: Optional[float] = None

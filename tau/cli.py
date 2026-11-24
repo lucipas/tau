@@ -1758,7 +1758,7 @@ def build_parser() -> argparse.ArgumentParser:
     devices = subparsers.add_parser(
         "devices",
         parents=[common],
-        help="pair a second device to this identity, or list paired devices",
+        help="pair a second device, revoke a pairing offer, or list paired devices",
     )
     devices.set_defaults(func=cmd_devices_list)
     devices_sub = devices.add_subparsers(dest="devices_command", metavar="DEVICES_COMMAND")
@@ -1817,6 +1817,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="show this device and the pairing offers it issued",
     )
     devices_list.set_defaults(func=cmd_devices_list)
+
+    devices_revoke = devices_sub.add_parser(
+        "revoke",
+        parents=[common],
+        help="cancel a pairing offer this node issued",
+    )
+    devices_revoke.add_argument(
+        "token",
+        metavar="TOKEN",
+        help="token (or unique prefix) of the pairing offer to cancel — "
+        "`tau devices list` shows the first 8 characters",
+    )
+    devices_revoke.set_defaults(func=cmd_devices_revoke)
 
     backup = subparsers.add_parser(
         "backup",
@@ -14614,6 +14627,41 @@ def cmd_devices_list(args: argparse.Namespace) -> int:
                 print(f"  token {offer['token'][:8]}… expires {expires}")
         else:
             print("no pairing offers issued")
+    return _EXIT_OK
+
+
+def cmd_devices_revoke(args: argparse.Namespace) -> int:
+    """Cancel an outstanding pairing offer (slice 3 of #469, #745).
+
+    This cancels this node's record of the offer only: a bundle
+    file already copied still redeems until it expires, because
+    redeem verifies the bundle itself and never consults the
+    primary — so the command says so and tells the owner to delete
+    the bundle file too.  Only the registry is touched, so no
+    instance lock is needed; the registry's own transaction lock
+    serialises against a concurrent ``tau id import`` reset.
+    """
+    config = _make_config(args)
+    registry = DeviceRegistry(config.devices_path)
+    try:
+        revoked = registry.revoke_offer(args.token)
+    except DevicesError as exc:
+        raise NodeError(str(exc)) from exc
+    if _json_mode(args):
+        _emit({"revoked": revoked}, True)
+    else:
+        expires = datetime.fromtimestamp(revoked["expires_at"]).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        print(
+            f"revoked pairing offer {revoked['token'][:8]}… "
+            f"(was set to expire {expires})"
+        )
+        print(
+            "note: a bundle file already copied still redeems until it "
+            "expires — delete the bundle file too; revoke only cancels "
+            "this node's record of the offer."
+        )
     return _EXIT_OK
 
 
