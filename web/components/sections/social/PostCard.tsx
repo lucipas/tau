@@ -6,10 +6,10 @@
 
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import Avatar from "@/components/chrome/Avatar";
 import { formatCountdown, formatRelative, shortHash } from "@/lib/format";
-import { tanMediaUrl } from "@/lib/api";
+import { TAN_MAX_IMAGE_BYTES, readFileAsDataUrl, tanMediaUrl } from "@/lib/api";
 import type { TanPost } from "@/lib/types";
 import type { UseTanFeedResult } from "@/lib/use-tan";
 import RichText from "./RichText";
@@ -127,6 +127,8 @@ export default function PostCard({
   const [quoteOpen, setQuoteOpen] = useState(false);
   const [quoteText, setQuoteText] = useState("");
   const [quoteSendIn, setQuoteSendIn] = useState<number | undefined>(undefined);
+  const [quoteFile, setQuoteFile] = useState<File | null>(null);
+  const quoteFileRef = useRef<HTMLInputElement>(null);
   const [scheduleRepostOpen, setScheduleRepostOpen] = useState(false);
   const [shareOpen, setShareOpen] = useState(false);
   const [shareKind, setShareKind] = useState<"peer" | "channel">("peer");
@@ -573,6 +575,41 @@ export default function PostCard({
                 className="w-full resize-none rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-zinc-100 outline-none focus:border-cyan-500"
               />
               <div className="flex flex-wrap items-center gap-2">
+                <input
+                  ref={quoteFileRef}
+                  type="file"
+                  accept="image/*"
+                  aria-label="Attach an image to the quote"
+                  disabled={busy}
+                  className="hidden"
+                  onChange={(e) => {
+                    const picked = e.target.files?.[0] ?? null;
+                    setQuoteFile(picked);
+                    if (picked) setError(null);
+                  }}
+                />
+                <button
+                  type="button"
+                  onClick={() => quoteFileRef.current?.click()}
+                  disabled={busy}
+                  title="Attach an image"
+                  className="rounded-full border border-zinc-700 px-3 py-1 text-xs font-medium text-zinc-300 hover:bg-zinc-900 disabled:opacity-50"
+                >
+                  🖼 Attach
+                </button>
+                {quoteFile && (
+                  <span className="flex items-center gap-1 rounded-full bg-zinc-800 px-2 py-1 text-xs text-zinc-300">
+                    {quoteFile.name}
+                    <button
+                      type="button"
+                      aria-label="Remove attached image"
+                      onClick={() => setQuoteFile(null)}
+                      className="text-zinc-500 hover:text-zinc-200"
+                    >
+                      ✕
+                    </button>
+                  </span>
+                )}
                 <label
                   className="text-xs text-zinc-400"
                   htmlFor={`quote-send-${shown.hash.slice(0, 8)}`}
@@ -604,17 +641,25 @@ export default function PostCard({
                   disabled={busy || !quoteText.trim()}
                   onClick={() =>
                     void run(async () => {
+                      if (quoteFile && quoteFile.size > TAN_MAX_IMAGE_BYTES) {
+                        throw new Error("That image is larger than the 2 MB limit.");
+                      }
+                      const image = quoteFile
+                        ? { dataUrl: await readFileAsDataUrl(quoteFile) }
+                        : undefined;
                       if (quoteSendIn !== undefined) {
                         await actions.scheduleQuote(
                           shown.hash,
                           quoteText.trim(),
                           quoteSendIn,
+                          { image },
                         );
                       } else {
-                        await actions.quote(shown.hash, quoteText.trim());
+                        await actions.quote(shown.hash, quoteText.trim(), { image });
                       }
                       setQuoteText("");
                       setQuoteSendIn(undefined);
+                      setQuoteFile(null);
                       setQuoteOpen(false);
                     })
                   }
@@ -627,6 +672,7 @@ export default function PostCard({
                   onClick={() => {
                     setQuoteOpen(false);
                     setQuoteSendIn(undefined);
+                    setQuoteFile(null);
                   }}
                   className="rounded-full border border-zinc-700 px-3 py-1 text-xs text-zinc-300"
                 >

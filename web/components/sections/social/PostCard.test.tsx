@@ -59,6 +59,81 @@ function openSharePicker() {
   fireEvent.click(screen.getByRole("button", { name: /Share/ }));
 }
 
+describe("PostCard quote composer with an image", () => {
+  function openQuoteComposer() {
+    fireEvent.click(
+      screen.getByRole("button", { name: "Show quotes, 0 quotes" }),
+    );
+  }
+
+  function pickImage(name = "pic.png", type = "image/png", bytes = "hello") {
+    const input = screen.getByLabelText(
+      "Attach an image to the quote",
+    ) as HTMLInputElement;
+    const file = new File([bytes], name, { type });
+    fireEvent.change(input, { target: { files: [file] } });
+    return file;
+  }
+
+  it("posts a picked image with the quote as a data URL", async () => {
+    const actions = makeActions();
+    render(<PostCard post={makePost()} actions={actions} />);
+    openQuoteComposer();
+    fireEvent.change(screen.getByLabelText("Quote text"), {
+      target: { value: "with a picture" },
+    });
+    pickImage();
+    expect(screen.getByText("pic.png")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Post quote" }));
+    await waitFor(() =>
+      expect(actions.quote).toHaveBeenCalledWith(POST_HASH, "with a picture", {
+        image: { dataUrl: "data:image/png;base64,aGVsbG8=" },
+      }),
+    );
+  });
+
+  it("schedules a picked image with the quote", async () => {
+    const actions = makeActions();
+    render(<PostCard post={makePost()} actions={actions} />);
+    openQuoteComposer();
+    fireEvent.change(screen.getByLabelText("Quote text"), {
+      target: { value: "later, with a picture" },
+    });
+    pickImage();
+    fireEvent.change(screen.getByLabelText("Send quote later"), {
+      target: { value: "3600" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Schedule quote" }));
+    await waitFor(() =>
+      expect(actions.scheduleQuote).toHaveBeenCalledWith(
+        POST_HASH,
+        "later, with a picture",
+        3600,
+        { image: { dataUrl: "data:image/png;base64,aGVsbG8=" } },
+      ),
+    );
+  });
+
+  it("refuses an image over the 2 MB limit", async () => {
+    const actions = makeActions();
+    render(<PostCard post={makePost()} actions={actions} />);
+    openQuoteComposer();
+    fireEvent.change(screen.getByLabelText("Quote text"), {
+      target: { value: "too big" },
+    });
+    const input = screen.getByLabelText(
+      "Attach an image to the quote",
+    ) as HTMLInputElement;
+    const big = new File([new Uint8Array(2 * 1024 * 1024 + 1)], "big.png", {
+      type: "image/png",
+    });
+    fireEvent.change(input, { target: { files: [big] } });
+    fireEvent.click(screen.getByRole("button", { name: "Post quote" }));
+    expect((await screen.findByRole("alert")).textContent).toMatch(/2 MB limit/);
+    expect(actions.quote).not.toHaveBeenCalled();
+  });
+});
+
 describe("PostCard share picker", () => {
   it("shares with a peer by default", async () => {
     const actions = makeActions();

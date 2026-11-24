@@ -218,7 +218,7 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/tan/drafts   saved Tan post drafts, newest first
     POST /api/tan/drafts   save a Tan post draft
     POST /api/tan/drafts/delete discard a saved Tan post draft
-    POST /api/tan/quote    quote a post with your own comment
+    POST /api/tan/quote    quote a post with your own comment (optional "image" base64 data URL)
     POST /api/tan/like     like a post (signed reaction on your chain)
     POST /api/tan/unlike   remove your like from a post
     POST /api/tan/vote     vote on a Tan poll (signed vote entry on your chain)
@@ -4010,13 +4010,13 @@ class WebBridge:
         With *kind* ``"repost"`` / ``"quote"`` the entry amplifies
         *target_post* instead: a repost carries no text, a quote
         carries its comment as the text, and the target is resolved
-        the same way as a reply target.  A repost or quote carries
-        neither an image nor a location nor poll options — Tan records
-        allow an image or a location only on a top-level post, and a
-        poll is its own kind — so any of those fields with one of
-        those kinds is refused here, before the image bytes are
-        decoded or pinned, rather than scheduled and silently dropped
-        at publish time.
+        the same way as a reply target.  A repost carries neither an
+        image nor a location nor poll options, and a quote carries
+        neither a location nor poll options — a quote is a top-level
+        entry, so it may carry an image, exactly like a post — so any
+        of those fields with one of those kinds is refused here,
+        before the image bytes are decoded or pinned, rather than
+        scheduled and silently dropped at publish time.
 
         With *poll_options* the entry is a poll instead: the text is
         its question, the options ride alongside it, and a reply
@@ -4044,8 +4044,8 @@ class WebBridge:
         if location is not None and poll_options is not None:
             raise ValueError("a scheduled poll cannot carry a location")
         if kind in ("repost", "quote"):
-            if image is not None:
-                raise ValueError(f"a scheduled {kind} cannot carry an image")
+            if kind == "repost" and image is not None:
+                raise ValueError("a scheduled repost cannot carry an image")
             if location is not None:
                 raise ValueError(f"a scheduled {kind} cannot carry a location")
             if poll_options is not None:
@@ -4101,6 +4101,7 @@ class WebBridge:
                 publish_at=time.time() + float(send_in),
                 ttl=MAX_GOSSIP_TTL,
                 name=getattr(self.node, "name", None),
+                image=image_attachment,
             )
             return post.to_dict()
         if poll_options is not None:
@@ -4324,10 +4325,31 @@ class WebBridge:
             conn.close()
         return app.repost(post_hash, publish=True)
 
-    def tan_quote(self, target: str, text: str) -> Dict[str, Any]:
+    def tan_quote(
+        self,
+        target: str,
+        text: str,
+        *,
+        image: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Quote a Tan post with *text* as the comment, from the console.
+
+        When *image* is given — a base64 data URL, like :meth:`tan_post`
+        takes — the bytes are decoded and pinned in the local media
+        store first and the quote carries the descriptor, exactly like
+        a post's image.  A quote is a top-level entry, so the
+        top-level-only image rule bars replies, not quotes.
+        """
         app = self._tan_app()
         if app is None:
             raise WebBridgeError("the Tan social feed is not enabled; run serve --social")
+        image_attachment: Optional[Dict[str, Any]] = None
+        if image is not None:
+            from .tangents.tan import image_attachment_from_data_url
+
+            image_attachment = image_attachment_from_data_url(
+                image, Path(self._tan_db_path()).parent
+            )
         conn = self._tan_conn()
         try:
             from .tangents.tan import resolve_post
@@ -4335,7 +4357,7 @@ class WebBridge:
             post_hash = resolve_post(conn, target)["hash"]
         finally:
             conn.close()
-        return app.quote(post_hash, text, publish=True)
+        return app.quote(post_hash, text, publish=True, image=image_attachment)
 
     def tan_share(
         self,
@@ -16687,8 +16709,20 @@ class _WebHandler(BaseHTTPRequestHandler):
                         400,
                     )
                     return
+                image = body.get("image")
+                if image is not None and not isinstance(image, str):
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "field 'image' must be a base64 data URL"
+                            }
+                        },
+                        head_only,
+                        400,
+                    )
+                    return
                 try:
-                    quote = self.bridge.tan_quote(target.strip(), text)
+                    quote = self.bridge.tan_quote(target.strip(), text, image=image)
                 except WebBridgeError as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 503)
                     return

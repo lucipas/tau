@@ -15106,6 +15106,72 @@ def test_tan_quote_via_api(tmp_path):
         bridge.stop()
 
 
+def test_tan_quote_via_api_accepts_image(tmp_path):
+    import base64
+    import hashlib
+
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        post = create_post(conn, identity, "api quotable", name="tester", now=1000)
+    finally:
+        conn.close()
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+        data_url = (
+            "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+        )
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/quote",
+            method="POST",
+            body={"target": post["hash"][:16], "text": "with a picture", "image": data_url},
+        )
+        assert status == 200
+        quote = payload["post"]
+        assert quote["kind"] == "quote"
+        assert quote["image"] == {
+            "sha256": hashlib.sha256(png).hexdigest(),
+            "size": len(png),
+            "mime": "image/png",
+            "name": "image.png",
+        }
+
+        # The bytes land in the media store, and the timeline shows
+        # the quote's own image above the embedded original.
+        digest = hashlib.sha256(png).hexdigest()
+        status, headers, body = _request(bridge, f"/api/tan/media/{digest}")
+        assert status == 200
+        assert body == png
+        assert headers["Content-Type"] == "image/png"
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        assert payload["posts"][0]["image"]["sha256"] == digest
+        assert payload["posts"][0]["quoted"]["hash"] == post["hash"]
+
+        # A non-string image is a 400, not a crash.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/quote",
+            method="POST",
+            body={"target": post["hash"], "text": "x", "image": 42},
+        )
+        assert status == 400
+        assert "data URL" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
 def test_tan_schedule_post_via_api(tmp_path):
     import RNS
 
@@ -15429,6 +15495,38 @@ def test_tan_schedule_repost_and_quote_via_api(tmp_path):
             "repost",
         ]
 
+        # A quote is a top-level entry, so it may carry an image: the
+        # scheduled entry carries the descriptor and the bytes are
+        # pinned in the media store at schedule time.
+        png2 = b"\x89PNG\r\n\x1a\n" + b"\x01" * 64
+        data_url2 = (
+            "data:image/png;base64," + base64.b64encode(png2).decode("ascii")
+        )
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/schedule",
+            method="POST",
+            body={
+                "kind": "quote",
+                "target_post": post["hash"],
+                "text": "with a picture",
+                "send_in": 60,
+                "image": data_url2,
+            },
+        )
+        assert status == 200
+        scheduled = payload["scheduled"]
+        assert scheduled["kind"] == "quote"
+        assert scheduled["image"] == {
+            "sha256": hashlib.sha256(png2).hexdigest(),
+            "size": len(png2),
+            "mime": "image/png",
+            "name": "image.png",
+        }
+        from tau.tangents.tan import media_path
+
+        assert media_path(tmp_path, hashlib.sha256(png2).hexdigest()) is not None
+
         # Bad repost/quote requests are 400s and queue nothing.
         png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
         data_url = (
@@ -15468,10 +15566,11 @@ def test_tan_schedule_repost_and_quote_via_api(tmp_path):
                 {"kind": "repost", "target_post": "cd" * 32, "send_in": 60},
                 "unknown post",
             ),
-            # An image or poll options on a repost/quote is refused up
-            # front, not scheduled and silently dropped at publish
-            # time: Tan records allow an image only on a top-level
-            # post, and a poll is its own kind.
+            # An image on a repost, or poll options on a repost/quote,
+            # is refused up front, not scheduled and silently dropped
+            # at publish time: a repost has no comment of its own, and
+            # a poll is its own kind.  (A quote may carry an image —
+            # see above — so only the repost case is refused here.)
             (
                 {
                     "kind": "repost",
@@ -15489,16 +15588,6 @@ def test_tan_schedule_repost_and_quote_via_api(tmp_path):
                     "poll_options": ["A", "B"],
                 },
                 "cannot carry poll options",
-            ),
-            (
-                {
-                    "kind": "quote",
-                    "target_post": post["hash"],
-                    "text": "x",
-                    "send_in": 60,
-                    "image": data_url,
-                },
-                "cannot carry an image",
             ),
             (
                 {
@@ -15518,11 +15607,9 @@ def test_tan_schedule_repost_and_quote_via_api(tmp_path):
             assert fragment in payload["error"]["message"], body
         # The refused image was never decoded or pinned: the refusal
         # happens before the media store sees the bytes.
-        from tau.tangents.tan import media_path
-
         assert media_path(tmp_path, hashlib.sha256(png).hexdigest()) is None
         status, _, payload = _json(bridge, "/api/tan/scheduled")
-        assert payload["count"] == 2
+        assert payload["count"] == 3
     finally:
         bridge.stop()
 

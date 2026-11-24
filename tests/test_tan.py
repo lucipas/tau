@@ -271,6 +271,73 @@ def test_only_posts_carry_images(identities, tmp_path):
         tan_module._normalize_post(crafted)
 
 
+def test_create_quote_with_image_round_trips(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "original thought", name="alice", now=1000)
+    image = _image_for(_png_bytes())
+    quote = create_quote(
+        conn, bob, post["hash"], "worth sharing", name="bob", now=1001, image=image
+    )
+
+    assert quote["kind"] == "quote"
+    assert quote["image"] == image
+    assert verify_post(quote)["image"] == image
+    stored = get_post(conn, quote["hash"])
+    assert stored is not None and stored["image"] == image
+    assert [entry["image"] for entry in feed(conn, author=quote["author"])] == [image]
+    items = timeline(conn, [post["author"], quote["author"]])
+    assert items[0]["image"] == image
+    assert items[0]["quoted"]["hash"] == post["hash"]
+
+
+def test_quote_image_is_signed_with_the_quote(identities, tmp_path):
+    alice, bob = identities
+    first = init_db(tmp_path / "a.sqlite3")
+    second = init_db(tmp_path / "b.sqlite3")
+    post = create_post(first, alice, "same target", name="alice", now=1000)
+    create_post(second, alice, "same target", name="alice", now=1000)
+    plain = create_quote(
+        first, bob, post["hash"], "same comment", name="bob", now=1001
+    )
+    with_image = create_quote(
+        second, bob, post["hash"], "same comment", name="bob", now=1001,
+        image=_image_for(_png_bytes()),
+    )
+    assert plain["hash"] != with_image["hash"]
+
+    tampered = dict(with_image, image={**with_image["image"], "size": 999})
+    with pytest.raises(PostError):
+        verify_post(tampered)
+
+
+def test_quote_rejects_bad_image_and_location(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "parent", name="alice", now=1000)
+    good = _image_for(_png_bytes())
+    for bad in [
+        {**good, "size": 0},
+        {**good, "mime": "image/svg+xml"},
+        {**good, "name": "../evil.png"},
+    ]:
+        with pytest.raises(PostError):
+            create_quote(
+                conn, bob, post["hash"], "x", name="bob", now=1001, image=bad
+            )
+    # A location stays post-only: a quote names its place through its
+    # target, so a second pin is refused at verification.
+    quote = create_quote(conn, bob, post["hash"], "ok", name="bob", now=1002)
+    crafted = dict(quote, location=_location_for())
+    with pytest.raises(PostError):
+        tan_module._normalize_post(crafted)
+    # And a repost still carries no image at all.
+    repost = create_repost(conn, bob, post["hash"], name="bob", now=1003)
+    crafted = dict(repost, image=good)
+    with pytest.raises(PostError):
+        tan_module._normalize_post(crafted)
+
+
 def test_find_post_by_image(identities, tmp_path):
     alice, _ = identities
     conn = init_db(tmp_path / "tan.sqlite3")
