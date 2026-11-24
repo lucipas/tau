@@ -7,17 +7,49 @@
 import { buildConversations, useTraffic } from "@/lib/use-tau";
 import { formatAge } from "@/lib/format";
 import { useNow } from "@/lib/use-now";
+import { useEffect, useState } from "react";
 import Avatar from "./Avatar";
 import TrafficStrip from "./TrafficStrip";
-import { useHash } from "./useHash";
+import { parseHash, useHash } from "./useHash";
 import { useTauContext } from "./TauContext";
 import PeerPanel from "../chat/PeerPanel";
 
 export default function RightSidebar({ className = "" }: { className?: string }) {
   const tau = useTauContext();
-  const { section, peer: selectedPeer, group: selectedGroup, navigate } = useHash();
+  const { section, peer: selectedPeer, group: selectedGroup, navigate, hash } = useHash();
   const now = useNow();
   const traffic = useTraffic(tau.messages, tau.peers);
+
+  // A roster change rotates the group to a successor id; when the
+  // refresh right after the change cannot load the successor yet, the
+  // PeerPanel hands the successor id + origin route up here, because
+  // this sidebar outlives the panel (the panel unmounts once the old
+  // group drops out of the snapshot). On a later snapshot that
+  // contains the successor, follow it — but only if the user is still
+  // on the thread the change started on. Leaving the thread clears
+  // the pending navigation at once (the hash is an effect dependency,
+  // so a departure clears it even if the user comes back before the
+  // successor snapshot arrives).
+  const [pendingSuccessor, setPendingSuccessor] = useState<{
+    id: string;
+    originHash: string;
+  } | null>(null);
+  useEffect(() => {
+    if (!pendingSuccessor) return;
+    // Compare against the live hash, not the `hash` state: the state
+    // updates on the async hashchange event, so a snapshot arriving
+    // in the same tick as a navigation would otherwise read the stale
+    // origin route and redirect a user who just left.
+    if (typeof window === "undefined" || window.location.hash !== pendingSuccessor.originHash) {
+      setPendingSuccessor(null);
+      return;
+    }
+    if (tau.groups.some((g) => g.id === pendingSuccessor.id)) {
+      const { section: originSection } = parseHash(pendingSuccessor.originHash);
+      navigate(originSection, { group: pendingSuccessor.id });
+      setPendingSuccessor(null);
+    }
+  }, [pendingSuccessor, tau.groups, navigate, hash]);
 
   const openConversation =
     (section === "chat" || section === "people") &&
@@ -55,7 +87,12 @@ export default function RightSidebar({ className = "" }: { className?: string })
               ← Back to chat
             </button>
           )}
-          <PeerPanel conversation={openConversation} />
+          <PeerPanel
+            conversation={openConversation}
+            onSuccessorPending={(id, originHash) =>
+              setPendingSuccessor({ id, originHash })
+            }
+          />
         </div>
       ) : (
         <>

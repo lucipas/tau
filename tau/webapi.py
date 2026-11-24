@@ -12324,10 +12324,41 @@ class WebBridge:
         new_group = self.node.groups.update_members(
             group["id"], roster, created_by=own_hash, identity=self.node.identity
         )
+        if new_group["id"] != group["id"]:
+            self._carry_group_successor(group["id"], new_group["id"])
         return {
             "group": self._describe_group(new_group),
             "previous_id": group["id"],
         }
+
+    def _carry_group_successor(self, old_id: str, new_id: str) -> None:
+        """Move a retired group's disappearing default and draft to its successor.
+
+        Defaults and drafts are keyed by exact group id, so a roster
+        rotation would otherwise orphan them. Best effort: the roster
+        change has already committed, so a failure is logged, not raised.
+        """
+        try:
+            path = self._disappearing_path()
+            if path is not None:
+                with self._disappearing_lock, disappearing_lock(path):
+                    current = load_disappearing_defaults(path)
+                    seconds = current.group_default(old_id)
+                    if seconds is not None:
+                        updated = current.with_group(new_id, seconds).without_group(old_id)
+                        save_disappearing_defaults(path, updated)
+        except Exception:
+            log.exception("failed to carry the disappearing default to the successor group")
+        try:
+            drafts_path = self._drafts_path()
+            if drafts_path is not None:
+                store = DraftStore(drafts_path)
+                draft = store.get("group", old_id)
+                if draft is not None:
+                    store.save("group", new_id, draft["text"])
+                    store.delete("group", old_id)
+        except Exception:
+            log.exception("failed to carry the saved draft to the successor group")
 
     def _describe_banned(self, group: Dict[str, Any]) -> List[Dict[str, str]]:
         """A group's ban list with display names for the console."""

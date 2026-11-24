@@ -56,7 +56,7 @@ export function fakeTau(overrides: Partial<UseTauResult> = {}): UseTauResult {
     connected: true,
     error: null,
     typing: {},
-    refresh: vi.fn(async () => undefined),
+    refresh: vi.fn(async () => null),
     ...overrides,
   };
 }

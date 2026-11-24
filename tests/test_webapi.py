@@ -3453,6 +3453,61 @@ def test_api_groups_add_member_returns_successor_group(bridge, node, tmp_path):
     assert listed["groups"][0]["id"] == payload["group"]["id"]
 
 
+def test_api_groups_add_member_carries_default_and_draft_to_successor(
+    node, tmp_path
+):
+    # A roster rotation retires the group id, so the disappearing
+    # default and saved draft keyed by it must follow the successor —
+    # otherwise the group silently loses both (Qodo review of #772).
+    from tau.groups import GroupStore
+
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        node.groups = GroupStore(tmp_path / "groups.json")
+        _add_carol_to_registry(node)
+        created = _json(
+            bridge,
+            "/api/groups",
+            method="POST",
+            body={"name": "weekend", "members": [PEER_HASH]},
+        )[2]["group"]
+        status, _, _ = _json(
+            bridge,
+            "/api/messages/disappearing",
+            method="POST",
+            body={"group": created["id"], "seconds": 3600},
+        )
+        assert status == 200
+        status, _, _ = _json(
+            bridge,
+            "/api/drafts",
+            method="POST",
+            body={
+                "kind": "group",
+                "target": created["id"],
+                "text": "hello crew",
+            },
+        )
+        assert status == 200
+        status, _, payload = _json(
+            bridge,
+            "/api/groups/add-member",
+            method="POST",
+            body={"group": "weekend", "members": [OTHER_HASH]},
+        )
+        assert status == 200
+        successor_id = payload["group"]["id"]
+        assert successor_id != created["id"]
+        _, _, defaults = _json(bridge, "/api/messages/disappearing")
+        assert defaults["groups"] == {successor_id: 3600.0}
+        _, _, drafts = _json(bridge, "/api/drafts")
+        assert drafts["count"] == 1
+        assert drafts["drafts"][0]["target"] == successor_id
+        assert drafts["drafts"][0]["text"] == "hello crew"
+    finally:
+        bridge.stop()
+
+
 def test_api_groups_remove_member_drops_offline_member(bridge, node, tmp_path):
     from tau.groups import GroupStore
 
