@@ -54,6 +54,7 @@ JOIN_REQUESTS_FILE_NAME = "join-requests.json"
 SCHEDULED_POSTS_FILE_NAME = "scheduled-posts.json"
 SCHEDULED_CHANNEL_MESSAGES_FILE_NAME = "scheduled-channel-messages.json"
 SCHEDULED_FILES_FILE_NAME = "scheduled-files.json"
+AUTO_BACKUPS_FILE_NAME = "auto-backups.json"
 REMINDERS_FILE_NAME = "reminders.json"
 SCHEDULED_FILES_DIR_NAME = "scheduled-files"
 PROFILE_FILE_NAME = "profile.json"
@@ -287,6 +288,20 @@ ANNOUNCE_INTERVAL_DEFAULT = 300.0
 # threading.TIMEOUT_MAX so a stored value can never overflow a wait.
 ANNOUNCE_INTERVAL_MAX = 365.0 * 24 * 3600
 
+# Automatic backups (see tau.auto_backup): 0 disables them, so a node
+# only backs itself up once its owner opts in. Same one-year cap as
+# the announce interval, for the same wait-overflow reason.
+BACKUP_INTERVAL_DEFAULT = 0.0
+BACKUP_INTERVAL_MAX = 365.0 * 24 * 3600
+# How many automatic backups to keep when the setting is absent or
+# invalid, and the largest keep a stored value may ask for.
+BACKUP_KEEP_DEFAULT = 7
+BACKUP_KEEP_MAX = 1000
+# Directory automatic backups land in when no backup-dir is set: next
+# to the data directory, never inside it (create_backup refuses a
+# target inside the data directory).
+BACKUP_DIR_NAME = "tau-backups"
+
 
 def announce_interval(data_dir: Path) -> float:
     """How often `tau serve` re-announces, in seconds (see #619).
@@ -312,6 +327,104 @@ def announce_interval(data_dir: Path) -> float:
     ):
         return ANNOUNCE_INTERVAL_DEFAULT
     return seconds
+
+
+def backup_interval(data_dir: Path) -> float:
+    """How often a serving node backs itself up, in seconds (see #750).
+
+    0 disables automatic backups (the default: a node only backs
+    itself up once its owner opts in). Any other value (including a
+    corrupt, non-finite, oversized, or out-of-range one) falls back
+    to the default, so a hand-edited node.json cannot wedge the
+    backup loop.
+    """
+    value = load_node_settings(data_dir).get(
+        "backup_interval", BACKUP_INTERVAL_DEFAULT
+    )
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return BACKUP_INTERVAL_DEFAULT
+    try:
+        seconds = float(value)
+    except OverflowError:
+        return BACKUP_INTERVAL_DEFAULT
+    if (
+        not math.isfinite(seconds)
+        or seconds < 0
+        or seconds > BACKUP_INTERVAL_MAX
+    ):
+        return BACKUP_INTERVAL_DEFAULT
+    return seconds
+
+
+def backup_dir(data_dir: Path) -> Path:
+    """Where automatic backups land (see #750).
+
+    The ``backup_dir`` setting when it names a usable absolute path
+    outside the data directory; otherwise the default — a
+    ``tau-backups`` directory next to the data directory. A relative
+    setting resolves against the data directory's parent, and a
+    setting pointing inside the data directory is ignored (a backup
+    target there would be refused anyway), so a hand-edited node.json
+    cannot aim automatic backups at the directory being backed up.
+    """
+    base = Path(data_dir)
+    default = base.parent / BACKUP_DIR_NAME
+    value = load_node_settings(data_dir).get("backup_dir")
+    if not isinstance(value, str) or not value.strip():
+        return default
+    path = Path(value.strip()).expanduser()
+    if not path.is_absolute():
+        path = base.parent / path
+    try:
+        resolved = path.resolve()
+        if resolved == base.resolve() or _is_within_path(resolved, base):
+            return default
+    except OSError:
+        return default
+    return resolved
+
+
+def _is_within_path(path: Path, directory: Path) -> bool:
+    try:
+        path.relative_to(directory.resolve())
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def backup_keep(data_dir: Path) -> int:
+    """How many automatic backups to retain (see #750).
+
+    0 keeps all; the default is 7. A corrupt, non-integer, negative,
+    or oversized stored value falls back to the default, so a
+    hand-edited node.json cannot prune everything or nothing by
+    accident.
+    """
+    value = load_node_settings(data_dir).get("backup_keep", BACKUP_KEEP_DEFAULT)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return BACKUP_KEEP_DEFAULT
+    if value < 0 or value > BACKUP_KEEP_MAX:
+        return BACKUP_KEEP_DEFAULT
+    return value
+
+
+def backup_passphrase_file(data_dir: Path) -> Optional[Path]:
+    """Passphrase file automatic backups are encrypted with (see #750).
+
+    None when unset: automatic backups are then plaintext, like a
+    manual backup with no passphrase flags. A non-string or empty
+    stored value also means None, so a hand-edited node.json cannot
+    point the worker at a nonsense path. A relative stored value
+    resolves against the data directory's parent, so it means the
+    same file no matter which directory the serving node started in.
+    """
+    value = load_node_settings(data_dir).get("backup_passphrase_file")
+    if not isinstance(value, str) or not value.strip():
+        return None
+    path = Path(value.strip()).expanduser()
+    if not path.is_absolute():
+        path = Path(data_dir).parent / path
+    return path
 
 
 def write_node_metadata(data_dir: Path, name: str) -> Path:
@@ -349,6 +462,10 @@ def load_node_settings(data_dir: Path) -> Dict[str, object]:
             "send_read_receipts",
             "tan_sync_depth",
             "announce_interval",
+            "backup_interval",
+            "backup_dir",
+            "backup_keep",
+            "backup_passphrase_file",
         )
         if key in raw
     }

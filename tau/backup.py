@@ -73,6 +73,7 @@ log = logging.getLogger(__name__)
 from . import __version__
 from .config import (
     ARCHIVED_FILE_NAME,
+    AUTO_BACKUPS_FILE_NAME,
     AWAY_FILE_NAME,
     CHANNELS_DB_FILE_NAME,
     DEVICES_FILE_NAME,
@@ -127,6 +128,7 @@ BACKUP_FILES = (
     SAVED_MESSAGES_FILE_NAME,
     SCHEDULED_POSTS_FILE_NAME,
     SCHEDULED_FILES_FILE_NAME,
+    AUTO_BACKUPS_FILE_NAME,
     "groups.json",
     "blocklist.json",
     DEVICES_FILE_NAME,
@@ -170,6 +172,24 @@ MIN_BACKUP_PASSPHRASE_LENGTH = 8
 # plus gzip overhead, so an encrypted file past this size can never
 # restore — refuse it before streaming it twice (HMAC pass, decrypt pass).
 _MAX_ENCRYPTED_BYTES = MAX_TOTAL_BYTES + 64 * 1024 * 1024
+
+
+def read_passphrase_file(path: Path) -> str:
+    """Read a backup passphrase from *path*, dropping one trailing newline.
+
+    The file usually ends with a newline from the editor that wrote it;
+    that newline is not part of the passphrase, but any other whitespace
+    is — the value must match exactly what a prompt would have read.
+    """
+    try:
+        content = Path(path).expanduser().read_text(encoding="utf-8")
+    except OSError as exc:
+        raise BackupError(f"cannot read passphrase file {path}: {exc}") from exc
+    if content.endswith("\r\n"):
+        content = content[:-2]
+    elif content.endswith("\n"):
+        content = content[:-1]
+    return content
 
 
 def _clean_passphrase(passphrase: object) -> str:

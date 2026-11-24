@@ -2179,3 +2179,143 @@ def test_read_receipts_flow_end_to_end(tmp_path: Path) -> None:
         if bob is not None:
             stop_process(bob)
         stop_process(alice)
+
+
+def test_serving_node_takes_automatic_backups(tmp_path: Path) -> None:
+    """A serving node with backup-interval set backs itself up (see #750).
+
+    No automatic backup exists yet, so the first mail-loop pass after
+    serve starts takes one; the test waits for the file to appear.
+    """
+    port = free_port()
+    alice_dir = tmp_path / "alice"
+    backup_dir = tmp_path / "backups"
+
+    require_ok(
+        run_tau(
+            "init",
+            "--data-dir",
+            str(alice_dir),
+            "--name",
+            "alice",
+            "--tcp-listen",
+            f"127.0.0.1:{port}",
+            "--no-auto-interface",
+            "--json",
+        )
+    )
+    require_ok(
+        run_tau(
+            "config",
+            "backup-interval",
+            "3600",
+            "--data-dir",
+            str(alice_dir),
+        )
+    )
+    require_ok(
+        run_tau(
+            "config",
+            "backup-dir",
+            str(backup_dir),
+            "--data-dir",
+            str(alice_dir),
+        )
+    )
+
+    alice_out = tmp_path / "alice.out"
+    alice_err = tmp_path / "alice.err"
+    alice = start_serve(alice_dir, alice_out, alice_err)
+    try:
+        time.sleep(2.0)
+        assert alice.poll() is None, alice_err.read_text()
+
+        deadline = time.time() + 60.0
+        backups: list[Path] = []
+        while time.time() < deadline:
+            backups = sorted(backup_dir.glob("tau-backup-alice-*.tar.gz"))
+            if backups:
+                break
+            time.sleep(1.0)
+        assert backups, "no automatic backup appeared while serving"
+        assert backups[0].stat().st_size > 0
+        # One backup, not one per mail-loop pass: the schedule advances
+        # after the first, so a second pass inside the wait sees nothing due.
+        time.sleep(3.0)
+        assert len(sorted(backup_dir.glob("tau-backup-alice-*.tar.gz"))) == 1
+    finally:
+        stop_process(alice)
+
+
+def test_serving_node_honors_short_backup_interval(tmp_path: Path) -> None:
+    """A backup interval shorter than the mail loop is honored (see #750).
+
+    The mail loop waits 45 seconds between passes; with a 10-second
+    backup interval the node must still take a second backup about an
+    interval after the first finished, not a mail loop later.
+    """
+    port = free_port()
+    alice_dir = tmp_path / "alice"
+    backup_dir = tmp_path / "backups"
+
+    require_ok(
+        run_tau(
+            "init",
+            "--data-dir",
+            str(alice_dir),
+            "--name",
+            "alice",
+            "--tcp-listen",
+            f"127.0.0.1:{port}",
+            "--no-auto-interface",
+            "--json",
+        )
+    )
+    require_ok(
+        run_tau(
+            "config",
+            "backup-interval",
+            "10",
+            "--data-dir",
+            str(alice_dir),
+        )
+    )
+    require_ok(
+        run_tau(
+            "config",
+            "backup-dir",
+            str(backup_dir),
+            "--data-dir",
+            str(alice_dir),
+        )
+    )
+    require_ok(
+        run_tau(
+            "config",
+            "backup-keep",
+            "5",
+            "--data-dir",
+            str(alice_dir),
+        )
+    )
+
+    alice_out = tmp_path / "alice.out"
+    alice_err = tmp_path / "alice.err"
+    alice = start_serve(alice_dir, alice_out, alice_err)
+    try:
+        time.sleep(2.0)
+        assert alice.poll() is None, alice_err.read_text()
+
+        deadline = time.time() + 45.0
+        backups: list[Path] = []
+        while time.time() < deadline:
+            backups = sorted(backup_dir.glob("tau-backup-alice-*.tar.gz"))
+            if len(backups) >= 2:
+                break
+            time.sleep(1.0)
+        assert len(backups) >= 2, (
+            f"only {len(backups)} automatic backup(s) in 45s "
+            "with a 10s interval"
+        )
+    finally:
+        stop_process(alice)
