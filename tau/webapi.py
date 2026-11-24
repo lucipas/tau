@@ -1481,6 +1481,10 @@ class WebBridge:
         # token, with its download filename and expiry, and deleted on
         # download, revoke, expiry, or stop.
         self._device_bundles: Dict[str, Tuple[Path, str, float]] = {}
+        # Bundles claimed for download, guarded by _backup_lock like
+        # the staged map: a claimed file is still the only copy of the
+        # private identity, so stop() deletes these too.
+        self._device_bundles_in_flight: Set[Path] = set()
         self._started_at = time.time()
 
     # -- lifecycle ---------------------------------------------------------
@@ -1568,6 +1572,8 @@ class WebBridge:
                 path for path, _name, _expires in self._device_bundles.values()
             ]
             self._device_bundles.clear()
+            device_leftovers.extend(self._device_bundles_in_flight)
+            self._device_bundles_in_flight.clear()
         for path in leftovers:
             _unlink_quietly(path)
         for path in device_leftovers:
@@ -1585,6 +1591,12 @@ class WebBridge:
             staged = self._device_bundles.pop(token, None)
         if staged is not None:
             _unlink_quietly(staged[0])
+
+    def finish_claimed_device_bundle(self, path: Path) -> None:
+        """Remove a bundle claimed by :meth:`claim_device_bundle` and delete it."""
+        with self._backup_lock:
+            self._device_bundles_in_flight.discard(path)
+        _unlink_quietly(path)
 
     def _prune_device_bundles_locked(self) -> None:
         """Delete staged bundles past expiry; caller holds ``_backup_lock``.
@@ -1756,10 +1768,14 @@ class WebBridge:
         The entry is popped under the lock before streaming, so a
         second concurrent GET for the same token gets a missing-bundle
         response instead of streaming the same single-use bundle twice.
-        The caller deletes the file after the transfer attempt.
+        The claimed file is tracked in flight until the caller deletes
+        it after the transfer attempt, so stop() can still clean it up
+        if shutdown overlaps a stalled download.
         """
         with self._backup_lock:
             staged = self._device_bundles.pop(token, None)
+            if staged is not None:
+                self._device_bundles_in_flight.add(staged[0])
         if staged is None:
             raise WebBridgeError(
                 "no pairing bundle staged for that token; mint a new one"
@@ -14060,7 +14076,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                     # never lingers in the temp directory — except on a
                     # HEAD, which must not consume the download.
                     if not head_only:
-                        _unlink_quietly(staged)
+                        self.bridge.finish_claimed_device_bundle(staged)
                 return
             if path == "/api/doctor":
                 try:

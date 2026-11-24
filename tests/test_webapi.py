@@ -5539,6 +5539,18 @@ def test_devices_claim_is_single_use_and_head_does_not_consume(tmp_path, capsys)
         bridge.stop()
 
 
+def test_devices_claimed_bundle_cleaned_up_on_stop(tmp_path, capsys):
+    # A claimed bundle leaves the staged map but stays tracked in
+    # flight, so bridge shutdown still deletes the private-identity
+    # file instead of stranding it in the temp directory.
+    _, bridge = _devices_bridge(tmp_path, capsys)
+    _, _, minted = _json(bridge, "/api/devices/pair", method="POST", body={})
+    staged, _name = bridge.claim_device_bundle(minted["token"])
+    assert staged.exists()
+    bridge.stop()
+    assert not staged.exists()
+
+
 def test_devices_prune_deletes_expired_staged_bundles(tmp_path, capsys):
     _, bridge = _devices_bridge(tmp_path, capsys)
     try:
