@@ -5390,7 +5390,7 @@ def test_devices_bundle_download_missing_file_is_a_clean_404(tmp_path, capsys):
     _, bridge = _devices_bridge(tmp_path, capsys)
     try:
         _, _, minted = _json(bridge, "/api/devices/pair", method="POST", body={})
-        staged, _name = bridge.device_bundle(minted["token"])
+        staged, _name, _expires = bridge.device_bundle(minted["token"])
         staged.unlink()
         status, _, payload = _json(bridge, minted["download"])
         assert status == 404
@@ -5498,10 +5498,62 @@ def test_devices_without_a_data_directory_is_unavailable(bridge):
 def test_bridge_stop_removes_unclaimed_pairing_bundle(tmp_path, capsys):
     _, bridge = _devices_bridge(tmp_path, capsys)
     result = bridge.pair_device()
-    staged, _name = bridge.device_bundle(result["token"])
+    staged, _name, _expires = bridge.device_bundle(result["token"])
     assert staged.exists()
     bridge.stop()
     assert not staged.exists()
+
+
+def test_devices_revoke_deletes_the_staged_bundle(tmp_path, capsys):
+    _, bridge = _devices_bridge(tmp_path, capsys)
+    try:
+        _, _, minted = _json(bridge, "/api/devices/pair", method="POST", body={})
+        staged, _name, _expires = bridge.device_bundle(minted["token"])
+        assert staged.exists()
+        status, _, _ = _json(
+            bridge, "/api/devices/revoke", method="POST", body={"token": minted["token"]}
+        )
+        assert status == 200
+        assert not staged.exists()
+        # The bundle is gone with the offer: no download survives revoke.
+        status, _, payload = _json(bridge, minted["download"])
+        assert status == 404
+    finally:
+        bridge.stop()
+
+
+def test_devices_claim_is_single_use_and_head_does_not_consume(tmp_path, capsys):
+    _, bridge = _devices_bridge(tmp_path, capsys)
+    try:
+        _, _, minted = _json(bridge, "/api/devices/pair", method="POST", body={})
+        # A HEAD peeks without consuming: the bundle still downloads after.
+        status, headers, _ = _request(bridge, minted["download"], method="HEAD")
+        assert status == 200
+        assert headers["Content-Disposition"].endswith(f'"{minted["filename"]}"')
+        # The first claim wins; a second claim is a missing bundle.
+        staged, _name = bridge.claim_device_bundle(minted["token"])
+        assert staged.exists()
+        with pytest.raises(WebBridgeError, match="no pairing bundle"):
+            bridge.claim_device_bundle(minted["token"])
+    finally:
+        bridge.stop()
+
+
+def test_devices_prune_deletes_expired_staged_bundles(tmp_path, capsys):
+    _, bridge = _devices_bridge(tmp_path, capsys)
+    try:
+        result = bridge.pair_device()
+        token = result["token"]
+        staged, name, _expires = bridge.device_bundle(token)
+        assert staged.exists()
+        # Age the staged entry past expiry, then mint again: the
+        # prune on mint must delete the stale file.
+        bridge._device_bundles[token] = (staged, name, time.time() - 1)
+        bridge.pair_device()
+        assert token not in bridge._device_bundles
+        assert not staged.exists()
+    finally:
+        bridge.stop()
 
 
 def test_static_console_and_assets(bridge):

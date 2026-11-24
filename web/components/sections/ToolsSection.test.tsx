@@ -129,8 +129,35 @@ describe("ToolsSection", () => {
     ).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Revoke" }));
     await waitFor(() => expect(calls).toContain("POST /api/devices/revoke"));
+    expect(
+      await screen.findByText(/still redeems until it expires/),
+    ).toBeTruthy();
     await waitFor(() =>
       expect(screen.queryByText("token abababab…")).toBeNull(),
     );
+  });
+
+  it("shows the server error when linked devices fail", async () => {
+    mockFetch((url) => {
+      if (url.includes("/api/devices")) {
+        throw new Error("this node has no data directory for linked devices");
+      }
+      if (url.includes("/api/doctor")) {
+        return {
+          ok: true,
+          checks: [{ name: "Node running", ok: true, message: "up" }],
+        };
+      }
+      if (url.includes("/api/allowlist")) {
+        return { enabled: true, entries: allowlistEntries };
+      }
+      return { ok: true };
+    });
+    render(<ToolsSection />);
+    expect(
+      await screen.findByText(
+        "this node has no data directory for linked devices",
+      ),
+    ).toBeTruthy();
   });
 });

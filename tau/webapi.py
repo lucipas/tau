@@ -1586,6 +1586,23 @@ class WebBridge:
         if staged is not None:
             _unlink_quietly(staged[0])
 
+    def _prune_device_bundles_locked(self) -> None:
+        """Delete staged bundles past expiry; caller holds ``_backup_lock``.
+
+        A bundle whose offer expired is no longer redeemable, so its
+        staged file must not linger in the temp directory waiting for
+        a download that can never succeed.
+        """
+        now = time.time()
+        expired = [
+            token
+            for token, (_path, _name, expires) in self._device_bundles.items()
+            if expires <= now
+        ]
+        for token in expired:
+            path, _name, _expires = self._device_bundles.pop(token)
+            _unlink_quietly(path)
+
     # -- linked devices ----------------------------------------------------
 
     def _devices_registry(self) -> DeviceRegistry:
@@ -1635,9 +1652,9 @@ class WebBridge:
         staged.  The bridge runs inside the serving node, so the
         instance lock is skipped: this process already holds it,
         exactly like :meth:`backup`.  Returns the token, expiry,
-        history size, download URL and filename; the caller streams
-        the staged file and deletes it with
-        :meth:`finish_device_bundle`.
+        history size, download URL and filename; the caller claims
+        the staged file with :meth:`claim_device_bundle` and deletes
+        it after the transfer attempt.
         """
         identity = getattr(self.node, "identity", None)
         if identity is None:
@@ -1719,8 +1736,12 @@ class WebBridge:
             "filename": filename,
         }
 
-    def device_bundle(self, token: str) -> Tuple[Path, str]:
-        """Staged bundle file and filename for *token*, or raise."""
+    def device_bundle(self, token: str) -> Tuple[Path, str, float]:
+        """Staged bundle file, filename and expiry for *token*, or raise.
+
+        A read-only peek for HEAD requests: it does not consume the
+        bundle, so a HEAD never destroys the only copy.
+        """
         with self._backup_lock:
             staged = self._device_bundles.get(token)
         if staged is None:
@@ -1729,10 +1750,34 @@ class WebBridge:
             )
         return staged
 
+    def claim_device_bundle(self, token: str) -> Tuple[Path, str]:
+        """Atomically take the staged bundle for *token* for download.
+
+        The entry is popped under the lock before streaming, so a
+        second concurrent GET for the same token gets a missing-bundle
+        response instead of streaming the same single-use bundle twice.
+        The caller deletes the file after the transfer attempt.
+        """
+        with self._backup_lock:
+            staged = self._device_bundles.pop(token, None)
+        if staged is None:
+            raise WebBridgeError(
+                "no pairing bundle staged for that token; mint a new one"
+            )
+        return staged[0], staged[1]
+
     def revoke_device_offer(self, token: str) -> Dict[str, Any]:
-        """Cancel an outstanding pairing offer, like ``tau devices revoke``."""
+        """Cancel an outstanding pairing offer, like ``tau devices revoke``.
+
+        The staged bundle for the offer is deleted with it: a revoked
+        offer must not leave a downloadable copy behind.  A bundle
+        file already downloaded still redeems until it expires — the
+        caller must say so, like ``tau devices revoke`` does.
+        """
         registry = self._devices_registry()
-        return registry.revoke_offer(token)
+        revoked = registry.revoke_offer(token)
+        self.finish_device_bundle(revoked["token"])
+        return revoked
 
     # -- message history ---------------------------------------------------
 
@@ -13970,7 +14015,16 @@ class _WebHandler(BaseHTTPRequestHandler):
                     return
                 token = path[len("/api/devices/bundle/"):]
                 try:
-                    staged, filename = self.bridge.device_bundle(token)
+                    if head_only:
+                        # A HEAD peeks without consuming the download.
+                        staged, filename, _expires = self.bridge.device_bundle(
+                            token
+                        )
+                    else:
+                        # Claim before streaming, so a second concurrent
+                        # GET gets a missing-bundle response instead of
+                        # streaming the same single-use bundle twice.
+                        staged, filename = self.bridge.claim_device_bundle(token)
                 except WebBridgeError as exc:
                     self._send_json(
                         {"error": {"message": str(exc)}}, head_only, 404
@@ -13980,13 +14034,33 @@ class _WebHandler(BaseHTTPRequestHandler):
                     self._send_file(
                         staged, filename, head_only, content_type="application/json"
                     )
+                except FileNotFoundError:
+                    # Only a missing file reads as gone: the open
+                    # happens before any header is committed, so a
+                    # permissions or I/O failure is not this case — it
+                    # reaches the logged internal-error path instead.
+                    # A missing file means a concurrent download already
+                    # consumed the bundle, or shutdown deleted it.
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": (
+                                    "pairing bundle is no longer available; "
+                                    "mint a new one"
+                                )
+                            }
+                        },
+                        head_only,
+                        404,
+                    )
+                    return
                 finally:
                     # The staged file is the only copy of the bundle:
                     # delete it after the download attempt, so a bundle
                     # never lingers in the temp directory — except on a
                     # HEAD, which must not consume the download.
                     if not head_only:
-                        self.bridge.finish_device_bundle(token)
+                        _unlink_quietly(staged)
                 return
             if path == "/api/doctor":
                 try:

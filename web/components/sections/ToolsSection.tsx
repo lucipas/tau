@@ -7,6 +7,7 @@
 
 import { useEffect, useState } from "react";
 import {
+  ApiError,
   allowlistAdd,
   allowlistRemove,
   allowlistSetEnabled,
@@ -51,6 +52,7 @@ export default function ToolsSection() {
   const [doctor, setDoctor] = useState<DoctorReport | null>(null);
   const [allowlist, setAllowlist] = useState<AllowList | null>(null);
   const [devices, setDevices] = useState<DevicesInfo | null>(null);
+  const [devicesError, setDevicesError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -67,16 +69,26 @@ export default function ToolsSection() {
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setLoading(false);
     }
     // Linked devices are loopback-only: a remote console gets a 403
-    // here, which must not fail the whole Tools page — the section
-    // then explains itself instead of listing devices.
+    // here, which must not fail the whole Tools page — and a local
+    // failure (no data directory, transient error) must not hide
+    // behind the localhost explanation either: the 403 keeps the
+    // localhost text, any other failure shows the server's message.
     try {
       setDevices(await getDevices());
-    } catch {
+      setDevicesError(null);
+    } catch (err) {
       setDevices(null);
+      setDevicesError(
+        err instanceof ApiError && err.status === 403
+          ? null
+          : err instanceof Error
+            ? err.message
+            : String(err),
+      );
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -282,8 +294,10 @@ export default function ToolsSection() {
         </p>
         {devices === null && (
           <p className="py-2 text-sm text-zinc-500">
-            Linked devices are available when the console runs on the same machine as
-            the node.
+            {loading
+              ? "Loading linked devices…"
+              : (devicesError ??
+                "Linked devices are available when the console runs on the same machine as the node.")}
           </p>
         )}
         {devices !== null && (
@@ -353,7 +367,7 @@ export default function ToolsSection() {
                           await revokeDeviceOffer(offer.token);
                           setDevices(await getDevices());
                         },
-                        "Pairing offer revoked.",
+                        "Pairing offer revoked. A bundle file already downloaded still redeems until it expires — delete it.",
                       )
                     }
                     className="shrink-0 rounded-full border border-red-800 px-3 py-1 text-xs text-red-400 hover:bg-red-950 disabled:opacity-50"
