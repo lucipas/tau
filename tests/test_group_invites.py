@@ -75,6 +75,39 @@ def _secret_group(node, identity, own_hash, *others):
     )
 
 
+def _v1_link(identity, *, group_name=None, group_id=None, mode="open",
+             generation=0, creator_hash=None):
+    """Mint a pre-sealing (v1) link by hand, for back-compat tests.
+
+    Mirrors the old mint path: a signed payload carried bare, not
+    sealed.  Exactly one of *group_name* / *group_id* is required.
+    """
+    own_hash = creator_hash or RNS.Destination.hash(
+        identity, APP_NAME, ASPECT
+    ).hex()
+    payload = {
+        "v": 1,
+        "type": "group-invite",
+        "creator": own_hash,
+        "mode": mode,
+        "generation": generation,
+        "issued_at": 1000.0,
+    }
+    if (group_name is None) == (group_id is None):
+        raise AssertionError("a v1 link needs exactly one group handle")
+    if group_name is not None:
+        payload["group"] = group_name
+    else:
+        payload["group_id"] = group_id
+    token = dict(payload)
+    token["sig"] = base64.b64encode(identity.sign(encode(payload))).decode(
+        "ascii"
+    )
+    return "tau://invite/" + base64.urlsafe_b64encode(
+        encode(token)
+    ).decode("ascii")
+
+
 def test_id_token_round_trip_carries_no_name():
     identity = RNS.Identity()
     own_hash = RNS.Destination.hash(identity, APP_NAME, ASPECT).hex()
@@ -83,10 +116,16 @@ def test_id_token_round_trip_carries_no_name():
         identity, group_id=group_id, creator_hash=own_hash, mode="closed"
     )
     assert link.startswith("tau://invite/")
-    token = parse_invite_link(link)
-    assert token["group_id"] == group_id
-    assert "group" not in token
-    # The group name appears nowhere in the token at all.
+    # The minted link is sealed: parsing it shows only the outer
+    # envelope — the creator hash plus an opaque blob.  No group
+    # field of any kind appears in the clear.
+    envelope = parse_invite_link(link)
+    assert envelope["v"] == 2
+    assert envelope["creator"] == own_hash
+    assert isinstance(envelope["sealed"], bytes) and envelope["sealed"]
+    assert "group" not in envelope and "group_id" not in envelope
+    # The group name appears nowhere in the link at all — not even
+    # inside the sealed blob's base64, which a holder cannot read.
     assert b"crew" not in base64.urlsafe_b64decode(
         link[len("tau://invite/") :]
     )
@@ -205,9 +244,16 @@ def test_mint_parse_verify_round_trip():
         identity, group_name=group_name, creator_hash=own_hash, mode="closed"
     )
     assert link.startswith("tau://invite/")
-    token = parse_invite_link(link)
-    assert token["group"] == group_name
-    assert token["mode"] == "closed"
+    # Sealed: the parsed link is the outer envelope, not the token.
+    envelope = parse_invite_link(link)
+    assert envelope["v"] == 2
+    assert envelope["creator"] == own_hash
+    assert isinstance(envelope["sealed"], bytes) and envelope["sealed"]
+    assert "group" not in envelope and "mode" not in envelope
+    # The name and the mode appear nowhere in the link at all.
+    raw = base64.urlsafe_b64decode(link[len("tau://invite/") :])
+    assert b"crew" not in raw
+    assert b"closed" not in raw
     verified = verify_invite_link(
         link,
         identity=identity,
@@ -224,8 +270,31 @@ def test_verify_rejects_tampered_mode_and_wrong_creator():
     link = mint_invite_token(
         identity, group_name=group_name, creator_hash=own_hash, mode="open"
     )
-    token = parse_invite_link(link)
-    # Tamper with the mode after signing: the signature must fail.
+    # Tamper with the sealed blob: the decrypt must fail, so the
+    # token is refused even though the outer envelope is intact.
+    envelope = parse_invite_link(link)
+    tampered_blob = bytes([envelope["sealed"][0] ^ 0xFF]) + envelope["sealed"][1:]
+    outer = {
+        "v": 2,
+        "type": "group-invite",
+        "creator": own_hash,
+        "sealed": base64.b64encode(tampered_blob).decode("ascii"),
+    }
+    tampered_link = "tau://invite/" + base64.urlsafe_b64encode(
+        encode(outer)
+    ).decode("ascii")
+    with pytest.raises(InviteError):
+        verify_invite_link(
+            tampered_link,
+            identity=identity,
+            invites={"groups": {group_name: {"mode": "open", "generation": 0}}},
+        )
+    # Tamper with the mode after signing, on a bare v1 link: the
+    # signature must fail.
+    v1_link = _v1_link(
+        identity, group_name=group_name, creator_hash=own_hash, mode="open"
+    )
+    token = parse_invite_link(v1_link)
     tampered = dict(token)
     tampered["mode"] = "closed"
     raw = base64.urlsafe_b64encode(encode(tampered)).decode("ascii")
@@ -246,6 +315,39 @@ def test_verify_rejects_tampered_mode_and_wrong_creator():
     # And a token for an unknown group fails even with the right signer.
     with pytest.raises(InviteError):
         verify_invite_link(link, identity=identity, invites={"groups": {}})
+
+
+def test_v1_link_still_verifies():
+    """A pre-sealing (v1) link keeps working after sealing lands."""
+    identity = RNS.Identity()
+    own_hash = RNS.Destination.hash(identity, APP_NAME, ASPECT).hex()
+    group_name = "crew"
+    link = _v1_link(
+        identity, group_name=group_name, creator_hash=own_hash, mode="closed"
+    )
+    token = parse_invite_link(link)
+    assert token["v"] == 1
+    assert token["group"] == group_name
+    assert token["mode"] == "closed"
+    verified = verify_invite_link(
+        link,
+        identity=identity,
+        invites={"groups": {group_name: {"mode": "closed", "generation": 0}}},
+    )
+    assert verified["group"] == group_name
+    assert verified["mode"] == "closed"
+    # A v1 id token for a secret group verifies the same way.
+    group_id = "ab" * 16
+    id_link = _v1_link(
+        identity, group_id=group_id, creator_hash=own_hash, mode="open"
+    )
+    verified = verify_invite_link(
+        id_link,
+        identity=identity,
+        invites={"groups": {group_name: {"mode": "open", "generation": 0}}},
+        resolve_group_id=lambda gid: group_name if gid == group_id else None,
+    )
+    assert verified["group_id"] == group_id
 
 
 def test_parse_rejects_garbage_links():
@@ -294,15 +396,36 @@ def test_revoke_invalidates_older_tokens(tmp_path):
 def test_invite_token_group_label():
     identity = RNS.Identity()
     own_hash = RNS.Destination.hash(identity, APP_NAME, ASPECT).hex()
+    # A sealed link names nothing in the clear, so its label is
+    # empty — the joiner learns the group from the creator's reply.
     name_link = mint_invite_token(
         identity, group_name="crew", creator_hash=own_hash
     )
     id_link = mint_invite_token(
         identity, group_id="ab" * 16, creator_hash=own_hash
     )
-    assert invite_token_group_label(parse_invite_link(name_link)) == "crew"
+    assert invite_token_group_label(parse_invite_link(name_link)) == ""
+    assert invite_token_group_label(parse_invite_link(id_link)) == ""
+    # A bare v1 link still labels as before.
     assert (
-        invite_token_group_label(parse_invite_link(id_link)) == "ab" * 16
+        invite_token_group_label(
+            parse_invite_link(
+                _v1_link(
+                    identity, group_name="crew", creator_hash=own_hash
+                )
+            )
+        )
+        == "crew"
+    )
+    assert (
+        invite_token_group_label(
+            parse_invite_link(
+                _v1_link(
+                    identity, group_id="ab" * 16, creator_hash=own_hash
+                )
+            )
+        )
+        == "ab" * 16
     )
 
 
@@ -778,10 +901,15 @@ def test_secret_group_join_via_id_link(tmp_path, monkeypatch):
         group_id=group["id"],
         group_created_at=group["created_at"],
     )
-    # The minted link names the group by id only — no name anywhere.
-    token = parse_invite_link(link)
-    assert token["group_id"] == group["id"]
-    assert "group" not in token
+    # The minted link is sealed: it names the group by id only
+    # inside the sealed blob — no name, and no id either, in the
+    # clear.  The creator still opens it and admits the joiner.
+    envelope = parse_invite_link(link)
+    assert envelope["v"] == 2
+    assert "group" not in envelope and "group_id" not in envelope
+    raw = base64.urlsafe_b64decode(link[len("tau://invite/") :])
+    assert b"crew" not in raw
+    assert group["id"].encode("ascii") not in raw
     welcomes = []
     monkeypatch.setattr(
         node,

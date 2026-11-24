@@ -17971,9 +17971,13 @@ def test_group_invite_endpoint_mints_a_verifiable_link(bridge, node):
     assert payload["generation"] == 0
     link = payload["link"]
     assert link.startswith("tau://invite/")
+    # The minted link is sealed: parsing it shows only the outer
+    # envelope — the creator hash plus an opaque blob — never the
+    # group name.  Verification still opens it.
     token = parse_invite_link(link)
+    assert token["v"] == 2
     assert token["creator"] == own_hash
-    assert token["group"] == "team"
+    assert "group" not in token
     assert (
         verify_invite_link(
             link,
@@ -18111,14 +18115,17 @@ def test_group_join_endpoint_joins_from_link(bridge, node, monkeypatch, tmp_path
     assert status == 200
     assert payload["status"] == "pending"
     assert payload["group"]["id"] == group_id
-    # An unreachable creator queues the request.
+    # An unreachable creator queues the request.  The sealed link
+    # names nothing in the clear, so the queued reply carries no
+    # group label — the joiner learns the group from the creator's
+    # reply, not the link.
     replies["reply"] = {"queued": True, "id": "mail-new-1"}
     status, _, payload = _json(
         bridge, "/api/groups/join", method="POST", body={"link": link}
     )
     assert status == 200
     assert payload["status"] == "queued"
-    assert payload["group"] == "remote-crew"
+    assert payload["group"] == ""
     # An error reply and malformed links are refused.
     replies["reply"] = {
         "ok": False,
@@ -18139,15 +18146,18 @@ def test_group_join_endpoint_joins_from_link(bridge, node, monkeypatch, tmp_path
     assert "field 'link'" in payload["error"]["message"]
 
 
-def test_group_join_endpoint_queued_id_link_reports_id(bridge, node, monkeypatch, tmp_path):
+def test_group_join_endpoint_queued_sealed_link_reports_no_group(
+    bridge, node, monkeypatch, tmp_path
+):
     from tau.group_invites import mint_invite
     from tau.identity import destination_hash
 
     creator = RNS.Identity()
     creator_hash = destination_hash(creator).hex()
     own_hash = _seed_own_identity(node)
-    # An id-keyed link for a secret group: the queued reply must
-    # report the opaque id, not raise on the missing group name.
+    # A sealed id-keyed link for a secret group: the queued reply
+    # reports no group — the link names nothing in the clear — and
+    # must not raise on the missing group name.
     link = mint_invite(
         tmp_path / "invites.json",
         creator,
@@ -18167,7 +18177,7 @@ def test_group_join_endpoint_queued_id_link_reports_id(bridge, node, monkeypatch
     )
     assert status == 200
     assert payload["status"] == "queued"
-    assert payload["group"] == "cd" * 16
+    assert payload["group"] == ""
 
 
 def test_join_request_endpoints_validate_fields(bridge, node):
