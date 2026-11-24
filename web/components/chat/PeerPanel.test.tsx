@@ -289,9 +289,18 @@ describe("PeerPanel group members", () => {
       fakePeer({ destination: BOB, name: "bob" }),
       fakePeer({ destination: CAROL, name: "carol" }),
     ],
+    // The successor group the refresh returns, when the roster change
+    // rotated the id. Null (the default) is a failed refresh: the
+    // successor is not in any snapshot, so the panel must not navigate.
+    successor: Group | null = null,
   ) {
+    const tau = fakeTauSections({ peers });
+    const snap = tau.snapshot;
+    tau.refresh = vi.fn(async () =>
+      successor && snap ? { ...snap, groups: [successor] } : null,
+    );
     return render(
-      <TauContext.Provider value={fakeTauSections({ peers })}>
+      <TauContext.Provider value={tau}>
         <PeerPanel conversation={conversation} />
       </TauContext.Provider>,
     );
@@ -353,16 +362,17 @@ describe("PeerPanel group members", () => {
   });
 
   it("adds the picked peer and follows the rotated group id", async () => {
+    const successor: Group = { ...memberGroup().group!, id: NEW_ID };
     const { calls } = mockFetchBodies((url, method) => {
       if (url.includes("/api/groups/add-member")) {
         return {
-          group: { ...memberGroup().group, id: NEW_ID },
+          group: successor,
           previous_id: GROUP_ID,
         };
       }
       return inviteOnly(url);
     });
-    renderGroupPanel(memberGroup());
+    renderGroupPanel(memberGroup(), undefined, successor);
     await waitFor(() => expect(screen.getByText("Members")).toBeTruthy());
     fireEvent.change(screen.getByLabelText("Add member"), {
       target: { value: CAROL },
@@ -383,16 +393,17 @@ describe("PeerPanel group members", () => {
   });
 
   it("removes a member after a confirm step and follows the rotated group id", async () => {
+    const successor: Group = { ...memberGroup().group!, id: NEW_ID };
     const { calls } = mockFetchBodies((url, method) => {
       if (url.includes("/api/groups/remove-member")) {
         return {
-          group: { ...memberGroup().group, id: NEW_ID },
+          group: successor,
           previous_id: GROUP_ID,
         };
       }
       return inviteOnly(url);
     });
-    renderGroupPanel(memberGroup());
+    renderGroupPanel(memberGroup(), undefined, successor);
     await waitFor(() => expect(screen.getByText("Members")).toBeTruthy());
     fireEvent.click(screen.getByLabelText("Remove bob from group"));
     expect(screen.getByText("Confirm remove?")).toBeTruthy();
@@ -407,6 +418,39 @@ describe("PeerPanel group members", () => {
           c.url.includes("/api/groups/remove-member") &&
           JSON.stringify(c.body) ===
             JSON.stringify({ group: GROUP_ID, members: [BOB] }),
+      ),
+    ).toBe(true);
+  });
+
+  it("stays put and reports when the refresh cannot load the successor", async () => {
+    // The roster change landed but the snapshot fetch failed, so the
+    // refresh returns null: navigating would point the thread at a
+    // group the console cannot display yet.
+    const { calls } = mockFetchBodies((url, method) => {
+      if (url.includes("/api/groups/remove-member")) {
+        return {
+          group: { ...memberGroup().group, id: NEW_ID },
+          previous_id: GROUP_ID,
+        };
+      }
+      return inviteOnly(url);
+    });
+    renderGroupPanel(memberGroup());
+    await waitFor(() => expect(screen.getByText("Members")).toBeTruthy());
+    fireEvent.click(screen.getByLabelText("Remove bob from group"));
+    fireEvent.click(screen.getByText("Confirm remove?"));
+    await waitFor(() =>
+      expect(
+        screen.getByText(
+          "Members updated, but the new group couldn't be loaded yet — it will appear when the connection recovers.",
+        ),
+      ).toBeTruthy(),
+    );
+    expect(window.location.hash).toBe("");
+    expect(
+      calls.some(
+        (c) =>
+          c.method === "POST" && c.url.includes("/api/groups/remove-member"),
       ),
     ).toBe(true);
   });

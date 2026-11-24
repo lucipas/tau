@@ -152,7 +152,14 @@ export interface UseTauResult {
   error: string | null;
   /** Typing indicators keyed by peer hash or `group:<id>`. */
   typing: Record<string, TypingState>;
-  refresh: () => Promise<void>;
+  /**
+   * Reload the snapshot. Resolves with the fresh snapshot, or null
+   * when the fetch failed (the error is also on `error`) — callers
+   * that must act on the fresh state, like following a successor
+   * group id, check the return instead of assuming the refresh
+   * landed.
+   */
+  refresh: () => Promise<Snapshot | null>;
 }
 
 export function useTau(): UseTauResult {
@@ -196,13 +203,15 @@ export function useTau(): UseTauResult {
     }
   }, []);
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (): Promise<Snapshot | null> => {
     try {
       const snap = await getStatus();
       setSnapshot(snap);
       setError(null);
+      return snap;
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+      return null;
     }
   }, []);
 

@@ -192,9 +192,22 @@ export default function PeerPanel({ conversation }: { conversation: Conversation
         : await removeGroupMembers(groupId, members);
       setConfirmRemove(null);
       setAddPeer("");
-      await tau.refresh();
+      // The refresh resolves even when the snapshot fetch fails, so
+      // only follow the successor once it is actually in the fresh
+      // snapshot: otherwise the open thread points at a group the
+      // console cannot display yet. Staying put keeps the old thread
+      // visible until the next refresh lands.
+      const snap = await tau.refresh();
+      const successorVisible =
+        snap?.groups.some((g) => g.id === result.group.id) ?? false;
       if (result.group.id !== groupId && window.location.hash === startedAt) {
-        navigate(section, { group: result.group.id });
+        if (successorVisible) {
+          navigate(section, { group: result.group.id });
+        } else {
+          setError(
+            "Members updated, but the new group couldn't be loaded yet — it will appear when the connection recovers.",
+          );
+        }
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
