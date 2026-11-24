@@ -5534,26 +5534,31 @@ def test_verify_latest_auto_backup_retries_after_prune(tmp_path, monkeypatch):
     import tau.webapi as webapi
 
     bridge, data_dir, first = _start_auto_backup_bridge(tmp_path)
+    set_node_setting(data_dir, "backup_keep", 1)
+    scheduler = AutoBackupScheduler(TauConfig.resolve(data_dir=data_dir))
+    real_verify = webapi.verify_backup
+    calls: list = []
+    created: list = []
+
+    def _pruning_verify(source, *, passphrase=None):
+        calls.append(Path(source).name)
+        if len(calls) == 1:
+            # Scheduled run creates a newer archive and, with retention 1,
+            # prunes the archive verification just selected.
+            second = scheduler.run(now=1764028800.0 + 7200)
+            assert second is not None and second != first
+            created.append(second)
+        return real_verify(Path(source), passphrase=passphrase)
+
     try:
-        scheduler = AutoBackupScheduler(TauConfig.resolve(data_dir=data_dir))
-        second = scheduler.run(now=1764028800.0 + 3600)
-        assert second is not None and second != first
-        real_verify = webapi.verify_backup
-        calls: list = []
-
-        def _pruning_verify(source, *, passphrase=None):
-            calls.append(Path(source).name)
-            if len(calls) == 1:
-                Path(source).unlink()
-            return real_verify(Path(source), passphrase=passphrase)
-
         monkeypatch.setattr(webapi, "verify_backup", _pruning_verify)
         result = bridge.verify_latest_auto_backup()
     finally:
         bridge.stop()
-    assert result["backup"] == first.name
+    assert not first.exists()
+    assert result["backup"] == second.name
     assert result["valid"] is True
-    assert calls == [second.name, first.name]
+    assert calls == [first.name, second.name]
 
 
 def test_verify_latest_auto_backup_rejects_corrupt_archive(tmp_path):
