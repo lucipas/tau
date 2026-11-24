@@ -206,6 +206,9 @@ export default function ChatSection() {
     if (!selected) return;
     setReplyTo(null);
     setEditing(null);
+    // An ignored group keeps its read cursor frozen so its unread posts
+    // come back when it is un-ignored.
+    if (selected.ignored) return;
     const target = selected.kind === "group" ? { group: selected.key } : { peer: selected.key };
     void actions
       .markRead(target)
