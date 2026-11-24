@@ -5383,6 +5383,22 @@ def test_devices_pair_mints_a_verifiable_bundle(tmp_path, capsys):
         bridge.stop()
 
 
+def test_devices_bundle_download_missing_file_is_a_clean_404(tmp_path, capsys):
+    # A concurrent download (or bridge shutdown) can delete the staged
+    # file between the token lookup and the open: the route must report
+    # the bundle as gone, not as a 500.
+    _, bridge = _devices_bridge(tmp_path, capsys)
+    try:
+        _, _, minted = _json(bridge, "/api/devices/pair", method="POST", body={})
+        staged, _name = bridge.device_bundle(minted["token"])
+        staged.unlink()
+        status, _, payload = _json(bridge, minted["download"])
+        assert status == 404
+        assert "no longer available" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
 def test_devices_pair_without_history_carries_no_snapshot(tmp_path, capsys):
     _, bridge = _devices_bridge(tmp_path, capsys)
     try:

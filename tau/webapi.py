@@ -13956,6 +13956,25 @@ class _WebHandler(BaseHTTPRequestHandler):
                     self._send_file(
                         staged, filename, head_only, content_type="application/json"
                     )
+                except OSError:
+                    # The open happens before any header is committed,
+                    # so this can only mean the staged file is gone —
+                    # a concurrent download already consumed it, or
+                    # bridge shutdown deleted it. Report it as gone,
+                    # not as a server error.
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": (
+                                    "pairing bundle is no longer available; "
+                                    "mint a new one"
+                                )
+                            }
+                        },
+                        head_only,
+                        404,
+                    )
+                    return
                 finally:
                     # The staged file is the only copy of the bundle:
                     # delete it after the download attempt, so a bundle
