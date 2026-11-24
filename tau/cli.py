@@ -25215,10 +25215,8 @@ def cmd_config(args: argparse.Namespace) -> int:
             "all" if settings["backup_keep"] == 0 else settings["backup_keep"]
         )
         print(f"  backup keep: {backup_keep_state}")
-        # Named neutrally on purpose: the value is the passphrase
-        # *file's path*, not the passphrase, and CodeQL's
-        # clear-text-logging query flags logged names containing
-        # "passphrase" regardless of what they hold.
+        # The value is the path of the passphrase file, not the
+        # passphrase itself: the passphrase content is never printed.
         backup_file_state = settings["backup_passphrase_file"] or "none"
         print(f"  backup passphrase file: {backup_file_state}")
         print("  change with: tau config accept-files on|off")

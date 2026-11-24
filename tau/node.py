@@ -5381,10 +5381,18 @@ class TauNode:
             # Wake early for the next automatic backup when its interval
             # is shorter than the mail cadence, so a short backup
             # interval is honored instead of running at mail-loop speed.
+            # Guarded like every other pass in this loop: a scheduler
+            # read failure must not kill the mail loop.
             wait_for = _MAIL_INTERVAL
-            due_in = self._auto_backup_scheduler.next_due_in()
-            if due_in is not None:
-                wait_for = min(_MAIL_INTERVAL, due_in)
+            try:
+                due_in = self._auto_backup_scheduler.next_due_in()
+            except Exception:  # pragma: no cover - defensive
+                log.debug(
+                    "Automatic backup deadline check failed", exc_info=True
+                )
+            else:
+                if due_in is not None:
+                    wait_for = min(_MAIL_INTERVAL, due_in)
             if self._stop_event.wait(wait_for):
                 break
 
