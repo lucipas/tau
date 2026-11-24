@@ -1262,7 +1262,7 @@ def _rebase_inbox(staged: Path, destinations: Dict[str, Path], files: List[str])
         atomic_write_json(staged, raw, mode=0o600)
 
 
-def _verify_identity(path: Path) -> None:
+def _verify_identity(path: Path) -> Any:
     # Imported here: identity validation is the one step that needs RNS,
     # and the archive logic above must stay importable without it.
     from .identity import load_identity
@@ -1275,6 +1275,7 @@ def _verify_identity(path: Path) -> None:
         ) from exc
     if identity is None:  # pragma: no cover - the staged file always exists
         raise BackupError("not a valid tau backup: identity is unreadable")
+    return identity
 
 
 def _install(staged: Dict[Path, Path], removals: List[Path]) -> None:
@@ -1310,6 +1311,100 @@ def _install(staged: Dict[Path, Path], removals: List[Path]) -> None:
         raise
     for _, aside in set_aside:
         _unlink_quietly(aside)
+
+
+def verify_backup(
+    source: Path,
+    *,
+    passphrase: Optional[str] = None,
+) -> Tuple[Dict[str, object], List[str]]:
+    """Check the backup at *source* would restore, without restoring it.
+
+    Runs every check :func:`restore_backup` runs before installing
+    anything — the manifest, the member list, staging (which reads
+    every member's bytes out of the archive), the scheduled-files hash
+    check, and the identity load — against a private temp directory
+    that is deleted afterwards, so nothing live is touched and no data
+    directory is needed.  An encrypted backup is decrypted into a
+    private scratch file first, exactly like restore; *passphrase* is
+    required for one and ignored for a plaintext backup.
+
+    Returns ``(manifest, files, destination)``: the archive manifest,
+    the member names, and the destination hash the staged identity
+    belongs to.  Raises :class:`BackupError` naming the first failed
+    check, so an archive this passes is an archive restore accepts.
+    """
+    source = Path(source).expanduser()
+    if not source.is_file():
+        raise BackupError(f"no backup at {source}")
+
+    # The decrypted plaintext lives in a private scratch directory for
+    # exactly as long as the archive is open; a failed or interrupted
+    # verification removes it with the directory.
+    dec_scratch = None
+    stage_scratch = None
+    try:
+        if is_encrypted_backup(source):
+            if passphrase is None:
+                raise BackupError(
+                    "this backup is encrypted; pass its passphrase with "
+                    "--passphrase or --passphrase-file"
+                )
+            try:
+                size = source.stat().st_size
+            except OSError as exc:
+                raise BackupError(f"not a valid tau backup: {exc}") from exc
+            if size > _MAX_ENCRYPTED_BYTES:
+                raise BackupError(
+                    "not a valid tau backup: encrypted backup is too large"
+                )
+            dec_scratch = tempfile.TemporaryDirectory(prefix="tau-backup-")
+            plain_path = Path(dec_scratch.name) / "backup.tar.gz"
+            try:
+                _decrypt_backup_file(source, plain_path, passphrase)
+            except BackupError:
+                raise
+            except OSError as exc:
+                raise BackupError(f"not a valid tau backup: {exc}") from exc
+            try:
+                archive = tarfile.open(plain_path, mode="r:gz")
+            except (tarfile.TarError, OSError) as exc:
+                raise BackupError(f"not a valid tau backup: {exc}") from exc
+        else:
+            try:
+                archive = tarfile.open(source, mode="r:gz")
+            except (tarfile.TarError, OSError) as exc:
+                raise BackupError(f"not a valid tau backup: {exc}") from exc
+        with archive:
+            try:
+                manifest = _read_manifest(archive)
+                files = _check_members(archive, manifest)
+            except _READ_ERRORS as exc:
+                raise BackupError(f"not a valid tau backup: {exc}") from exc
+            # Stage into a private temp directory, not a data directory:
+            # _stage writes each member beside its destination, so every
+            # member gets a temp path of its own and nothing live is
+            # touched — but every member's bytes are still read in full,
+            # so a truncated or damaged member fails here, not at restore.
+            stage_scratch = tempfile.TemporaryDirectory(prefix="tau-verify-")
+            stage_root = Path(stage_scratch.name)
+            destinations = {name: stage_root / name for name in files}
+            staged: Dict[Path, Path] = {}
+            try:
+                _stage(archive, files, destinations, staged)
+                _verify_scheduled_files(staged, destinations, files)
+                identity = _verify_identity(staged[destinations["identity"]])
+            finally:
+                for temp in staged.values():
+                    _unlink_quietly(temp)
+        from .identity import destination_hash
+
+        return manifest, files, destination_hash(identity).hex()
+    finally:
+        if stage_scratch is not None:
+            stage_scratch.cleanup()
+        if dec_scratch is not None:
+            dec_scratch.cleanup()
 
 
 def restore_backup(

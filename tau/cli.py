@@ -46,7 +46,7 @@ from .away import (
     load_away,
     save_away,
 )
-from .backup import create_backup, is_encrypted_backup, restore_backup
+from .backup import create_backup, is_encrypted_backup, restore_backup, verify_backup
 from .backup import BackupError as _BackupError
 from .backup import _clean_passphrase as _validate_backup_passphrase
 from .backup import _is_within as _path_is_within
@@ -1901,6 +1901,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="read the passphrase of an encrypted backup from FILE",
     )
     restore.set_defaults(func=cmd_restore)
+
+    backup_verify = subparsers.add_parser(
+        "backup-verify",
+        parents=[common],
+        help="check a backup archive would restore, without restoring it",
+    )
+    backup_verify.add_argument(
+        "file",
+        type=Path,
+        metavar="FILE",
+        help="backup archive to check",
+    )
+    backup_verify_passphrase = backup_verify.add_mutually_exclusive_group()
+    backup_verify_passphrase.add_argument(
+        "--passphrase",
+        action="store_true",
+        help="prompt for the passphrase of an encrypted backup",
+    )
+    backup_verify_passphrase.add_argument(
+        "--passphrase-file",
+        type=Path,
+        metavar="FILE",
+        help="read the passphrase of an encrypted backup from FILE",
+    )
+    backup_verify.set_defaults(func=cmd_backup_verify)
 
     outbox = subparsers.add_parser(
         "outbox",
@@ -15973,6 +15998,36 @@ def cmd_restore(args: argparse.Namespace) -> int:
         print(f"destination: {payload['destination']}")
         print(f"data dir:    {payload['data_dir']}")
         print(f"files:       {len(payload['files'])}")
+    return _EXIT_OK
+
+
+def cmd_backup_verify(args: argparse.Namespace) -> int:
+    passphrase = None
+    if is_encrypted_backup(args.file):
+        passphrase = _resolve_backup_passphrase(args, confirm=False)
+        if passphrase is None:
+            # No flag given: prompt on the terminal rather than failing
+            # outright — the file is known to be encrypted at this point.
+            passphrase = _prompt_backup_passphrase(confirm=False)
+    manifest, files, destination = verify_backup(args.file, passphrase=passphrase)
+    payload = {
+        "backup": str(args.file),
+        "node": manifest.get("node"),
+        "destination": destination,
+        "files": files,
+        "encrypted": is_encrypted_backup(args.file),
+        "valid": True,
+    }
+    if _json_mode(args):
+        _emit(payload, True)
+    else:
+        print(f"backup:      {payload['backup']}")
+        print(f"node:        {payload['node']}")
+        print(f"destination: {payload['destination']}")
+        print(f"files:       {len(payload['files'])}")
+        if payload["encrypted"]:
+            print("encrypted:   yes")
+        print("valid:       yes — this backup would restore")
     return _EXIT_OK
 
 
