@@ -5535,6 +5535,7 @@ class TauNode:
                 "Automatic backup worker failed to start; "
                 "retrying in %d seconds",
                 int(START_FAILURE_RETRY_DELAY),
+                exc_info=True,
             )
 
     def _fire_due_reminders(self) -> None:
