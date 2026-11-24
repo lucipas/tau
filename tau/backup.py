@@ -30,6 +30,17 @@ must declare format 1, every member must be an allowlisted regular file
 with no ``..`` segments, the archive must contain an identity, and
 expanded sizes are bounded while streaming.
 
+An encrypted backup (format 2, ``tau backup --passphrase``) wraps the
+same gzipped tar in an envelope: a magic line, one JSON header line
+(scrypt parameters, salt, IV, HMAC), then AES-256-CBC ciphertext with
+PKCS#7 padding.  The key is derived with scrypt and split into an
+encryption key and a MAC key; the HMAC covers IV + ciphertext, so a
+wrong passphrase and a tampered archive both fail before anything is
+decrypted.  The cipher comes from RNS's bundled cryptography (a lazy
+import, so this module still imports without Reticulum); the KDF, MAC,
+and padding are stdlib.  Restore auto-detects the envelope, so a
+plaintext backup (format 1) restores exactly as before.
+
 This module must stay importable without Reticulum: only the identity
 check during restore imports :mod:`tau.identity`.
 """
@@ -37,6 +48,7 @@ check during restore imports :mod:`tau.identity`.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import io
 import json
 import logging
@@ -47,7 +59,7 @@ import tempfile
 import zlib
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 log = logging.getLogger(__name__)
 
@@ -127,6 +139,199 @@ MAX_MANIFEST_BYTES = 1024 * 1024
 MAX_MEMBER_BYTES = 4 * 1024**3
 MAX_TOTAL_BYTES = 8 * 1024**3
 _COPY_CHUNK = 1024 * 1024
+
+# -- encrypted backups (format 2) -------------------------------------------
+# Envelope layout: magic line, one JSON header line, raw ciphertext.
+# ``{"kdf": "scrypt", "n": ..., "r": ..., "p": ..., "salt": "<hex>",
+# "iv": "<hex>", "hmac": "<hex>"}`` — the HMAC is over IV + ciphertext,
+# so the header's own fields are authenticated only through the salt/IV
+# they carry; a header naming absurd scrypt parameters is rejected
+# before any key derivation, so a hostile file cannot force a huge KDF.
+ENCRYPTED_BACKUP_MAGIC = b"TAU-BACKUP-2\n"
+ENCRYPTED_BACKUP_FORMAT_VERSION = 2
+_BACKUP_KDF_N = 32768
+_BACKUP_KDF_R = 8
+_BACKUP_KDF_P = 1
+_BACKUP_KDF_MAX_N = 2**20
+_BACKUP_KDF_MAX_R = 64
+_BACKUP_KDF_MAX_P = 64
+_BACKUP_SALT_BYTES = 16
+_BACKUP_IV_BYTES = 16
+_BACKUP_KEY_BYTES = 32
+MIN_BACKUP_PASSPHRASE_LENGTH = 8
+# A gzipped tar that expands to MAX_TOTAL_BYTES is at most that large
+# plus gzip overhead, so an encrypted file past this size can never
+# restore — refuse it before holding the whole plaintext in memory.
+_MAX_ENCRYPTED_BYTES = MAX_TOTAL_BYTES + 64 * 1024 * 1024
+
+
+def _clean_passphrase(passphrase: object) -> str:
+    """Validate a backup passphrase: a string of at least 8 characters.
+
+    The passphrase is never stripped: leading or trailing spaces are
+    part of it, so a prompt and a file holding the same characters
+    agree exactly.
+    """
+    if not isinstance(passphrase, str) or not passphrase:
+        raise BackupError("backup passphrase must not be empty")
+    if len(passphrase) < MIN_BACKUP_PASSPHRASE_LENGTH:
+        raise BackupError(
+            "backup passphrase must be at least "
+            f"{MIN_BACKUP_PASSPHRASE_LENGTH} characters"
+        )
+    return passphrase
+
+
+def _derive_backup_keys(passphrase: str, salt: bytes) -> Tuple[bytes, bytes]:
+    """Split a 64-byte scrypt output into encryption and MAC keys."""
+    derived = hashlib.scrypt(
+        passphrase.encode("utf-8"),
+        salt=salt,
+        n=_BACKUP_KDF_N,
+        r=_BACKUP_KDF_R,
+        p=_BACKUP_KDF_P,
+        dklen=2 * _BACKUP_KEY_BYTES,
+        # n=32768, r=8 needs 32 MiB; OpenSSL's default cap is exactly
+        # 32 MiB, so name the 64 MiB budget explicitly instead of
+        # relying on the default.
+        maxmem=64 * 1024 * 1024,
+    )
+    return derived[:_BACKUP_KEY_BYTES], derived[_BACKUP_KEY_BYTES:]
+
+
+def _pkcs7_pad(data: bytes) -> bytes:
+    pad = 16 - len(data) % 16
+    return data + bytes([pad]) * pad
+
+
+def _pkcs7_unpad(data: bytes) -> bytes:
+    if not data or len(data) % 16:
+        raise BackupError("wrong passphrase or the backup is corrupt")
+    pad = data[-1]
+    if pad < 1 or pad > 16 or data[-pad:] != bytes([pad]) * pad:
+        raise BackupError("wrong passphrase or the backup is corrupt")
+    return data[:-pad]
+
+
+def _backup_cipher(key: bytes, iv: bytes):
+    """AES-256-CBC cipher from RNS's bundled cryptography (lazy import)."""
+    from RNS.Cryptography.AES import Cipher, algorithms, modes
+
+    return Cipher(algorithms.AES(key), modes.CBC(iv))
+
+
+def encrypt_backup_archive(plaintext: bytes, passphrase: str) -> bytes:
+    """Wrap a gzipped-tar *plaintext* in the encrypted-backup envelope."""
+    passphrase = _clean_passphrase(passphrase)
+    salt = os.urandom(_BACKUP_SALT_BYTES)
+    iv = os.urandom(_BACKUP_IV_BYTES)
+    enc_key, mac_key = _derive_backup_keys(passphrase, salt)
+    encryptor = _backup_cipher(enc_key, iv).encryptor()
+    ciphertext = encryptor.update(_pkcs7_pad(plaintext)) + encryptor.finalize()
+    tag = hmac.new(mac_key, iv + ciphertext, hashlib.sha256).hexdigest()
+    header = json.dumps(
+        {
+            "format": ENCRYPTED_BACKUP_FORMAT_VERSION,
+            "kdf": "scrypt",
+            "n": _BACKUP_KDF_N,
+            "r": _BACKUP_KDF_R,
+            "p": _BACKUP_KDF_P,
+            "salt": salt.hex(),
+            "iv": iv.hex(),
+            "hmac": tag,
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+    return ENCRYPTED_BACKUP_MAGIC + header + b"\n" + ciphertext
+
+
+def decrypt_backup_archive(data: bytes, passphrase: str) -> bytes:
+    """Unwrap an encrypted-backup envelope; raises :class:`BackupError`.
+
+    A wrong passphrase and a tampered archive fail alike, and both fail
+    before any plaintext is returned — the HMAC is verified before the
+    ciphertext is decrypted.
+    """
+    passphrase = _clean_passphrase(passphrase)
+    if not data.startswith(ENCRYPTED_BACKUP_MAGIC):
+        raise BackupError("not an encrypted tau backup")
+    rest = data[len(ENCRYPTED_BACKUP_MAGIC):]
+    try:
+        header_raw, ciphertext = rest.split(b"\n", 1)
+        header = json.loads(header_raw)
+    except ValueError as exc:
+        raise BackupError("not a valid encrypted tau backup") from exc
+    if not isinstance(header, dict):
+        raise BackupError("not a valid encrypted tau backup")
+    if header.get("format") != ENCRYPTED_BACKUP_FORMAT_VERSION:
+        raise BackupError(
+            "unsupported encrypted backup format "
+            f"{header.get('format')!r} (expected {ENCRYPTED_BACKUP_FORMAT_VERSION})"
+        )
+    if header.get("kdf") != "scrypt":
+        raise BackupError(
+            f"unsupported backup key derivation {header.get('kdf')!r}"
+        )
+    try:
+        n = int(header["n"])
+        r = int(header["r"])
+        p = int(header["p"])
+        salt = bytes.fromhex(str(header["salt"]))
+        iv = bytes.fromhex(str(header["iv"]))
+        tag = bytes.fromhex(str(header["hmac"]))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise BackupError("not a valid encrypted tau backup") from exc
+    if (
+        n < 1
+        or n > _BACKUP_KDF_MAX_N
+        or r < 1
+        or r > _BACKUP_KDF_MAX_R
+        or p < 1
+        or p > _BACKUP_KDF_MAX_P
+        or len(salt) != _BACKUP_SALT_BYTES
+        or len(iv) != _BACKUP_IV_BYTES
+        or len(tag) != hashlib.sha256().digest_size
+    ):
+        raise BackupError("not a valid encrypted tau backup")
+    try:
+        derived = hashlib.scrypt(
+            passphrase.encode("utf-8"),
+            salt=salt,
+            n=n,
+            r=r,
+            p=p,
+            dklen=2 * _BACKUP_KEY_BYTES,
+            # Same 64 MiB budget as _derive_backup_keys; the header's n/r/p
+            # are bounded above, so a hostile file cannot force a huge KDF.
+            maxmem=64 * 1024 * 1024,
+        )
+    except ValueError as exc:
+        # A header whose parameters need more than the 64 MiB budget.
+        raise BackupError("not a valid encrypted tau backup") from exc
+    enc_key, mac_key = (
+        derived[:_BACKUP_KEY_BYTES],
+        derived[_BACKUP_KEY_BYTES:],
+    )
+    expected = hmac.new(mac_key, iv + ciphertext, hashlib.sha256).digest()
+    if not hmac.compare_digest(expected, tag):
+        raise BackupError("wrong passphrase or the backup is corrupt")
+    decryptor = _backup_cipher(enc_key, iv).decryptor()
+    try:
+        padded = decryptor.update(ciphertext) + decryptor.finalize()
+    except ValueError as exc:
+        raise BackupError("wrong passphrase or the backup is corrupt") from exc
+    return _pkcs7_unpad(padded)
+
+
+def is_encrypted_backup(path: Path) -> bool:
+    """True when *path* starts with the encrypted-backup magic line."""
+    try:
+        with open(path, "rb") as handle:
+            return handle.read(len(ENCRYPTED_BACKUP_MAGIC)) == (
+                ENCRYPTED_BACKUP_MAGIC
+            )
+    except OSError:
+        return False
 
 # Exceptions raised by tarfile/gzip/zlib while reading a damaged archive.
 _READ_ERRORS = (tarfile.TarError, EOFError, zlib.error, OSError)
@@ -346,7 +551,12 @@ def _snapshot_sqlite(source: Path, dest: Path) -> Path:
 
 
 def create_backup(
-    config: TauConfig, target: Path, *, force: bool = False, live: bool = False
+    config: TauConfig,
+    target: Path,
+    *,
+    force: bool = False,
+    live: bool = False,
+    passphrase: Optional[str] = None,
 ) -> Tuple[Path, Dict[str, object]]:
     """Write a backup of *config*'s data directory to *target*.
 
@@ -362,6 +572,13 @@ def create_backup(
     database is captured through SQLite's backup API.  Any other
     caller must leave it off, so a node that starts mid-backup cannot
     mutate the mailbox or the Tan database under the archive.
+
+    Pass ``passphrase`` to wrap the archive in the encrypted-backup
+    envelope (format 2) instead of writing the plaintext tar: the
+    archive is written to the same temp file first, then read back and
+    replaced by the envelope, so the rename onto *target* is still
+    atomic and a failed encryption leaves no partial archive behind.
+    The plaintext tar is held in memory once for the encryption pass.
     """
     target = Path(target).expanduser()
     if target.is_dir():
@@ -521,6 +738,17 @@ def create_backup(
                                     archive.addfile(info, handle_in)
                     handle.flush()
                     os.fsync(handle.fileno())
+                if passphrase is not None:
+                    # Validate before touching the finished archive, so
+                    # a short passphrase fails without rewriting it.
+                    _clean_passphrase(passphrase)
+                    with open(tmp_name, "rb") as handle:
+                        plaintext = handle.read()
+                    envelope = encrypt_backup_archive(plaintext, passphrase)
+                    with open(tmp_name, "wb") as handle:
+                        handle.write(envelope)
+                        handle.flush()
+                        os.fsync(handle.fileno())
                 os.chmod(tmp_name, 0o600)
                 os.replace(tmp_name, target)
             except BaseException:
@@ -860,7 +1088,11 @@ def _install(staged: Dict[Path, Path], removals: List[Path]) -> None:
 
 
 def restore_backup(
-    config: TauConfig, source: Path, *, force: bool = False
+    config: TauConfig,
+    source: Path,
+    *,
+    force: bool = False,
+    passphrase: Optional[str] = None,
 ) -> Tuple[Dict[str, object], List[str]]:
     """Restore the backup at *source* into *config*'s data directory.
 
@@ -872,6 +1104,10 @@ def restore_backup(
     replaced.  With ``--force``, node state absent from the archive
     (including SQLite sidecars) is removed, so the result reflects only
     the backup.
+
+    An encrypted backup (format 2) is detected by its magic line and
+    decrypted in memory before the tar is opened; *passphrase* is
+    required for one and ignored for a plaintext backup.
     """
     # Identity locking is the only RNS-dependent helper the restore needs.
     from .identity import _identity_lock
@@ -880,10 +1116,34 @@ def restore_backup(
     if not source.is_file():
         raise BackupError(f"no backup at {source}")
 
-    try:
-        archive = tarfile.open(source, mode="r:gz")
-    except (tarfile.TarError, OSError) as exc:
-        raise BackupError(f"not a valid tau backup: {exc}") from exc
+    if is_encrypted_backup(source):
+        if passphrase is None:
+            raise BackupError(
+                "this backup is encrypted; pass its passphrase with "
+                "--passphrase or --passphrase-file"
+            )
+        try:
+            size = source.stat().st_size
+        except OSError as exc:
+            raise BackupError(f"not a valid tau backup: {exc}") from exc
+        if size > _MAX_ENCRYPTED_BYTES:
+            raise BackupError("not a valid tau backup: encrypted backup is too large")
+        try:
+            with open(source, "rb") as handle:
+                plaintext = decrypt_backup_archive(handle.read(), passphrase)
+        except BackupError:
+            raise
+        except OSError as exc:
+            raise BackupError(f"not a valid tau backup: {exc}") from exc
+        try:
+            archive = tarfile.open(fileobj=io.BytesIO(plaintext), mode="r:gz")
+        except (tarfile.TarError, OSError) as exc:
+            raise BackupError(f"not a valid tau backup: {exc}") from exc
+    else:
+        try:
+            archive = tarfile.open(source, mode="r:gz")
+        except (tarfile.TarError, OSError) as exc:
+            raise BackupError(f"not a valid tau backup: {exc}") from exc
     with archive:
         try:
             manifest = _read_manifest(archive)

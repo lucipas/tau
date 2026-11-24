@@ -14,7 +14,17 @@ import threading
 import pytest
 
 from tau import cli
-from tau.backup import BACKUP_FILES, MANIFEST_NAME, create_backup, restore_backup
+from tau.backup import (
+    BACKUP_FILES,
+    ENCRYPTED_BACKUP_MAGIC,
+    MANIFEST_NAME,
+    create_backup,
+    decrypt_backup_archive,
+    encrypt_backup_archive,
+    is_encrypted_backup,
+    restore_backup,
+)
+from tau.instance_lock import BackupError
 from tau.channels import (
     create_message,
     init_db as init_channel_db,
@@ -1319,3 +1329,215 @@ def test_backup_skips_orphan_staged_bytes_and_restores(tmp_path, capsys):
     staged = config_b.scheduled_files_dir / queue.files[0].id / "notes.txt"
     assert staged.read_bytes() == b"hello mesh"
     assert not (config_b.scheduled_files_dir / ("e" * 16)).exists()
+
+
+# -- encrypted backups (format 2, #748) -------------------------------------
+
+PASSPHRASE = "correct horse battery staple"
+
+
+def test_encrypt_decrypt_backup_archive_round_trip():
+    plaintext = b"fake gzipped tar bytes" * 100
+    envelope = encrypt_backup_archive(plaintext, PASSPHRASE)
+    assert envelope != plaintext
+    assert envelope.startswith(ENCRYPTED_BACKUP_MAGIC)
+    assert decrypt_backup_archive(envelope, PASSPHRASE) == plaintext
+
+
+def test_decrypt_backup_archive_rejects_wrong_passphrase():
+    envelope = encrypt_backup_archive(b"secret", PASSPHRASE)
+    with pytest.raises(BackupError, match="wrong passphrase"):
+        decrypt_backup_archive(envelope, "wrong passphrase here")
+
+
+def test_decrypt_backup_archive_rejects_tampered_ciphertext():
+    envelope = encrypt_backup_archive(b"secret", PASSPHRASE)
+    tampered = bytearray(envelope)
+    tampered[-1] ^= 0x01
+    with pytest.raises(BackupError, match="wrong passphrase"):
+        decrypt_backup_archive(bytes(tampered), PASSPHRASE)
+
+
+def test_decrypt_backup_archive_rejects_tampered_header():
+    envelope = encrypt_backup_archive(b"secret", PASSPHRASE)
+    header_end = envelope.index(b"\n", len(ENCRYPTED_BACKUP_MAGIC))
+    header = json.loads(envelope[len(ENCRYPTED_BACKUP_MAGIC):header_end])
+    # A different salt derives different keys, so the HMAC no longer matches.
+    header["salt"] = "00" * 16
+    rebuilt = (
+        ENCRYPTED_BACKUP_MAGIC
+        + json.dumps(header, sort_keys=True).encode("utf-8")
+        + b"\n"
+        + envelope[header_end + 1:]
+    )
+    with pytest.raises(BackupError, match="wrong passphrase"):
+        decrypt_backup_archive(rebuilt, PASSPHRASE)
+
+
+def test_decrypt_backup_archive_rejects_bad_envelope():
+    with pytest.raises(BackupError, match="not an encrypted tau backup"):
+        decrypt_backup_archive(b"just a gzipped tar, probably", PASSPHRASE)
+    with pytest.raises(BackupError, match="not a valid encrypted tau backup"):
+        decrypt_backup_archive(ENCRYPTED_BACKUP_MAGIC + b"not json\nxxx", PASSPHRASE)
+
+
+def test_encrypt_backup_archive_rejects_short_passphrase():
+    with pytest.raises(BackupError, match="at least 8"):
+        encrypt_backup_archive(b"x", "short")
+
+
+def test_is_encrypted_backup(tmp_path):
+    plain = tmp_path / "plain.tar.gz"
+    plain.write_bytes(b"not an envelope")
+    assert not is_encrypted_backup(plain)
+    assert not is_encrypted_backup(tmp_path / "missing.tar.gz")
+    encrypted = tmp_path / "enc.tar.gz"
+    encrypted.write_bytes(encrypt_backup_archive(b"secret", PASSPHRASE))
+    assert is_encrypted_backup(encrypted)
+
+
+def _encrypted_round_trip_setup(tmp_path, capsys):
+    """Seeded node A, its destination, and its file contents."""
+    node_a = _init_node(tmp_path, "a", "alice")
+    received = _seed_state(node_a)
+    capsys.readouterr()
+    destination_a = _id_destination(node_a, capsys)
+    contents_before = {
+        name: (node_a / name).read_bytes()
+        for name in BACKUP_FILES
+        if (node_a / name).is_file()
+    }
+    contents_before.update(received)
+    return node_a, destination_a, contents_before
+
+
+def _assert_restored(node_a, node_b, destination_a, contents_before, capsys):
+    assert _id_destination(node_b, capsys) == destination_a
+    for name, data in contents_before.items():
+        if name in ("tan.sqlite3", "channels.sqlite3"):
+            assert _sqlite_dump(node_b / name) == _sqlite_dump(node_a / name)
+        else:
+            assert (node_b / name).read_bytes() == data
+
+
+def test_encrypted_backup_restore_round_trip(tmp_path, capsys):
+    node_a, destination_a, contents_before = _encrypted_round_trip_setup(
+        tmp_path, capsys
+    )
+    pw_file = tmp_path / "pw.txt"
+    pw_file.write_text(PASSPHRASE + "\n", encoding="utf-8")
+    archive = tmp_path / "alice.tar.gz"
+    assert (
+        cli.main(
+            [
+                "backup",
+                str(archive),
+                "--data-dir",
+                str(node_a),
+                "--passphrase-file",
+                str(pw_file),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["encrypted"] is True
+    assert payload["destination"] == destination_a
+    assert is_encrypted_backup(archive)
+    assert stat.S_IMODE(os.stat(archive).st_mode) == 0o600
+    # The identity and the node name are inside the envelope, never in
+    # the clear: the archive file holds no readable trace of either.
+    raw = archive.read_bytes()
+    assert b"alice" not in raw
+    assert (node_a / "identity").read_bytes() not in raw
+
+    node_b = tmp_path / "b"
+    assert (
+        cli.main(
+            [
+                "restore",
+                str(archive),
+                "--data-dir",
+                str(node_b),
+                "--passphrase-file",
+                str(pw_file),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["destination"] == destination_a
+    _assert_restored(node_a, node_b, destination_a, contents_before, capsys)
+
+
+def test_encrypted_backup_restore_needs_the_passphrase(tmp_path, capsys):
+    node_a, destination_a, contents_before = _encrypted_round_trip_setup(
+        tmp_path, capsys
+    )
+    config_a = TauConfig.resolve(data_dir=node_a)
+    archive = tmp_path / "alice.tar.gz"
+    create_backup(config_a, archive, passphrase=PASSPHRASE)
+
+    node_b = tmp_path / "b"
+    config_b = TauConfig.resolve(data_dir=node_b)
+    with pytest.raises(BackupError, match="encrypted"):
+        restore_backup(config_b, archive)
+    with pytest.raises(BackupError, match="wrong passphrase"):
+        restore_backup(config_b, archive, passphrase="wrong passphrase here")
+    manifest, _files = restore_backup(config_b, archive, passphrase=PASSPHRASE)
+    assert manifest["node"] == "alice"
+    _assert_restored(node_a, node_b, destination_a, contents_before, capsys)
+
+
+def test_encrypted_backup_restore_via_cli_wrong_passphrase(tmp_path, capsys):
+    node_a, _destination_a, _contents = _encrypted_round_trip_setup(
+        tmp_path, capsys
+    )
+    config_a = TauConfig.resolve(data_dir=node_a)
+    archive = tmp_path / "alice.tar.gz"
+    create_backup(config_a, archive, passphrase=PASSPHRASE)
+    wrong_pw = tmp_path / "wrong.txt"
+    wrong_pw.write_text("wrong passphrase here\n", encoding="utf-8")
+    code = cli.main(
+        [
+            "restore",
+            str(archive),
+            "--data-dir",
+            str(tmp_path / "b"),
+            "--passphrase-file",
+            str(wrong_pw),
+        ]
+    )
+    assert code == 1
+    assert "wrong passphrase" in capsys.readouterr().err
+
+
+def test_create_encrypted_backup_rejects_short_passphrase(tmp_path, capsys):
+    node_a = _init_node(tmp_path, "a", "alice")
+    capsys.readouterr()
+    config_a = TauConfig.resolve(data_dir=node_a)
+    archive = tmp_path / "alice.tar.gz"
+    with pytest.raises(BackupError, match="at least 8"):
+        create_backup(config_a, archive, passphrase="short")
+    assert not archive.exists()
+
+
+def test_plaintext_backup_ignores_a_passphrase(tmp_path, capsys):
+    # A passphrase supplied for a plaintext backup is simply unused:
+    # old archives restore unchanged.
+    node_a, destination_a, contents_before = _encrypted_round_trip_setup(
+        tmp_path, capsys
+    )
+    config_a = TauConfig.resolve(data_dir=node_a)
+    archive = tmp_path / "alice.tar.gz"
+    create_backup(config_a, archive)
+    assert not is_encrypted_backup(archive)
+    node_b = tmp_path / "b"
+    config_b = TauConfig.resolve(data_dir=node_b)
+    manifest, _files = restore_backup(
+        config_b, archive, passphrase="anything at all"
+    )
+    assert manifest["node"] == "alice"
+    _assert_restored(node_a, node_b, destination_a, contents_before, capsys)
