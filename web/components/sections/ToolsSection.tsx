@@ -52,6 +52,7 @@ async function readJsonFile(file: File): Promise<unknown> {
 export default function ToolsSection() {
   const [doctor, setDoctor] = useState<DoctorReport | null>(null);
   const [backupVerify, setBackupVerify] = useState<BackupVerifyResult | null>(null);
+  const [backupVerifyError, setBackupVerifyError] = useState<string | null>(null);
   const [allowlist, setAllowlist] = useState<AllowList | null>(null);
   const [devices, setDevices] = useState<DevicesInfo | null>(null);
   const [devicesError, setDevicesError] = useState<string | null>(null);
