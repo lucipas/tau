@@ -20751,25 +20751,26 @@ def cmd_group_list(args: argparse.Namespace) -> int:
 
 def cmd_group_export(args: argparse.Namespace) -> int:
     config = _make_config(args)
+    store = GroupStore(config.groups_path)
     try:
-        store = GroupStore(config.groups_path)
         group = store.find(args.group)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     assert group is not None  # find() raises instead of returning None
-    # History spans renames: messages stored under a verified
-    # predecessor id still belong to this group, as in `tau messages`.
-    group_ids = store.lineage(group["id"])
     inbox = Inbox(config.inbox_path)
     # The same document `tau messages import` accepts, restricted to
     # this group: a group backup restores through the existing import
     # path, including its retract/edit guards.  Stored records are the
     # reader's view — edits applied in place, retracted and expired
     # messages already gone from the store — the same promise `tau
-    # messages export` makes for DMs.  A known group with no stored
-    # messages still exports, as an empty list.
-    document = inbox.export_document(group_ids=group_ids)
+    # messages export` makes for DMs.  The export spans renames: it
+    # filters on the group's verified lineage (current id plus
+    # predecessors), exactly as `tau messages --group` reads it, so a
+    # renamed group's older messages are not silently dropped.  A
+    # known group with no stored messages still exports, as an empty
+    # list.
+    document = inbox.export_document(group=store.lineage(group["id"]))
     document["group"] = group["name"]
     document["group_id"] = group["id"]
     count = len(document["messages"])

@@ -2457,30 +2457,29 @@ class Inbox:
         self,
         *,
         peer: Optional[str] = None,
-        group: Optional[str] = None,
-        group_ids: Optional[Collection[str]] = None,
+        group: Optional[Union[str, Collection[str]]] = None,
     ) -> Dict[str, Any]:
         """Return a portable backup of the stored messages.
 
         Messages are in stored (oldest-first) order so an import replays
         them in order; ``peer`` restricts the export to one sender
-        destination hash, ``group`` to one group id, and ``group_ids`` to
-        any of several group ids (a group and its rename predecessors).
-        The document is
-        the same shape :meth:`import_messages` accepts.  The snapshot is
-        read through the cross-process transaction, so messages another
-        process committed since this inbox last loaded are included instead
-        of silently omitted from the backup.
+        destination hash and ``group`` to one group id, or to several
+        (a group plus its rename predecessors, so history spans
+        renames).  The document is the same shape
+        :meth:`import_messages` accepts.  The snapshot is read through
+        the cross-process transaction, so messages another process
+        committed since this inbox last loaded are included instead of
+        silently omitted from the backup.
         """
         with self.transaction():
             entries = [dict(item) for item in self._messages]
         if peer is not None:
             entries = [item for item in entries if item.get("destination") == peer]
         if group is not None:
-            entries = [item for item in entries if item.get("group") == group]
-        if group_ids is not None:
-            wanted_groups = set(group_ids)
-            entries = [item for item in entries if item.get("group") in wanted_groups]
+            wanted = {group} if isinstance(group, str) else set(group)
+            entries = [
+                item for item in entries if str(item.get("group") or "") in wanted
+            ]
         return {
             "format": INBOX_EXPORT_FORMAT,
             "version": INBOX_EXPORT_VERSION,

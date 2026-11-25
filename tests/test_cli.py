@@ -8500,59 +8500,6 @@ def test_group_export_round_trip(tmp_path, capsys):
     assert [item["id"] for item in group_entries] == ["g-2", "g-1"]
 
 
-def test_group_export_includes_rename_predecessor_history(tmp_path, capsys):
-    from tau.groups import GroupStore, derive_group_id
-
-    data_dir = _init_node(tmp_path, "node", "alice")
-    capsys.readouterr()  # drain the --json output of `tau init`
-    own_hash = _id_destination(data_dir, capsys)
-    store = GroupStore(data_dir / "groups.json")
-    members = [own_hash, "cd" * 16]
-    old = store.create("weekend", members, created_by=own_hash)
-    config = TauConfig.resolve(data_dir=data_dir, name="alice")
-    inbox = Inbox(config.inbox_path)
-    inbox.append(
-        {
-            "from": "alice",
-            "destination": own_hash,
-            "text": "before the rename",
-            "sent_at": 10.0,
-            "received_at": 20.0,
-            "id": "g-old",
-            "kind": "group",
-            "group": old["id"],
-        }
-    )
-    new_id = derive_group_id(own_hash, "road trip", members)
-    store.record(
-        new_id,
-        "road trip",
-        members,
-        creator=own_hash,
-        sender=own_hash,
-        sent_at=100.0,
-        renamed_from=[old["id"]],
-    )
-    inbox.append(
-        {
-            "from": "alice",
-            "destination": own_hash,
-            "text": "after the rename",
-            "sent_at": 110.0,
-            "received_at": 120.0,
-            "id": "g-new",
-            "kind": "group",
-            "group": new_id,
-        }
-    )
-
-    code = cli.main(["group", "export", "--data-dir", str(data_dir), "road trip"])
-    assert code == 0
-    document = json.loads(capsys.readouterr().out)
-    assert document["group_id"] == new_id
-    assert [entry["id"] for entry in document["messages"]] == ["g-old", "g-new"]
-
-
 def test_group_export_rejects_unknown_group(tmp_path, capsys):
     data_dir = _init_node(tmp_path, "node", "alice")
     capsys.readouterr()  # drain the --json output of `tau init`
@@ -8576,6 +8523,55 @@ def test_group_export_empty_group(tmp_path, capsys):
     document = json.loads(capsys.readouterr().out)
     assert document["group"] == "weekend"
     assert document["messages"] == []
+
+
+def test_group_export_spans_rename(tmp_path, capsys):
+    # Regression test (Qodo Critical on PR #800): a renamed group's
+    # export must include messages stored under its predecessor id,
+    # the same history `tau messages --group` shows.
+    from tau.groups import GroupStore
+
+    data_dir = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()  # drain the --json output of `tau init`
+    own_hash = _id_destination(data_dir, capsys)
+    store = GroupStore(data_dir / "groups.json")
+    group = store.create("weekend", [own_hash, "cd" * 16], created_by=own_hash)
+    config = TauConfig.resolve(data_dir=data_dir, name="alice")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": own_hash,
+            "text": "before the rename",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "g-1",
+            "kind": "group",
+            "group": group["id"],
+        }
+    )
+    renamed = store.rename(group["id"], "weekend-plans", created_by=own_hash)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": own_hash,
+            "text": "after the rename",
+            "sent_at": 11.0,
+            "received_at": 21.0,
+            "id": "g-2",
+            "kind": "group",
+            "group": renamed["id"],
+        }
+    )
+
+    code = cli.main(
+        ["group", "export", "--data-dir", str(data_dir), "weekend-plans"]
+    )
+    assert code == 0
+    document = json.loads(capsys.readouterr().out)
+    assert document["group"] == "weekend-plans"
+    assert document["group_id"] == renamed["id"]
+    assert [entry["id"] for entry in document["messages"]] == ["g-1", "g-2"]
 
 
 def test_messages_import_skips_retracted_group_messages(tmp_path, capsys):
