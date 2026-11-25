@@ -25244,6 +25244,89 @@ def test_channel_schedule_poll_via_api(tmp_path):
         bridge.stop()
 
 
+def test_channel_schedule_location_via_api(tmp_path):
+    from tau.channels import init_db as init_channel_db, join_channel
+    from tau.config import TauConfig
+
+    assert cli.main(["init", "--data-dir", str(tmp_path), "--name", "tester"]) == 0
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    conn = init_channel_db(node.config.channels_db_path)
+    try:
+        join_channel(conn, "general")
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/schedule",
+            method="POST",
+            body={
+                "channel": "general",
+                "text": "meet here",
+                "send_in": 3600,
+                "location": {
+                    "lat": 34.05,
+                    "lon": -83.88,
+                    "name": "Rock Springs Park",
+                },
+            },
+        )
+        assert status == 200
+        scheduled = payload["scheduled"]
+        assert scheduled["location"] == {
+            "lat": 34.05,
+            "lon": -83.88,
+            "name": "Rock Springs Park",
+        }
+
+        # The scheduled list carries the pin.
+        status, _, payload = _json(bridge, "/api/channels/scheduled")
+        assert status == 200
+        assert payload["count"] == 1
+        assert payload["scheduled"][0]["location"] == {
+            "lat": 34.05,
+            "lon": -83.88,
+            "name": "Rock Springs Park",
+        }
+
+        # A malformed pin is a bad request, not a silently dropped pin.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/schedule",
+            method="POST",
+            body={
+                "channel": "general",
+                "text": "meet here",
+                "send_in": 60,
+                "location": {"lat": 91.0, "lon": 0.0},
+            },
+        )
+        assert status == 400
+        assert "location" in payload["error"]["message"]
+
+        # A poll cannot carry a pin.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/schedule",
+            method="POST",
+            body={
+                "channel": "general",
+                "text": "which day?",
+                "send_in": 60,
+                "poll_options": ["Saturday", "Sunday"],
+                "location": {"lat": 34.05, "lon": -83.88},
+            },
+        )
+        assert status == 400
+        assert "location" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
 def test_channel_schedule_rejects_bad_requests(tmp_path):
     from tau.channels import init_db as init_channel_db, join_channel
     from tau.config import TauConfig

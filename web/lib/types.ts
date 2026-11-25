@@ -938,6 +938,8 @@ export interface ScheduledChannelMessage {
   kind?: "message" | "poll";
   /** Fixed poll choices; only present when kind is "poll". */
   options?: string[];
+  /** Static location pin on a queued message, if any. */
+  location?: LocationPin;
   [key: string]: unknown;
 }
 

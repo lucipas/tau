@@ -10529,13 +10529,6 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    if location is not None and getattr(args, "delay", None) is not None:
-        print(
-            "error: --location cannot be combined with --delay — "
-            "scheduled channel messages cannot carry a location pin yet",
-            file=sys.stderr,
-        )
-        return 2
     if contact is not None and getattr(args, "delay", None) is not None:
         print(
             "error: --contact cannot be combined with --delay — "
@@ -10602,6 +10595,7 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
                 to=getattr(args, "to", None),
                 ttl=int(getattr(args, "ttl", MAX_GOSSIP_TTL)),
                 name=config.name,
+                location=location,
                 disappearing_path=config.disappearing_path,
             )
         except ScheduledChannelError as exc:
@@ -11415,6 +11409,14 @@ def cmd_channel_scheduled(args: argparse.Namespace) -> int:
             print(f"  to {', '.join(entry.to)}")
         for line in entry.text.splitlines() or [""]:
             print(f"  {line}")
+        pin = clean_location(entry.location)
+        if pin is not None:
+            # A queued pin prints under the text with its map link, so
+            # a scheduled location message reads in the terminal the
+            # way it renders in the console once published.
+            label = pin.get("name") or "Location"
+            print(f"  📍 {label} — {pin['lat']}, {pin['lon']}")
+            print(f"  {location_maps_url(pin)}")
         if entry.kind == "poll":
             for index, option in enumerate(entry.options, start=1):
                 print(f"    {index}. {option}")

@@ -868,6 +868,7 @@ export default function ChannelsSection() {
                             </p>
                           )}
                           <p className="text-sm whitespace-pre-wrap text-zinc-300">{s.text}</p>
+                          {s.location && <ChannelLocationLink location={s.location} />}
                           {s.kind === "poll" &&
                             (s.options ?? []).map((option, i) => (
                               <p key={i} className="text-xs text-zinc-500">

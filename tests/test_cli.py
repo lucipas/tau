@@ -941,7 +941,12 @@ def test_print_message_entry_shows_location_pin(tmp_path, capsys):
     )
     out = capsys.readouterr().out
     assert "📍 Rock Springs Park — 34.05, -83.88" in out
-    assert "openstreetmap.org" in out
+    # The map link is printed verbatim on its own line; check the whole
+    # line, not a substring of the URL.
+    assert (
+        "  https://www.openstreetmap.org/?mlat=34.05&mlon=-83.88"
+        "#map=15/34.05/-83.88" in out.splitlines()
+    )
     assert "mlat=34.05&mlon=-83.88" in out
 
 
@@ -15572,6 +15577,40 @@ def test_channel_send_delay_json_round_trip(tmp_path, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert len(payload["scheduled"]) == 1
     assert payload["scheduled"][0]["channel"] == "general"
+
+
+def test_channel_send_delay_with_location_schedules_and_lists(tmp_path, capsys):
+    _init_node(tmp_path, "node", "alice")
+    assert _run_channel(tmp_path, "join", "general") == 0
+    capsys.readouterr()
+
+    code = _run_channel(
+        tmp_path,
+        "send",
+        "general",
+        "meet here",
+        "--location",
+        "34.05,-83.88 Rock Springs Park",
+        "--delay",
+        "5m",
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "scheduled" in out
+    assert "publishes in 5m" in out
+
+    code = _run_channel(tmp_path, "scheduled")
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "#general" in out
+    assert "meet here" in out
+    assert "📍 Rock Springs Park — 34.05, -83.88" in out
+    # The map link is printed verbatim on its own line; check the whole
+    # line, not a substring of the URL.
+    assert (
+        "  https://www.openstreetmap.org/?mlat=34.05&mlon=-83.88"
+        "#map=15/34.05/-83.88" in out.splitlines()
+    )
 
 
 def test_channel_send_delay_rejects_bad_combinations(tmp_path, capsys):

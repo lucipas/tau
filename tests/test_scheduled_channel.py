@@ -319,6 +319,108 @@ def test_queue_without_kind_loads_as_message(tmp_path):
     assert entry.text == "old hello"
 
 
+PIN = {"lat": 34.05, "lon": -83.88, "name": "Rock Springs Park"}
+
+
+def test_schedule_location_round_trip(tmp_path):
+    path = tmp_path / "scheduled-channel-messages.json"
+    entry = schedule_channel_message(
+        path,
+        channel="general",
+        text="meet here",
+        publish_at=2000.0,
+        now=1000.0,
+        location=PIN,
+    )
+    queue = load_scheduled_channel_messages(path)
+    assert len(queue) == 1
+    assert queue.messages[0] == entry
+    assert entry.location == PIN
+    assert entry.to_dict()["location"] == PIN
+
+
+def test_queue_without_location_loads_with_no_pin(tmp_path):
+    # Queue files written before pins could be scheduled carry no
+    # location: they load with no pin, exactly as before — and a
+    # hand-built entry without one publishes a plain message.
+    entry = _message()
+    assert entry.location is None
+    loaded = ScheduledChannelMessage.from_dict(
+        {
+            "id": "a" * 16,
+            "channel": "general",
+            "text": "old hello",
+            "publish_at": 1000.0,
+            "created_at": 900.0,
+        }
+    )
+    assert loaded.location is None
+
+
+def test_schedule_rejects_bad_location(tmp_path):
+    path = tmp_path / "scheduled-channel-messages.json"
+    for bad in (
+        {"lat": 91.0, "lon": 0.0},
+        {"lat": 34.05, "lon": -200.0},
+        {"lat": "34.05", "lon": -83.88},
+        {"lat": 34.05, "lon": -83.88, "name": "x" * 201},
+        "34.05,-83.88",
+    ):
+        with pytest.raises(ScheduledChannelError, match="location is invalid"):
+            schedule_channel_message(
+                path,
+                channel="general",
+                text="meet here",
+                publish_at=1000.0,
+                now=900.0,
+                location=bad,
+            )
+    assert load_scheduled_channel_messages(path).messages == ()
+
+
+def test_schedule_poll_rejects_location(tmp_path):
+    path = tmp_path / "scheduled-channel-messages.json"
+    with pytest.raises(ScheduledChannelError, match="cannot carry a location"):
+        schedule_channel_message(
+            path,
+            channel="general",
+            text="which day?",
+            publish_at=1000.0,
+            now=900.0,
+            kind="poll",
+            options=["Saturday", "Sunday"],
+            location=PIN,
+        )
+    assert load_scheduled_channel_messages(path).messages == ()
+
+
+def test_schedule_location_wire_preflight(tmp_path):
+    # 1,920 emoji fit the 8 KiB envelope on their own but overflow
+    # once the pin (~90 bytes) rides along: refuse at schedule time,
+    # instead of failing every publish attempt forever.  Nothing is saved.
+    path = tmp_path / "scheduled-channel-messages.json"
+    with pytest.raises(ScheduledChannelError, match="too large"):
+        schedule_channel_message(
+            path,
+            channel="general",
+            text="😀" * 1920,
+            publish_at=1000.0,
+            now=900.0,
+            location=PIN,
+        )
+    assert load_scheduled_channel_messages(path).messages == ()
+    # And 1,900 emoji with the same pin still fit.
+    entry = schedule_channel_message(
+        path,
+        channel="general",
+        text="😀" * 1900,
+        publish_at=1000.0,
+        now=900.0,
+        location=PIN,
+    )
+    assert load_scheduled_channel_messages(path).messages[0].id == entry.id
+
+
 def test_cancel_scheduled_channel_message_end_to_end(tmp_path):
     path = tmp_path / "scheduled-channel-messages.json"
     entry = schedule_channel_message(
@@ -548,7 +650,7 @@ class _FakeChannelApp:
         self.fail_publish = fail_publish
         self.fail_with_errors = fail_with_errors
 
-    def send(self, channel, text, *, publish=False, poll_options=None):
+    def send(self, channel, text, *, publish=False, poll_options=None, location=None):
         message = {
             "hash": "c" * 64,
             "channel": channel,
@@ -557,6 +659,8 @@ class _FakeChannelApp:
         }
         if poll_options is not None:
             message["poll_options"] = list(poll_options)
+        if location is not None:
+            message["location"] = location
         self.created.append(message)
         self.stored[message["hash"]] = message
         return message
@@ -620,6 +724,54 @@ def test_publish_due_publishes_a_scheduled_poll(tmp_path):
     queue = load_scheduled_channel_messages(path)
     assert all(entry.id != poll.id for entry in queue.messages)
     assert len(queue) == 0
+
+
+def test_publish_due_attaches_location(tmp_path):
+    # The published message carries the queued pin, so it renders
+    # exactly like one sent immediately with the same pin.
+    path = tmp_path / "scheduled-channel-messages.json"
+    pinned = schedule_channel_message(
+        path,
+        channel="general",
+        text="meet here",
+        publish_at=1000.0,
+        now=900.0,
+        location=PIN,
+    )
+    app = _FakeChannelApp()
+
+    result = publish_due_scheduled_channel_messages(path, app, now=2000.0)
+    assert result == {"published": 1, "kept": 0}
+    assert len(app.created) == 1
+    assert app.created[0]["text"] == "meet here"
+    assert app.created[0]["location"] == PIN
+    assert app.published[0][0]["location"] == PIN
+    queue = load_scheduled_channel_messages(path)
+    assert all(entry.id != pinned.id for entry in queue.messages)
+    assert len(queue) == 0
+
+
+def test_edit_scheduled_message_keeps_location(tmp_path):
+    # Editing a pinned entry's text keeps its pin, and the edit
+    # preflight measures the pin: 1,910 emoji fit without one but
+    # overflow with it, so that edit is refused while a 1,900-emoji
+    # edit (which fits with the pin) goes through with the pin intact.
+    path = tmp_path / "scheduled-channel-messages.json"
+    entry = schedule_channel_message(
+        path,
+        channel="general",
+        text="meet here",
+        publish_at=5000.0,
+        now=1000.0,
+        location=PIN,
+    )
+    with pytest.raises(ScheduledChannelError, match="too large"):
+        edit_scheduled_channel_message(path, entry.id, text="😀" * 1910, now=1500.0)
+    edited = edit_scheduled_channel_message(
+        path, entry.id, text="😀" * 1900, now=1500.0
+    )
+    assert edited.location == PIN
+    assert load_scheduled_channel_messages(path).messages[0].location == PIN
 
 
 def test_publish_due_keeps_failed_messages_queued(tmp_path):
