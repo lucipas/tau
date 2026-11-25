@@ -28,6 +28,16 @@ export function formatVoiceDuration(seconds: number): string {
   return `${minutes}:${String(rest).padStart(2, "0")}`;
 }
 
+/** File extension for a recorded voice note's container: the recorder's
+    MIME type decides, so a browser that records MP4 (e.g. Safari) does
+    not send MP4 data under a .webm name. Unknown containers fall back
+    to webm, matching the preferred recording MIME type. */
+export function voiceFileExtension(mimeType: string): string {
+  if (mimeType.startsWith("audio/mp4")) return "m4a";
+  if (mimeType.startsWith("audio/ogg")) return "ogg";
+  return "webm";
+}
+
 /** True when this browser can record a voice note. */
 export function canRecordVoice(): boolean {
   return (
@@ -469,9 +479,11 @@ export default function Composer({
       // between the new chat rendering and the cleanup effect running.
       if (session.discard || session.conversationKey !== conversationKeyRef.current) return;
       const type = recorder.mimeType || "audio/webm";
-      const recorded = new File([new Blob(chunks, { type })], `voice-note-${Date.now()}.webm`, {
-        type,
-      });
+      const recorded = new File(
+        [new Blob(chunks, { type })],
+        `voice-note-${Date.now()}.${voiceFileExtension(type)}`,
+        { type },
+      );
       const problem = validateFile(recorded);
       if (problem) {
         setError(problem);
