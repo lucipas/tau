@@ -271,7 +271,16 @@ def _clean_expires_in(value: Any) -> Optional[float]:
         raise ScheduledChannelError(
             "scheduled channel message expires_in must be a number of seconds"
         )
-    seconds = float(value)
+    try:
+        seconds = float(value)
+    except OverflowError as exc:
+        # A huge JSON integer cannot convert to a float; treat it as the
+        # same invalid duration so the queue reads as unusable, not as a
+        # crash that skips every queued message.
+        raise ScheduledChannelError(
+            "scheduled channel message expires_in must be more than 0s and "
+            "at most 30d"
+        ) from exc
     if not math.isfinite(seconds) or seconds <= 0 or seconds > MAX_MAIL_TTL:
         raise ScheduledChannelError(
             "scheduled channel message expires_in must be more than 0s and "
@@ -748,6 +757,12 @@ def schedule_channel_message(
     if clean_kind == "poll" and clean_contact_value is not None:
         raise ScheduledChannelError("a scheduled poll cannot carry a contact card")
     clean_expires_in = _clean_expires_in(expires_in)
+    clean_publish_at = _clean_timestamp(publish_at, "publish_at")
+    # The publish pass stamps created_at with the send time, rounded to
+    # milliseconds, so its fractional digits can be longer than a whole
+    # publish_at.  Measure with a full three-digit fraction so the
+    # preflight never undercounts the bytes the timestamps take on the wire.
+    wire_at = math.floor(clean_publish_at) + 0.999
     envelope = {
         # Placeholder author/key at their real lengths (destination
         # hash 32 hex, RNS public key 128 hex): a shorter placeholder
@@ -765,14 +780,14 @@ def schedule_channel_message(
         "key": "0" * 128,
         "name": sanitize_name(name or "anonymous"),
         "text": clean_text,
-        "created_at": publish_at,
+        "created_at": wire_at,
         "reply_to": "",
     }
     default_expire = channel_default_for(disappearing_path, clean_channel)
     if clean_expires_in is not None:
-        envelope["expires_at"] = publish_at + clean_expires_in
+        envelope["expires_at"] = round(wire_at + clean_expires_in, 3)
     elif default_expire is not None:
-        envelope["expires_at"] = publish_at + default_expire
+        envelope["expires_at"] = round(wire_at + default_expire, 3)
     if clean_kind == "poll":
         envelope["poll_options"] = list(clean_options)
     if clean_location_value is not None:
@@ -1065,33 +1080,52 @@ def publish_due_scheduled_channel_messages(
                     targets = _resolve_publish_targets(
                         message, resolve_peer, should_stop, deadline
                     )
+                    # The send-time clock, not the pass start: target
+                    # resolution and earlier messages can use up a short
+                    # lifetime before signing.  Rounded like ChannelApp.send
+                    # rounds created_at, so the lifetime never grows past
+                    # what was asked for.
+                    sent_at = round(now if now is not None else time.time(), 3)
                     stored = (
                         app.get_message(message.message_hash)
                         if message.message_hash
                         else None
                     )
+                    expired_copy = (
+                        stored is not None
+                        and stored.get("expires_at") is not None
+                        and float(stored["expires_at"]) <= sent_at
+                    )
+                    if expired_copy:
+                        # The stored copy expired while earlier attempts
+                        # backed off; recipients would discard it, so
+                        # sign a fresh one instead of resending it.
+                        stored = None
                     if stored is None:
                         if message.message_hash is not None:
                             # The signed message was created on an
                             # earlier pass but is gone from the local
-                            # store (retention evicted it): sign a
-                            # fresh copy rather than leaving the entry
-                            # stuck forever.  Peers that received the
-                            # first copy see a second message — the
-                            # eviction window makes this rare, and a
-                            # stuck queue entry is worse than a
-                            # duplicate.
+                            # store (retention evicted it), or it expired
+                            # before it could be delivered: sign a fresh
+                            # copy rather than leaving the entry stuck
+                            # forever.  Peers that received the first
+                            # copy see a second message — the window
+                            # makes this rare, and a stuck queue entry
+                            # is worse than a duplicate.
                             log.warning(
-                                "Scheduled channel message %s lost its stored "
-                                "copy; signing a fresh one",
+                                "Scheduled channel message %s %s; signing a "
+                                "fresh one",
                                 message.id,
+                                "expired before delivery"
+                                if expired_copy
+                                else "lost its stored copy",
                             )
                         created = app.send(
                             message.channel,
                             message.text,
                             publish=False,
                             expires_at=(
-                                at + message.expires_in
+                                sent_at + message.expires_in
                                 if message.expires_in is not None
                                 else None
                             ),
