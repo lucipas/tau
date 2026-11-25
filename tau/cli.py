@@ -10810,13 +10810,27 @@ def cmd_channel_export(args: argparse.Namespace) -> int:
     try:
         # A channel the node has never seen is an error, not an empty
         # archive; a joined channel with no messages still exports.
-        has_messages = conn.execute(
-            "SELECT 1 FROM messages WHERE channel = ? LIMIT 1", (name,)
-        ).fetchone()
-        has_topic = conn.execute(
-            "SELECT 1 FROM topics WHERE channel = ?", (name,)
-        ).fetchone()
-        if not is_member and has_messages is None and has_topic is None:
+        # Any stored record counts as having seen the channel: a
+        # retraction deletes its message, so a channel whose last
+        # message was retracted leaves only the retraction behind.
+        seen = is_member
+        for table in (
+            "messages",
+            "topics",
+            "retractions",
+            "reactions",
+            "edits",
+            "pins",
+        ):
+            if seen:
+                break
+            seen = (
+                conn.execute(
+                    f"SELECT 1 FROM {table} WHERE channel = ? LIMIT 1", (name,)
+                ).fetchone()
+                is not None
+            )
+        if not seen:
             print(f"error: unknown channel: {args.channel!r}", file=sys.stderr)
             return 2
         document = export_channel_document(conn, name)

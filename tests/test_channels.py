@@ -4340,6 +4340,31 @@ def test_cli_channel_export_rejects_unknown_channel(tmp_path, capsys):
     assert "unknown channel" in err
 
 
+def test_cli_channel_export_accepts_channel_left_with_only_a_retraction(
+    identities, tmp_path, capsys
+):
+    # A retraction deletes its message, so an unjoined channel whose
+    # last message was retracted leaves only the retraction record
+    # behind — the export must still recognize the channel and produce
+    # an empty archive instead of rejecting it as unknown.
+    _, bob = identities
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    config = TauConfig.resolve(data_dir=data_dir, name="alice")
+    conn = init_db(config.channels_db_path)
+    message = create_message(conn, bob, "general", "gone", name="bob", now=1000)
+    create_retraction(conn, bob, "general", message["hash"], now=1001)
+    conn.close()
+    capsys.readouterr()
+
+    assert (
+        main(["channel", "export", "--data-dir", str(data_dir), "general"]) == 0
+    )
+    document = json.loads(capsys.readouterr().out)
+    assert document["channel"] == "general"
+    assert document["messages"] == []
+
+
 def test_export_channel_document_includes_messages_beyond_one_page(
     identities, tmp_path
 ):
