@@ -229,29 +229,76 @@ export default function ChatSection() {
   const [ignoredHistoryError, setIgnoredHistoryError] = useState(false);
   const [ignoredHistoryRetry, setIgnoredHistoryRetry] = useState(0);
   const ignoredHistorySeq = useRef(0);
+  // Coalescing for the history fetch: a fetch in flight for the open
+  // thread, the thread it belongs to, and whether messages moved while
+  // it was running. Without this, every snapshot move bumped the seq
+  // and invalidated the in-flight response, so in a busy chat no
+  // response could ever commit and the thread stayed empty.
+  const ignoredHistoryInFlight = useRef(false);
+  const ignoredHistoryPending = useRef(false);
+  const ignoredHistoryKey = useRef<string | null>(null);
   // Ignoring or un-ignoring the open group keeps its key, so the
   // ignored flag must be a dependency too.
   const selectedIgnoredGroup = selected?.kind === "group" && !!selected.ignored;
   useEffect(() => {
-    const seq = ++ignoredHistorySeq.current;
-    if (!selected || !selectedIgnoredGroup) {
+    const groupId =
+      selected?.kind === "group" && selectedIgnoredGroup ? selected.key : null;
+    if (!groupId) {
+      // Leaving the ignored thread (or un-ignoring it) invalidates any
+      // fetch still running for it; the newer fetch owns the flags.
+      ignoredHistorySeq.current += 1;
+      ignoredHistoryKey.current = null;
+      ignoredHistoryPending.current = false;
       setIgnoredHistory([]);
       setIgnoredHistoryError(false);
       return;
     }
+    const startFetch = (id: string) => {
+      const seq = ++ignoredHistorySeq.current;
+      ignoredHistoryInFlight.current = true;
+      void (async () => {
+        try {
+          const history = await getGroupMessages(id);
+          if (seq !== ignoredHistorySeq.current) return;
+          setIgnoredHistory(history);
+          setIgnoredHistoryError(false);
+        } catch {
+          if (seq === ignoredHistorySeq.current) setIgnoredHistoryError(true);
+        } finally {
+          // Superseded by a selection change: the newer fetch owns the
+          // in-flight flags now, so leave them alone.
+          if (seq !== ignoredHistorySeq.current) return;
+          ignoredHistoryInFlight.current = false;
+          // Messages moved while this fetch ran: run at most one
+          // follow-up so the thread still catches up, without starting
+          // a fetch per message.
+          if (ignoredHistoryPending.current) {
+            ignoredHistoryPending.current = false;
+            startFetch(id);
+          }
+        }
+      })();
+    };
+    if (groupId !== ignoredHistoryKey.current) {
+      // New selection (or newly ignored): drop any in-flight fetch for
+      // the old thread — a slow response must not overwrite a newer
+      // selection — and start fresh for this one.
+      ignoredHistoryKey.current = groupId;
+      ignoredHistoryPending.current = false;
+      startFetch(groupId);
+      return;
+    }
+    // Same thread: a new post, edit, or deletion moved the snapshot.
     // Re-fetch when the snapshot's messages move: the snapshot never
     // carries ignored posts, so without this a new post, edit, or
     // deletion in the open ignored group would never reach the thread.
-    void (async () => {
-      try {
-        const history = await getGroupMessages(selected.key);
-        if (seq !== ignoredHistorySeq.current) return;
-        setIgnoredHistory(history);
-        setIgnoredHistoryError(false);
-      } catch {
-        if (seq === ignoredHistorySeq.current) setIgnoredHistoryError(true);
-      }
-    })();
+    // If a fetch is already running for this thread, let its result
+    // commit and queue at most one follow-up instead.
+    if (ignoredHistoryInFlight.current) {
+      ignoredHistoryPending.current = true;
+      return;
+    }
+    startFetch(groupId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedKey, selectedIgnoredGroup, tau.messages, ignoredHistoryRetry]);
 

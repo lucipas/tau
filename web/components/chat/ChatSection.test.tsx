@@ -33,6 +33,10 @@ function defer<T>() {
   return { promise, resolve };
 }
 let heldGet: ReturnType<typeof defer<unknown>> | null = null;
+/** A deferred the next GET /api/messages?group=… waits on: the test
+ *  resolves it to prove snapshot moves during an in-flight history
+ *  fetch still let a result commit instead of starving the thread. */
+let heldHistoryGet: ReturnType<typeof defer<unknown>> | null = null;
 
 /** The next POST /api/groups/join answers with this payload, so a
  *  join test can stage a named or a label-free queued reply. */
@@ -50,6 +54,7 @@ function stubFetch() {
   groupHistory = [];
   groupHistoryFails = false;
   heldGet = null;
+  heldHistoryGet = null;
   nextJoin = null;
   vi.stubGlobal(
     "fetch",
@@ -119,6 +124,16 @@ function stubFetch() {
             ok: false,
             status: 500,
             text: async () => JSON.stringify({ error: { message: "boom" } }),
+          } as Response;
+        }
+        if (heldHistoryGet) {
+          const held = heldHistoryGet;
+          heldHistoryGet = null;
+          const payload = await held.promise;
+          return {
+            ok: true,
+            status: 200,
+            text: async () => JSON.stringify(payload),
           } as Response;
         }
         payload = { messages: groupHistory };
@@ -721,6 +736,67 @@ describe("ChatSection ignored groups", () => {
         expect(
           calls.filter((c) => c === groupHistoryUrl).length,
         ).toBeGreaterThanOrEqual(2),
+    );
+  });
+
+  it("rapid snapshot moves during an in-flight fetch still commit a result", async () => {
+    groupHistory = [
+      makeMessage({
+        id: 2,
+        group: GROUP_ID,
+        group_name: "crew",
+        peer: PEER_HASH,
+        peer_name: "Alice",
+        text: "crew history",
+      }),
+    ];
+    // Hold the first history fetch so snapshot moves land mid-flight.
+    const held = defer();
+    heldHistoryGet = held;
+    const { rerender } = renderIgnoredGroup();
+    await waitFor(() => expect(calls).toContain(groupHistoryUrl));
+    // Three snapshot moves while the fetch is in flight: before the fix
+    // each bumped the seq and starved the thread — no response could
+    // commit. Now they coalesce: no new fetch starts mid-flight.
+    const rerenderWithMessages = (
+      messages: ReturnType<typeof makeMessage>[],
+    ) =>
+      rerender(
+        <TauContext.Provider
+          value={fakeTau({
+            peers: [makePeer({ destination: PEER_HASH, name: "Alice" })],
+            messages,
+            groups: [
+              {
+                id: GROUP_ID,
+                name: "crew",
+                members: [],
+                created_at: 1700000000,
+                topic: "",
+                created_by_me: true,
+                can_leave: true,
+                ignored: true,
+              },
+            ],
+          })}
+        >
+          <ChatSection />
+        </TauContext.Provider>,
+      );
+    for (let i = 1; i <= 3; i++) {
+      rerenderWithMessages([
+        makeMessage({ id: 10 + i, peer: PEER_HASH, text: `dm ${i}` }),
+      ]);
+    }
+    expect(calls.filter((c) => c === groupHistoryUrl).length).toBe(1);
+    held.resolve({ messages: groupHistory });
+    await waitFor(() => expect(screen.getByText("crew history")).toBeTruthy());
+    // Exactly one follow-up fetch ran for the moves that landed mid-flight.
+    await waitFor(
+      () =>
+        expect(
+          calls.filter((c) => c === groupHistoryUrl).length,
+        ).toBe(2),
     );
   });
 
