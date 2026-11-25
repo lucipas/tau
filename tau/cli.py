@@ -2929,6 +2929,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     group_list.set_defaults(func=cmd_group_list)
 
+    group_export = group_sub.add_parser(
+        "export",
+        parents=[common],
+        help="back up a group's stored history as a JSON export",
+    )
+    group_export.add_argument(
+        "group", metavar="GROUP", help="group id, id prefix or name"
+    )
+    group_export.add_argument(
+        "--output",
+        type=Path,
+        metavar="FILE",
+        help="write the export to a file instead of stdout",
+    )
+    group_export.set_defaults(func=cmd_group_export)
+
     group_show = group_sub.add_parser(
         "show",
         parents=[common],
@@ -20730,6 +20746,40 @@ def cmd_group_list(args: argparse.Namespace) -> int:
         print(f"{group['name']} ({group['id'][:8]}) — {names}{ignored_suffix}{pinned_suffix}{announcements_suffix}")
         if group.get("topic"):
             print(f"  topic: {group['topic']}")
+    return _EXIT_OK
+
+
+def cmd_group_export(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    store = GroupStore(config.groups_path)
+    try:
+        group = store.find(args.group)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    assert group is not None  # find() raises instead of returning None
+    inbox = Inbox(config.inbox_path)
+    # The same document `tau messages import` accepts, restricted to
+    # this group: a group backup restores through the existing import
+    # path, including its retract/edit guards.  Stored records are the
+    # reader's view — edits applied in place, retracted and expired
+    # messages already gone from the store — the same promise `tau
+    # messages export` makes for DMs.  The export spans renames: it
+    # filters on the group's verified lineage (current id plus
+    # predecessors), exactly as `tau messages --group` reads it, so a
+    # renamed group's older messages are not silently dropped.  A
+    # known group with no stored messages still exports, as an empty
+    # list.
+    document = inbox.export_document(group=store.lineage(group["id"]))
+    document["group"] = group["name"]
+    document["group_id"] = group["id"]
+    count = len(document["messages"])
+    text = json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True)
+    if getattr(args, "output", None):
+        atomic_write_text(args.output, text + "\n")
+        print(f"Exported {count} messages (group {group['name']}) to {args.output}")
+    else:
+        print(text)
     return _EXIT_OK
 
 
