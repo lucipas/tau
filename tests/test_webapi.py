@@ -9128,6 +9128,60 @@ def test_reminders_endpoint_returns_503_when_store_locked(node, tmp_path):
         bridge.stop()
 
 
+def test_reminders_list_shows_channel_reminder(node, tmp_path):
+    """A channel reminder lists with its #name; blocking the author hides it.
+
+    The console cannot create one yet (POST /api/reminders only
+    knows inbox message ids — see #797), so the reminder is seeded
+    straight into the store, the way the CLI creates it.
+    """
+    from tau.channels import ChannelApp, create_message
+    from tau.identity import save_identity
+    from tau.reminders import ReminderStore
+
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        config = node.config
+        owner = RNS.Identity()
+        save_identity(owner, config.identity_path)
+        author = RNS.Identity()
+        app = ChannelApp(config, owner, name="tester", gossip=False)
+        app.join("general")
+        conn = app.connect()
+        try:
+            message = create_message(
+                conn, author, "general", "agenda?", name="bob", now=time.time()
+            )
+        finally:
+            conn.close()
+        ReminderStore(bridge._reminders_path()).add(
+            message_id=message["hash"],
+            kind="channel",
+            target="general",
+            text="agenda?",
+            sender="bob",
+            due_at=time.time() + 3600,
+        )
+        status, _, payload = _json(bridge, "/api/reminders")
+        assert status == 200
+        assert payload["count"] == 1
+        shown = payload["reminders"][0]
+        assert shown["kind"] == "channel"
+        assert shown["target"] == "general"
+        assert shown["target_name"] == "#general"
+        assert shown["sender"] == "bob"
+
+        # Blocking the author hides it, like any other reminder.
+        save_blocklist(
+            config.blocklist_path,
+            BlockList(blocked=frozenset({destination_hash(author).hex()})),
+        )
+        status, _, payload = _json(bridge, "/api/reminders")
+        assert payload == {"reminders": [], "count": 0}
+    finally:
+        bridge.stop()
+
+
 def test_reminders_hide_message_deleted_by_another_process(node, tmp_path):
     """The listing reloads the inbox file, so a delete from another
     process hides the reminder even though the serving bridge's

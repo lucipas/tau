@@ -1,10 +1,11 @@
 """Message reminders: snooze a stored message and be re-pinged later.
 
-A reminder is a one-shot nudge attached to a stored DM or group
-message, set with ``tau remind add <MSG> --in 1h`` (or ``--at`` an ISO
-time).  When the node is serving, its mail loop fires due reminders:
-the conversation is marked unread again, so it lights the unread
-badge, and the reminder is printed with the original message text and
+A reminder is a one-shot nudge attached to a stored DM, group, or
+channel message, set with ``tau remind add <MSG> --in 1h`` (or
+``--at`` an ISO time; a channel message needs ``--channel NAME``).
+When the node is serving, its mail loop fires due reminders: the
+conversation is marked unread again, so it lights the unread badge,
+and the reminder is printed with the original message text and
 sender — then consumed, never fired twice.
 
 Reminders are local-only by construction — there is no wire format
@@ -40,6 +41,7 @@ try:  # Windows only; the lock uses msvcrt there, as identity.py does.
 except ImportError:  # pragma: no cover - POSIX platforms
     msvcrt = None  # type: ignore[assignment]
 
+from .channels import ChannelError, clean_channel_name
 from .protocol import ProtocolError, normalize_message
 from .util import atomic_write_json, read_json
 
@@ -58,7 +60,7 @@ MAX_REMINDER_DELAY = 30 * 24 * 60 * 60
 
 REMINDER_ID_BYTES = 8
 
-REMINDER_KINDS = ("peer", "group")
+REMINDER_KINDS = ("peer", "group", "channel")
 
 
 class ReminderError(ValueError):
@@ -76,6 +78,24 @@ def _valid_hash(value: Any) -> Optional[str]:
     return value.lower()
 
 
+def _valid_target(kind: str, target: Any) -> Optional[str]:
+    """A reminder target in canonical form, or ``None`` when unusable.
+
+    DM and group reminders name a 32-hex destination hash or group
+    id; a channel reminder names the channel, validated exactly like
+    every other channel name, so ``#General`` and ``#general`` stay
+    distinct the way the channel store keeps them.
+    """
+    if kind == "channel":
+        if not isinstance(target, str):
+            return None
+        try:
+            return clean_channel_name(target)
+        except ChannelError:
+            return None
+    return _valid_hash(target)
+
+
 def _valid_reminder(raw: Any) -> Optional[Dict[str, Any]]:
     """Normalize one stored reminder, or ``None`` when it is unusable."""
     if not isinstance(raw, dict):
@@ -83,7 +103,7 @@ def _valid_reminder(raw: Any) -> Optional[Dict[str, Any]]:
     kind = raw.get("kind")
     if kind not in REMINDER_KINDS:
         return None
-    target = _valid_hash(raw.get("target"))
+    target = _valid_target(kind, raw.get("target"))
     if target is None:
         return None
     message_id = raw.get("message_id")
@@ -259,9 +279,11 @@ class ReminderStore:
         """
         if kind not in REMINDER_KINDS:
             raise ReminderError(f"unknown reminder target kind: {kind!r}")
-        key_target = _valid_hash(target)
+        key_target = _valid_target(kind, target)
         if key_target is None:
-            raise ReminderError("reminder target must be a destination hash")
+            raise ReminderError(
+                "reminder target must be a destination hash or a channel name"
+            )
         if not isinstance(message_id, str) or not message_id.strip():
             raise ReminderError("reminder needs a message id")
         try:
@@ -363,16 +385,27 @@ class ReminderStore:
             return len(self._reminders)
 
 
-def _find_stored(inbox: Any, reminder: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """The stored inbox record the reminded message is, or ``None`` if gone.
+def _find_stored(
+    inbox: Any, reminder: Dict[str, Any], channels: Any = None
+) -> Optional[Dict[str, Any]]:
+    """The stored record the reminded message is, or ``None`` if gone.
 
     A group send stores one leg id as the record id and the rest in
     ``leg_ids``, so a reminder naming any leg still matches — the
-    same convention as :meth:`Inbox.resolve`.  Callers must hold the
-    inbox transaction, so the answer reflects the shared inbox file
-    rather than a stale in-memory copy.
+    same convention as :meth:`Inbox.resolve`.  A channel reminder is
+    looked up in the channel store instead: the message as history
+    shows it, so an expired or retracted message is gone here too.
+    Callers must hold the inbox transaction, so the answer reflects
+    the shared inbox file rather than a stale in-memory copy.
     """
     message_id = reminder["message_id"]
+    if reminder["kind"] == "channel":
+        if channels is None:
+            return None
+        entry = channels.get_visible_message(message_id)
+        if entry is None or entry.get("channel") != reminder["target"]:
+            return None
+        return entry
     if reminder["kind"] == "group":
         entries = inbox.list_messages(
             limit=None, group=[reminder["target"]], direction=None
@@ -390,6 +423,17 @@ def _find_stored(inbox: Any, reminder: Dict[str, Any]) -> Optional[Dict[str, Any
     return None
 
 
+def _reminder_author(entry: Dict[str, Any], reminder: Dict[str, Any]) -> Any:
+    """The reminded message's sender, for the block-list check.
+
+    Channel messages carry the sender in ``author``; inbox entries
+    carry it in ``destination``.
+    """
+    if reminder["kind"] == "channel":
+        return entry.get("author")
+    return entry.get("destination")
+
+
 def _inbox_transaction(inbox: Any) -> ContextManager[Any]:
     """The inbox's cross-process transaction, or a no-op for plain stand-ins."""
     transaction = getattr(inbox, "transaction", None)
@@ -404,14 +448,20 @@ def fire_due_reminders(
     *,
     now: Optional[float] = None,
     blocklist_path: Optional[Union[str, Path]] = None,
+    channels: Any = None,
 ) -> Dict[str, List[Dict[str, Any]]]:
     """Fire every due reminder through an inbox.
 
     For each due reminder whose message is still stored, the
     conversation is marked unread again (so it lights the unread
     badge), the reminder is consumed, and then it is printed with the
-    full original message text and sender.  The consume is an exclusive
-    claim on the reminder store: when two passes or a ``tau remind
+    full original message text and sender.  A channel reminder
+    re-opens its channel at the reminded message instead — the read
+    cursor moves back to just before it — and needs *channels*, the
+    node's channel store; without one it stays due, like a reminder
+    held back by an unreadable block-list, and fires on a later pass
+    once channels are available.  The consume is an exclusive claim
+    on the reminder store: when two passes or a ``tau remind
     cancel`` race for the same reminder, only the one whose removal
     succeeds prints it, and a failed removal means it is not fired.
     A reminder whose message was deleted first, or whose sender is
@@ -441,20 +491,38 @@ def fire_due_reminders(
                     # Unreadable block-list: keep the reminder due and
                     # show nothing this pass.
                     continue
+            if reminder["kind"] == "channel" and channels is None:
+                # No channel store on this pass (the node is not
+                # serving channels): keep the reminder due and try
+                # again later instead of dropping a live reminder.
+                continue
             with _inbox_transaction(inbox):
-                entry = _find_stored(inbox, reminder)
+                entry = _find_stored(inbox, reminder, channels)
                 if entry is None:
                     outcome = "dropped"
-                elif entry.get("destination") in blocked:
+                elif _reminder_author(entry, reminder) in blocked:
                     outcome = "dropped"
                 else:
-                    if reminder["kind"] == "group":
+                    if reminder["kind"] == "channel":
+                        try:
+                            counts = channels.mark_unread(
+                                reminder["target"], reminder["message_id"]
+                            )
+                        except ChannelError:
+                            # Left the channel, or the message went
+                            # away between the lookup and the mark:
+                            # nothing to re-light.
+                            outcome = "dropped"
+                        else:
+                            outcome = "fire" if counts is not None else "dropped"
+                    elif reminder["kind"] == "group":
                         counts = inbox.mark_unread(group=reminder["target"])
+                        outcome = "fire" if counts is not None else "dropped"
                     else:
                         counts = inbox.mark_unread(reminder["target"])
-                    # No received message to mark unread (for example a
-                    # sent-only conversation): nothing to re-ping about.
-                    outcome = "fire" if counts is not None else "dropped"
+                        # No received message to mark unread (for example a
+                        # sent-only conversation): nothing to re-ping about.
+                        outcome = "fire" if counts is not None else "dropped"
         except Exception:  # pragma: no cover - defensive; keep firing
             log.warning("Reminder %s failed to fire", reminder["id"], exc_info=True)
             continue
