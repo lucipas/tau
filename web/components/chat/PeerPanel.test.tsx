@@ -1,7 +1,8 @@
 // PeerPanel.test.tsx — the DM public-profile section (display name, bio,
-// links from the peer's served profile) and the group invite-link section
+// links from the peer's served profile), the group invite-link section
 // (shown only for groups this node created, with create / copy / mode /
-// revoke).
+// revoke), and the group join-requests section (pending closed-invite
+// requests, with approve / deny).
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -10,7 +11,7 @@ import { TauContext } from "../chrome/TauContext";
 import { fakeTau as fakeTauChat, makePeer } from "../test-utils";
 import { fakeTau as fakeTauSections, fakePeer, mockFetch } from "../sections/test-utils";
 import type { Conversation } from "@/lib/use-tau";
-import type { Group, Peer } from "@/lib/types";
+import type { Group, JoinRequest, Peer } from "@/lib/types";
 
 const PEER_HASH = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6";
 const GROUP_ID = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6";
@@ -221,6 +222,332 @@ describe("PeerPanel invite links", () => {
     expect(screen.queryByText("Invite link")).toBeNull();
     expect(screen.queryByText("Create invite link")).toBeNull();
     expect(calls.filter((c) => c.includes("/api/groups/invite"))).toEqual([]);
+  });
+});
+
+describe("PeerPanel join requests", () => {
+  const CAROL = "c".repeat(32);
+  const DAVE = "d".repeat(32);
+  const OTHER_GROUP = "e".repeat(32);
+  const SUCCESSOR_ID = "f".repeat(32);
+
+  function joinRequest(overrides: Partial<JoinRequest> = {}): JoinRequest {
+    return {
+      group: "crew",
+      peer: CAROL,
+      peer_name: "carol",
+      group_id: GROUP_ID,
+      requested_at: 1700000000,
+      expires_at: 1700086400,
+      ...overrides,
+    };
+  }
+
+  function renderRequestsPanel(
+    conversation: Conversation,
+    successor: Group | null = null,
+    onSuccessorPending: (successorId: string, originHash: string) => void = () => {},
+  ) {
+    const tau = fakeTauSections();
+    const snap = tau.snapshot;
+    tau.refresh = vi.fn(async () =>
+      successor && snap ? { ...snap, groups: [successor] } : null,
+    );
+    return render(
+      <TauContext.Provider value={tau}>
+        <PeerPanel conversation={conversation} onSuccessorPending={onSuccessorPending} />
+      </TauContext.Provider>,
+    );
+  }
+
+  // mockFetch records method + url only; decisions need the body
+  // asserted too, so this local variant records parsed JSON bodies.
+  function mockFetchBodies(
+    handler: (url: string, method: string, body: unknown) => unknown,
+  ) {
+    const calls: { method: string; url: string; body: unknown }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        const method = init?.method ?? "GET";
+        let body: unknown = null;
+        if (init?.body) {
+          try {
+            body = JSON.parse(String(init.body));
+          } catch {
+            body = null;
+          }
+        }
+        calls.push({ method, url, body });
+        const payload = await handler(url, method, body);
+        return {
+          ok: true,
+          status: 200,
+          text: async () => JSON.stringify(payload ?? {}),
+        } as Response;
+      }),
+    );
+    return { calls };
+  }
+
+  function inviteOnly(url: string) {
+    if (url.includes("/api/groups/invite")) {
+      return { mode: "open", generation: 0, link: null };
+    }
+    return { ok: true };
+  }
+
+  afterEach(() => {
+    // A rotated group id lands in the URL hash; clear it so the next
+    // test starts from the default "#chat" hash.
+    window.location.hash = "";
+  });
+
+  it("lists this group's pending requests only, with approve and deny", async () => {
+    const requests = [
+      joinRequest(),
+      joinRequest({ peer: DAVE, peer_name: "dave", group_id: OTHER_GROUP }),
+    ];
+    mockFetchBodies((url) => {
+      if (url.includes("/api/groups/join-requests")) {
+        return { requests, count: requests.length };
+      }
+      return inviteOnly(url);
+    });
+    renderRequestsPanel(groupConv());
+    await waitFor(() => expect(screen.getByText("Join requests")).toBeTruthy());
+    expect(screen.getByText("carol")).toBeTruthy();
+    expect(screen.queryByText("dave")).toBeNull();
+    expect(screen.getByLabelText("Approve carol to join")).toBeTruthy();
+    expect(screen.getByLabelText("Deny carol to join")).toBeTruthy();
+  });
+
+  it("approves a request, posts the decision, and follows the rotated group id", async () => {
+    const successor: Group = {
+      ...groupConv().group!,
+      id: SUCCESSOR_ID,
+      members: [...groupConv().group!.members, { hash: CAROL, name: "carol" }],
+    };
+    let requests = [joinRequest()];
+    const { calls } = mockFetchBodies((url, method) => {
+      if (url.includes("/api/groups/approve-join")) {
+        requests = [];
+        return {
+          ok: true,
+          status: "added",
+          group: { id: SUCCESSOR_ID, name: "crew", members: [], creator: "" },
+        };
+      }
+      if (url.includes("/api/groups/join-requests")) {
+        return { requests, count: requests.length };
+      }
+      return inviteOnly(url);
+    });
+    renderRequestsPanel(groupConv(), successor);
+    await waitFor(() =>
+      expect(screen.getByLabelText("Approve carol to join")).toBeTruthy(),
+    );
+    fireEvent.click(screen.getByLabelText("Approve carol to join"));
+    await waitFor(() =>
+      expect(window.location.hash).toBe(`#chat?group=${SUCCESSOR_ID}`),
+    );
+    expect(
+      calls.some(
+        (c) =>
+          c.method === "POST" &&
+          c.url.includes("/api/groups/approve-join") &&
+          JSON.stringify(c.body) ===
+            JSON.stringify({ group: GROUP_ID, peer: CAROL }),
+      ),
+    ).toBe(true);
+  });
+
+  it("denies a request and removes it from the list", async () => {
+    let requests = [joinRequest()];
+    const { calls } = mockFetchBodies((url, method) => {
+      if (url.includes("/api/groups/deny-join")) {
+        requests = [];
+        return {
+          ok: true,
+          status: "denied",
+          group: { id: GROUP_ID, name: "crew", members: [], creator: "" },
+        };
+      }
+      if (url.includes("/api/groups/join-requests")) {
+        return { requests, count: requests.length };
+      }
+      return inviteOnly(url);
+    });
+    renderRequestsPanel(groupConv());
+    await waitFor(() =>
+      expect(screen.getByLabelText("Deny carol to join")).toBeTruthy(),
+    );
+    fireEvent.click(screen.getByLabelText("Deny carol to join"));
+    await waitFor(() => expect(screen.queryByText("Join requests")).toBeNull());
+    expect(window.location.hash).toBe("");
+    expect(
+      calls.some(
+        (c) =>
+          c.method === "POST" &&
+          c.url.includes("/api/groups/deny-join") &&
+          JSON.stringify(c.body) ===
+            JSON.stringify({ group: GROUP_ID, peer: CAROL }),
+      ),
+    ).toBe(true);
+  });
+
+  it("approving a peer who is already a member clears the stale request", async () => {
+    let requests = [joinRequest()];
+    const { calls } = mockFetchBodies((url, method) => {
+      if (url.includes("/api/groups/approve-join")) {
+        requests = [];
+        return {
+          ok: true,
+          status: "already_member",
+          group: { id: GROUP_ID, name: "crew", members: [], creator: "" },
+        };
+      }
+      if (url.includes("/api/groups/join-requests")) {
+        return { requests, count: requests.length };
+      }
+      return inviteOnly(url);
+    });
+    renderRequestsPanel(groupConv());
+    await waitFor(() =>
+      expect(screen.getByLabelText("Approve carol to join")).toBeTruthy(),
+    );
+    fireEvent.click(screen.getByLabelText("Approve carol to join"));
+    await waitFor(() => expect(screen.queryByText("Join requests")).toBeNull());
+    expect(window.location.hash).toBe("");
+    expect(
+      calls.some(
+        (c) =>
+          c.method === "POST" &&
+          c.url.includes("/api/groups/approve-join") &&
+          JSON.stringify(c.body) ===
+            JSON.stringify({ group: GROUP_ID, peer: CAROL }),
+      ),
+    ).toBe(true);
+  });
+
+  it("stays put and keeps the list when the refresh cannot load the successor", async () => {
+    // The approval landed but the snapshot fetch failed, so the
+    // successor is not in any snapshot: navigating would point the
+    // thread at a group the console cannot display yet, and the
+    // retired panel must not take on the successor's requests.
+    const onSuccessorPending = vi.fn();
+    const { calls } = mockFetchBodies((url, method) => {
+      if (url.includes("/api/groups/approve-join")) {
+        return {
+          ok: true,
+          status: "added",
+          group: { id: SUCCESSOR_ID, name: "crew", members: [], creator: "" },
+        };
+      }
+      if (url.includes("/api/groups/join-requests")) {
+        return { requests: [joinRequest()], count: 1 };
+      }
+      return inviteOnly(url);
+    });
+    renderRequestsPanel(groupConv(), null, onSuccessorPending);
+    await waitFor(() =>
+      expect(screen.getByLabelText("Approve carol to join")).toBeTruthy(),
+    );
+    fireEvent.click(screen.getByLabelText("Approve carol to join"));
+    await waitFor(() =>
+      expect(
+        screen.getByText(
+          "Member added, but the new group couldn't be loaded yet — it will appear when the connection recovers.",
+        ),
+      ).toBeTruthy(),
+    );
+    expect(window.location.hash).toBe("");
+    expect(onSuccessorPending).toHaveBeenCalledWith(SUCCESSOR_ID, "");
+    // The request stays listed: the retired panel never took on the
+    // successor's list, so deciding it again would not send the
+    // retired id.
+    expect(screen.getByLabelText("Approve carol to join")).toBeTruthy();
+    expect(
+      calls.filter(
+        (c) => c.method === "GET" && c.url.includes("/api/groups/join-requests"),
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("shows a load error apart from action errors, and clears it on a fresh load", async () => {
+    let calls = 0;
+    mockFetchBodies((url) => {
+      if (url.includes("/api/groups/join-requests")) {
+        calls += 1;
+        if (calls === 1) {
+          throw new Error("boom");
+        }
+        return { requests: [joinRequest({ group_id: OTHER_GROUP })], count: 1 };
+      }
+      return inviteOnly(url);
+    });
+    const other = {
+      ...groupConv(),
+      key: OTHER_GROUP,
+      name: "crew2",
+      group: { ...groupConv().group!, id: OTHER_GROUP },
+    };
+    const { rerender } = renderPanel(groupConv());
+    await waitFor(() =>
+      expect(screen.getByText(/Couldn't load join requests/)).toBeTruthy(),
+    );
+    expect(screen.queryByText("Join requests")).toBeNull();
+    rerender(
+      <TauContext.Provider value={fakeTauSections()}>
+        <PeerPanel conversation={other} />
+      </TauContext.Provider>,
+    );
+    await waitFor(() => expect(screen.getByText("Join requests")).toBeTruthy());
+    expect(screen.queryByText(/Couldn't load join requests/)).toBeNull();
+    expect(screen.getByText("carol")).toBeTruthy();
+  });
+
+  it("shows no section when there are no pending requests", async () => {
+    mockFetch((url) => {
+      if (url.includes("/api/groups/join-requests")) {
+        return { requests: [], count: 0 };
+      }
+      return inviteOnly(url);
+    });
+    renderPanel(groupConv());
+    await waitFor(() => expect(screen.getByText("Members")).toBeTruthy());
+    expect(screen.queryByText("Join requests")).toBeNull();
+  });
+
+  it("shows no section and fetches nothing for a group this node did not create", async () => {
+    const { calls } = mockFetch(() => ({ ok: true }));
+    renderPanel(groupConv({ created_by_me: false }));
+    await waitFor(() => expect(screen.getByText("Members")).toBeTruthy());
+    expect(screen.queryByText("Join requests")).toBeNull();
+    expect(calls.filter((c) => c.includes("/api/groups/join-requests"))).toEqual([]);
+  });
+
+  it("shows an API error and keeps the request for a retry", async () => {
+    mockFetchBodies((url, method) => {
+      if (url.includes("/api/groups/approve-join")) {
+        throw new Error("no pending join request from that peer");
+      }
+      if (url.includes("/api/groups/join-requests")) {
+        return { requests: [joinRequest()], count: 1 };
+      }
+      return inviteOnly(url);
+    });
+    renderRequestsPanel(groupConv());
+    await waitFor(() =>
+      expect(screen.getByLabelText("Approve carol to join")).toBeTruthy(),
+    );
+    fireEvent.click(screen.getByLabelText("Approve carol to join"));
+    await waitFor(() =>
+      expect(
+        screen.getByText("no pending join request from that peer"),
+      ).toBeTruthy(),
+    );
+    expect(screen.getByLabelText("Approve carol to join")).toBeTruthy();
   });
 });
 

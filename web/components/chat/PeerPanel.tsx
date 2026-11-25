@@ -5,15 +5,19 @@
 // confirm — never automatically), block/unblock, forget, alias, note,
 // archive, mute, pin, disappearing default, mark unread/read.
 // Group: members, topic, mute, mark unread/read, leave, ignore. The creator also
-// manages the roster here (add/remove members); a roster change rotates
-// the group to a successor id, so the panel follows the new id.
+// manages the roster here (add/remove members) and answers pending join
+// requests from closed invite links; a roster change rotates the group to
+// a successor id, so the panel follows the new id.
 
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   addGroupMembers,
+  approveJoinRequest,
+  denyJoinRequest,
   getGroupInviteStatus,
+  getJoinRequests,
   leaveGroup,
   mintGroupInvite,
   removeGroupMembers,
@@ -22,10 +26,15 @@ import {
   setGroupAnnouncements,
   type GroupInviteStatus,
 } from "@/lib/api";
-import { formatAge, formatDateTime, truncatedHash } from "@/lib/format";
+import {
+  formatAge,
+  formatDateTime,
+  formatRelative,
+  truncatedHash,
+} from "@/lib/format";
 import { useNow } from "@/lib/use-now";
 import { usePeerActions, type Conversation } from "@/lib/use-tau";
-import type { Peer } from "@/lib/types";
+import type { JoinRequest, Peer } from "@/lib/types";
 import Avatar from "../chrome/Avatar";
 import { useTauContext } from "../chrome/TauContext";
 import { useHash } from "../chrome/useHash";
@@ -103,6 +112,18 @@ export default function PeerPanel({
   const [inviteBusy, setInviteBusy] = useState(false);
   const [confirmRevoke, setConfirmRevoke] = useState(false);
   const [copied, setCopied] = useState(false);
+  // Pending join requests for a group this node created (closed invite
+  // links only): the peer who asked and when, or null while loading.
+  const [requests, setRequests] = useState<JoinRequest[] | null>(null);
+  // A load failure is a join-requests problem, not an action failure:
+  // it gets its own message, cleared by the next successful load, so
+  // a transient poll failure never sticks beside a fresh list and
+  // never replaces an error from a decision.
+  const [requestsError, setRequestsError] = useState<string | null>(null);
+  // Generation of the latest requests load: a slow poll that started
+  // before a decision (or a newer poll) must not overwrite the newer
+  // list with its older result.
+  const requestsGen = useRef(0);
   // Roster management (creator only): the peer picked to add, and the
   // member awaiting a remove confirm.
   const [addPeer, setAddPeer] = useState("");
@@ -162,6 +183,41 @@ export default function PeerPanel({
       });
     return () => {
       cancelled = true;
+    };
+  }, [groupId, groupCreatedByMe]);
+
+  // Join requests are creator-managed too: only fetch them for groups
+  // this node created, reload them after every decision, and poll while
+  // the panel is open so requests arriving from closed invite links show
+  // up without reopening it. The request names the group, so filter by
+  // the group id to keep another group's requests out of this panel.
+  // A load applies only when no newer load has superseded it (see
+  // requestsGen): a slow poll must not overwrite a newer list.
+  useEffect(() => {
+    setRequests(null);
+    setRequestsError(null);
+    if (!groupCreatedByMe || !groupId) return;
+    let cancelled = false;
+    const load = () => {
+      const gen = ++requestsGen.current;
+      void getJoinRequests()
+        .then((all) => {
+          if (!cancelled && requestsGen.current === gen) {
+            setRequests(all.filter((r) => r.group_id === groupId));
+            setRequestsError(null);
+          }
+        })
+        .catch((err) => {
+          if (!cancelled && requestsGen.current === gen) {
+            setRequestsError(err instanceof Error ? err.message : String(err));
+          }
+        });
+    };
+    load();
+    const timer = window.setInterval(load, 10_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
     };
   }, [groupId, groupCreatedByMe]);
 
@@ -228,6 +284,83 @@ export default function PeerPanel({
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  // Answer one pending join request. Approving adds the peer, so the
+  // roster rotates to a successor id and the panel follows it exactly
+  // like a roster change does (see changeMembers); denying only
+  // resolves the request, so no follow is needed. The reloaded list
+  // is committed only for the group this decision started for: a
+  // switch mid-flight leaves the new group's own load in charge of
+  // its list, and when the successor cannot be loaded yet the list
+  // stays as-is until the successor is actually selected.
+  async function decideJoinRequest(request: JoinRequest, approve: boolean) {
+    if (!groupId || busy !== null) return;
+    // Only follow the successor if the user is still on this thread when
+    // the request completes (they may have switched chats or sections).
+    const startedAt = window.location.hash;
+    setBusy(approve ? "approve" : "deny");
+    setError(null);
+    try {
+      const result = (await (approve
+        ? approveJoinRequest(groupId, request.peer)
+        : denyJoinRequest(groupId, request.peer))) as {
+        group?: { id?: string };
+      };
+      const nextId = result.group?.id ?? groupId;
+      const snap = await tau.refresh();
+      let successorMissing = false;
+      if (approve && nextId !== groupId && window.location.hash === startedAt) {
+        const successorVisible =
+          snap?.groups.some((g) => g.id === nextId) ?? false;
+        if (successorVisible) {
+          navigate(section, { group: nextId });
+        } else {
+          successorMissing = true;
+          setError(
+            "Member added, but the new group couldn't be loaded yet — it will appear when the connection recovers.",
+          );
+          // Hand the successor to the parent: the id lives only in
+          // this request, so without it a later successful refresh
+          // could never follow the successor and the retired thread
+          // would stay selected forever.
+          onSuccessorPending?.(nextId, startedAt);
+        }
+      }
+      // A navigation above already changed the hash, so the
+      // successor's own load owns its list; commit here only when
+      // the panel still shows this decision's group. The reload is
+      // generation-guarded like the polls (see requestsGen), and a
+      // reload failure is a load problem, not an action error — the
+      // decision itself already succeeded.
+      if (window.location.hash === startedAt && !successorMissing) {
+        const gen = ++requestsGen.current;
+        try {
+          const fresh = await getJoinRequests();
+          if (
+            requestsGen.current === gen &&
+            window.location.hash === startedAt
+          ) {
+            setRequests(fresh.filter((r) => r.group_id === nextId));
+          }
+        } catch (err) {
+          if (
+            requestsGen.current === gen &&
+            window.location.hash === startedAt
+          ) {
+            setRequestsError(err instanceof Error ? err.message : String(err));
+          }
+        }
+      }
+    } catch (err) {
+      // A switch mid-flight means this error belongs to a group the
+      // panel no longer shows; leave the new panel's state alone.
+      if (window.location.hash === startedAt) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
     } finally {
       setBusy(null);
     }
@@ -497,6 +630,51 @@ export default function PeerPanel({
               </ActionButton>
             </div>
           )}
+        </div>
+      )}
+
+      {isGroup && groupCreatedByMe && requestsError !== null && (
+        <p role="alert" className="mt-2 text-xs text-amber-300">
+          Couldn&apos;t load join requests — {requestsError}
+        </p>
+      )}
+
+      {isGroup && groupCreatedByMe && requests !== null && requests.length > 0 && (
+        <div className="mt-3 rounded-xl border border-zinc-800 p-3">
+          <h3 className="text-sm font-bold text-zinc-100">Join requests</h3>
+          <p className="mt-1 text-xs leading-snug text-zinc-500">
+            People who asked to join with a closed invite link. Approving adds them to the
+            group; denying just turns them away — they can ask again.
+          </p>
+          <ul className="mt-2 flex flex-col gap-2">
+            {requests.map((request) => (
+              <li key={request.peer} className="flex items-center gap-2 text-sm">
+                <Avatar name={request.peer_name} seed={request.peer} size="sm" />
+                <span className="min-w-0 flex-1 truncate text-zinc-200">{request.peer_name}</span>
+                <span className="shrink-0 text-xs text-zinc-500">
+                  {formatRelative(request.requested_at, now)}
+                </span>
+                <button
+                  type="button"
+                  disabled={busy !== null}
+                  onClick={() => void decideJoinRequest(request, true)}
+                  aria-label={`Approve ${request.peer_name} to join`}
+                  className="shrink-0 rounded-full bg-cyan-500 px-2.5 py-1 text-xs font-bold text-zinc-950 hover:bg-cyan-400 disabled:opacity-40"
+                >
+                  Approve
+                </button>
+                <button
+                  type="button"
+                  disabled={busy !== null}
+                  onClick={() => void decideJoinRequest(request, false)}
+                  aria-label={`Deny ${request.peer_name} to join`}
+                  className="shrink-0 rounded-full border border-zinc-700 px-2.5 py-1 text-xs font-semibold text-zinc-200 hover:bg-zinc-800 disabled:opacity-40"
+                >
+                  Deny
+                </button>
+              </li>
+            ))}
+          </ul>
         </div>
       )}
 
