@@ -45,6 +45,9 @@ type VoiceSession = {
   recorder: MediaRecorder;
   stream: MediaStream;
   discard: boolean;
+  /** Key of the conversation the recording began in; output for a
+      conversation that is no longer open is dropped in onstop. */
+  conversationKey: string | undefined;
 };
 
 /** Abandon a voice recording: stop the recorder (its onstop sees the
@@ -185,6 +188,12 @@ export default function Composer({
   // Bumped whenever a recording must be abandoned (unmount, chat change),
   // so a permission prompt that resolves late does not start one.
   const voiceGenRef = useRef(0);
+  // Latest prop values for the async recording callbacks, which close
+  // over the props from the click that started them.
+  const disabledRef = useRef(disabled);
+  disabledRef.current = disabled;
+  const conversationKeyRef = useRef(conversationKey);
+  conversationKeyRef.current = conversationKey;
   const [savingDraft, setSavingDraft] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
 
@@ -217,6 +226,18 @@ export default function Composer({
       setRecording(false);
     }
   }, [conversationKey]);
+
+  // Posting can be disabled mid-recording (an announcements-only group
+  // locks): a live recording must not outlive the permission to post.
+  useEffect(() => {
+    if (!disabled) return;
+    const session = voiceSessionRef.current;
+    voiceSessionRef.current = null;
+    if (session) {
+      releaseVoiceSession(session);
+      setRecording(false);
+    }
+  }, [disabled]);
 
   // A contact picked in one thread must not ride into the next:
   // the composer is reused across conversations, so reset contact
@@ -409,9 +430,9 @@ export default function Composer({
       );
       return;
     }
-    // The composer unmounted or the chat changed while the permission
-    // prompt was open: give the microphone straight back.
-    if (generation !== voiceGenRef.current) {
+    // The composer unmounted, the chat changed, or posting was disabled
+    // while the permission prompt was open: give the microphone back.
+    if (generation !== voiceGenRef.current || disabledRef.current) {
       stream.getTracks().forEach((t) => t.stop());
       startingRef.current = false;
       return;
@@ -435,7 +456,7 @@ export default function Composer({
       );
       return;
     }
-    const session: VoiceSession = { recorder, stream, discard: false };
+    const session: VoiceSession = { recorder, stream, discard: false, conversationKey };
     const chunks: Blob[] = [];
     recorder.ondataavailable = (e) => {
       if (e.data.size > 0) chunks.push(e.data);
@@ -444,8 +465,9 @@ export default function Composer({
       stream.getTracks().forEach((t) => t.stop());
       if (voiceSessionRef.current === session) voiceSessionRef.current = null;
       // An abandoned recording (chat change, unmount, runtime error)
-      // never becomes an attachment.
-      if (session.discard) return;
+      // never becomes an attachment. The key check covers the window
+      // between the new chat rendering and the cleanup effect running.
+      if (session.discard || session.conversationKey !== conversationKeyRef.current) return;
       const type = recorder.mimeType || "audio/webm";
       const recorded = new File([new Blob(chunks, { type })], `voice-note-${Date.now()}.webm`, {
         type,
@@ -462,7 +484,7 @@ export default function Composer({
       setVoiceFile(true);
     };
     recorder.onerror = (e) => {
-      if (session.discard) return;
+      if (session.discard || session.conversationKey !== conversationKeyRef.current) return;
       const reason = (e as { error?: { message?: string } }).error?.message ?? "unknown error";
       releaseVoiceSession(session);
       if (voiceSessionRef.current === session) voiceSessionRef.current = null;

@@ -301,31 +301,59 @@ describe("voice recording", () => {
     vi.restoreAllMocks();
   });
 
-  function installVoiceMocks() {
-    const stream = { getTracks: () => [] } as unknown as MediaStream;
-    const getUserMedia = vi.fn().mockResolvedValue(stream);
+  function installVoiceMocks(opts?: { deferPermission?: boolean }) {
+    const stopTrack = vi.fn();
+    const stream = {
+      getTracks: () => [{ stop: stopTrack }],
+    } as unknown as MediaStream;
+    let resolvePermission: ((s: MediaStream) => void) | undefined;
+    const getUserMedia = vi.fn().mockImplementation(() => {
+      if (opts?.deferPermission) {
+        return new Promise<MediaStream>((resolve) => {
+          resolvePermission = resolve;
+        });
+      }
+      return Promise.resolve(stream);
+    });
     Object.defineProperty(navigator, "mediaDevices", {
       value: { getUserMedia },
       configurable: true,
     });
+    const recorders: {
+      ondataavailable: ((e: { data: Blob }) => void) | null;
+      onstop: (() => void) | null;
+      onerror: ((e: unknown) => void) | null;
+      stop: () => void;
+    }[] = [];
     class FakeRecorder {
       static isTypeSupported = () => true;
       ondataavailable: ((e: { data: Blob }) => void) | null = null;
       onstop: (() => void) | null = null;
+      onerror: ((e: unknown) => void) | null = null;
       mimeType = "audio/webm;codecs=opus";
+      state = "inactive";
       constructor(
         public stream: MediaStream,
         public opts?: { mimeType?: string },
-      ) {}
+      ) {
+        recorders.push(this);
+      }
       start() {
+        this.state = "recording";
         this.ondataavailable?.({ data: new Blob(["audio"], { type: "audio/webm" }) });
       }
       stop() {
+        this.state = "inactive";
         this.onstop?.();
       }
     }
     vi.stubGlobal("MediaRecorder", FakeRecorder);
-    return { getUserMedia };
+    return {
+      getUserMedia,
+      stopTrack,
+      recorders,
+      resolvePermission: () => resolvePermission?.(stream),
+    };
   }
 
   it("hides the mic button when the browser cannot record", () => {
@@ -354,6 +382,55 @@ describe("voice recording", () => {
         expect.objectContaining({ voice: true }),
       ),
     );
+  });
+
+  it("does not start recording when the chat locks while permission is pending", async () => {
+    const mocks = installVoiceMocks({ deferPermission: true });
+    const { rerender } = render(
+      <Composer disabled={false} onSend={() => undefined} onSendFile={() => undefined} />,
+    );
+
+    fireEvent.click(screen.getByLabelText("Record a voice note"));
+    expect(mocks.getUserMedia).toHaveBeenCalledWith({ audio: true });
+
+    // The announcements-only group locks while the prompt is open.
+    rerender(
+      <Composer disabled onSend={() => undefined} onSendFile={() => undefined} />,
+    );
+    mocks.resolvePermission();
+    await vi.waitFor(() => expect(mocks.stopTrack).toHaveBeenCalled());
+    expect(screen.queryByLabelText("Stop recording")).toBeNull();
+  });
+
+  it("drops a recording that finishes after the conversation changed", async () => {
+    const mocks = installVoiceMocks();
+    const onSendFile = vi.fn();
+    const { rerender } = render(
+      <Composer
+        conversationKey="chat-a"
+        onSend={() => undefined}
+        onSendFile={onSendFile}
+      />,
+    );
+
+    fireEvent.click(screen.getByLabelText("Record a voice note"));
+    await vi.waitFor(() =>
+      expect(screen.getByLabelText("Stop recording")).toBeTruthy(),
+    );
+
+    // Switch chats, then let the old recorder's stop land late: the
+    // cleanup effect normally discards first, and the session-key check
+    // in onstop covers the window before the effect runs.
+    rerender(
+      <Composer
+        conversationKey="chat-b"
+        onSend={() => undefined}
+        onSendFile={onSendFile}
+      />,
+    );
+    mocks.recorders[0].stop();
+    expect(screen.queryByText(/Voice note:/)).toBeNull();
+    expect(onSendFile).not.toHaveBeenCalled();
   });
 
   it("sends a picked file without the voice marker", async () => {
