@@ -5033,6 +5033,32 @@ class WebBridge:
             raise WebBridgeError(
                 "public channels are not enabled; run serve --channels"
             )
+        cleaned_contact: Optional[Dict[str, Any]] = None
+        if contact is not None:
+            cleaned_contact = clean_contact(contact)
+            if cleaned_contact is None:
+                raise ValueError(
+                    "contact must have a name and a 32 character hex "
+                    "destination hash"
+                )
+            # Same refusals as direct and group sends: never publish
+            # your own card, and never amplify a blocked peer to a
+            # channel, failing closed if the block-list is unreadable.
+            if cleaned_contact["destination_hash"] == getattr(
+                self.node, "destination_hexhash", ""
+            ):
+                raise ValueError(
+                    "cannot share your own contact: the recipient "
+                    "already has your hash"
+                )
+            blocklist = getattr(self.node, "blocklist", None)
+            if blocklist is None:
+                raise ValueError(
+                    "cannot share a contact: the block-list could not "
+                    "be read"
+                )
+            if blocklist.is_blocked(cleaned_contact["destination_hash"]):
+                raise ValueError("cannot share a contact for a blocked peer")
         expires_at = None
         if expires_in is not None:
             expires_at = time.time() + float(expires_in)
@@ -5043,7 +5069,7 @@ class WebBridge:
             reply_to=reply_to,
             expires_at=expires_at,
             location=location,
-            contact=contact,
+            contact=cleaned_contact if cleaned_contact is not None else contact,
         )
 
     def channel_edit(
