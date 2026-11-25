@@ -4326,3 +4326,72 @@ def test_cli_channel_export_rejects_bad_name(tmp_path, capsys):
         == 2
     )
     assert "error" in capsys.readouterr().err
+
+
+def test_cli_channel_export_rejects_unknown_channel(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    capsys.readouterr()
+
+    assert (
+        main(["channel", "export", "--data-dir", str(data_dir), "nowhere"]) == 2
+    )
+    err = capsys.readouterr().err
+    assert "unknown channel" in err
+
+
+def test_export_channel_document_includes_messages_beyond_one_page(
+    identities, tmp_path
+):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    for index in range(120):
+        create_message(
+            conn, alice, "general", f"msg {index}", name="alice", now=1000 + index
+        )
+
+    document = export_channel_document(conn, "general")
+
+    assert len(document["messages"]) == 120
+    assert [item["text"] for item in document["messages"]] == [
+        f"msg {index}" for index in range(120)
+    ]
+
+
+def test_cli_channel_export_hides_blocked_authors(identities, tmp_path, capsys):
+    _, bob = identities
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    config = TauConfig.resolve(data_dir=data_dir, name="alice")
+    conn = init_db(config.channels_db_path)
+    bob_message = create_message(conn, bob, "general", "from bob", name="bob", now=1000)
+    conn.close()
+    save_blocklist(
+        config.blocklist_path,
+        BlockList(blocked=frozenset({bob_message["author"]})),
+    )
+    capsys.readouterr()
+
+    assert (
+        main(["channel", "export", "--data-dir", str(data_dir), "general"]) == 0
+    )
+    assert json.loads(capsys.readouterr().out)["messages"] == []
+
+
+def test_cli_channel_export_fails_closed_on_unreadable_blocklist(
+    identities, tmp_path, capsys
+):
+    _, bob = identities
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    config = TauConfig.resolve(data_dir=data_dir, name="alice")
+    conn = init_db(config.channels_db_path)
+    create_message(conn, bob, "general", "from bob", name="bob", now=1000)
+    conn.close()
+    config.blocklist_path.write_text("not a blocklist", encoding="utf-8")
+    capsys.readouterr()
+
+    assert (
+        main(["channel", "export", "--data-dir", str(data_dir), "general"]) == 0
+    )
+    assert json.loads(capsys.readouterr().out)["messages"] == []

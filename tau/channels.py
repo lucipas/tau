@@ -2601,21 +2601,38 @@ def export_channel_document(
 
     Messages are the ones a reader sees — expired and retracted
     messages are left out, exactly as :func:`channel_history` shows
-    them — in stored (oldest-first) order, bounded by the per-channel
-    store cap.  Each message keeps its stored shape (hash, author,
-    text, timestamps, reply linkage).  The document is export-only:
-    there is no channel import, because sync already re-fetches posts
-    from peers and re-ingesting an export would need the full gossip
-    verification path.
+    them — in stored (oldest-first) order.  Every retained message is
+    included: history is walked page by page, so pinned messages kept
+    beyond the newest-500 window are not dropped.  Each message keeps
+    its stored shape (hash, author, text, timestamps, reply linkage).
+    The document is export-only: there is no channel import, because
+    sync already re-fetches posts from peers and re-ingesting an
+    export would need the full gossip verification path.
     """
     name = clean_channel_name(channel)
-    messages = channel_messages_visible(conn, name)
+    newest_first: List[Dict[str, Any]] = []
+    before: Optional[float] = None
+    before_hash: Optional[str] = None
+    while True:
+        page, has_more = channel_history_page(
+            conn,
+            name,
+            limit=MAX_CHANNEL_HISTORY,
+            before=before,
+            before_hash=before_hash,
+            apply_edits=False,
+        )
+        newest_first.extend(page)
+        if not has_more or not page:
+            break
+        before = float(page[-1]["created_at"])
+        before_hash = str(page[-1]["hash"])
     return {
         "format": CHANNEL_EXPORT_FORMAT,
         "version": CHANNEL_EXPORT_VERSION,
         "channel": name,
         "exported_at": time.time(),
-        "messages": list(reversed(messages)),
+        "messages": list(reversed(newest_first)),
     }
 
 

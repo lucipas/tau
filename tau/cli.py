@@ -10800,11 +10800,36 @@ def cmd_channel_export(args: argparse.Namespace) -> int:
     except ChannelError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    # Same block rules the reader applies: a blocked author's stored
+    # posts stay out of the archive, and an unreadable block-list
+    # fails closed, leaving the archive without messages.
+    blocked = load_blocked_set(config.blocklist_path)
+    app = ChannelApp(config, _tan_identity(config), name=config.name)
+    is_member = any(item["channel"] == name for item in app.memberships())
     conn = init_channel_db(config.channels_db_path)
     try:
+        # A channel the node has never seen is an error, not an empty
+        # archive; a joined channel with no messages still exports.
+        has_messages = conn.execute(
+            "SELECT 1 FROM messages WHERE channel = ? LIMIT 1", (name,)
+        ).fetchone()
+        has_topic = conn.execute(
+            "SELECT 1 FROM topics WHERE channel = ?", (name,)
+        ).fetchone()
+        if not is_member and has_messages is None and has_topic is None:
+            print(f"error: unknown channel: {args.channel!r}", file=sys.stderr)
+            return 2
         document = export_channel_document(conn, name)
     finally:
         conn.close()
+    if blocked is None:
+        document["messages"] = []
+    else:
+        document["messages"] = [
+            message
+            for message in document["messages"]
+            if str(message.get("author", "")) not in blocked
+        ]
     count = len(document["messages"])
     text = json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True)
     if getattr(args, "output", None):
