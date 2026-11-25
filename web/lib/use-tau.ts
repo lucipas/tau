@@ -184,11 +184,10 @@ export function useTau(): UseTauResult {
   const restTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const retryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const stopped = useRef(false);
-  // Count of groups events seen, and the newest group list they carried.
-  // A REST refresh that started before a groups event must not replace
-  // the flags that event set with its older response.
+  // Count of groups events seen. A REST refresh that started before a
+  // groups event must not replace the flags that event set with its
+  // older response.
   const groupsSeq = useRef(0);
-  const latestGroups = useRef<Group[] | null>(null);
 
   snapshotRef.current = snapshot;
 
@@ -200,7 +199,6 @@ export function useTau(): UseTauResult {
     }
     if (event.type === "groups") {
       groupsSeq.current += 1;
-      latestGroups.current = (event as { groups: Group[] }).groups;
     }
     if (!current) return;
     // Functional update: several live events can land in one batch, and
@@ -226,11 +224,34 @@ export function useTau(): UseTauResult {
   }, []);
 
   const refresh = useCallback(async (): Promise<Snapshot | null> => {
+    // A groups event that lands while this fetch is in flight carries
+    // newer ignore flags than the snapshot being fetched: the fetched
+    // list must not overwrite them (#784).
+    const groupsSeqAtStart = groupsSeq.current;
     try {
       const snap = await getStatus();
-      setSnapshot(snap);
+      let next = snap;
+      if (groupsSeq.current !== groupsSeqAtStart) {
+        // Keep the live flags (and any groups the live list learned
+        // since) instead of letting the stale fetch overwrite them.
+        // The fetched snapshot still wins for everything else.
+        const prev = snapshotRef.current;
+        if (prev) {
+          const live = new Map(prev.groups.map((g) => [g.id, g]));
+          const merged = snap.groups.map((g) => {
+            const current = live.get(g.id);
+            return current ? { ...g, ignored: current.ignored } : g;
+          });
+          const fetchedIds = new Set(snap.groups.map((g) => g.id));
+          for (const g of prev.groups) {
+            if (!fetchedIds.has(g.id)) merged.push(g);
+          }
+          next = { ...snap, groups: merged };
+        }
+      }
+      setSnapshot(next);
       setError(null);
-      return snap;
+      return next;
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       return null;

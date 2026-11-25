@@ -220,6 +220,45 @@ describe("useTau live socket", () => {
     expect(result.current.groups[0].ignored).toBe(true);
   });
 
+  it("keeps live group flags when a stale refresh resolves after a groups event", async () => {
+    const group: Group = {
+      id: "g".repeat(32),
+      name: "crew",
+      members: [],
+      created_at: 900,
+      topic: "",
+      created_by_me: true,
+      can_leave: false,
+      ignored: false,
+    };
+    // Hold the mount refresh: it resolves only after the groups event lands.
+    let resolveFetch!: (value: Response) => void;
+    fetchImpl = () =>
+      new Promise<Response>((resolve) => {
+        resolveFetch = resolve;
+      });
+    const { result } = renderHook(() => useTau());
+    const ws = FakeWebSocket.instances[0];
+    await act(async () => {
+      ws.open();
+      ws.receive({ type: "snapshot", snapshot: makeSnapshot({ groups: [group] }) });
+    });
+    await waitFor(() => expect(result.current.groups).toHaveLength(1));
+    await act(async () => {
+      ws.receive({ type: "groups", groups: [{ ...group, ignored: true }] });
+    });
+    expect(result.current.groups[0].ignored).toBe(true);
+    // The stale refresh resolves with the pre-event snapshot: the live flag must survive.
+    await act(async () => {
+      resolveFetch({
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify(makeSnapshot({ groups: [group] })),
+      } as Response);
+    });
+    expect(result.current.groups[0].ignored).toBe(true);
+  });
+
   it("falls back to REST when WebSocket is unavailable", async () => {
     vi.unstubAllGlobals();
     vi.stubGlobal(
