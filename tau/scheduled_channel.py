@@ -35,6 +35,17 @@ published message is the same one an immediate send would have
 made.  Queue files written before cards could be scheduled carry
 no ``contact`` and load with no card, exactly as before.
 
+An explicit expiry queues the same way (``tau channel send
+--expire 2h --delay 5m``): the queued entry carries the lifetime in
+seconds from publish, and the publish pass signs the message with
+``expires_at`` set that far past the publish time, so the published
+message disappears exactly like an immediate ``--expire`` send
+would.  The explicit expiry wins over the channel's disappearing
+default at publish time, the same way an explicit ``expires_at``
+wins in ``ChannelApp.send``.  Queue files written before expiries
+could be scheduled carry no ``expires_in`` and load with no explicit
+expiry, exactly as before.
+
 Entries are validated on load the way the other small JSON stores
 are: a malformed file raises rather than silently dropping queued
 messages, and the mail-loop publisher treats a corrupt queue as
@@ -45,6 +56,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import secrets
 import time
@@ -53,7 +65,13 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
-from .protocol import ProtocolError, clean_contact, clean_location, normalize_message
+from .protocol import (
+    MAX_MAIL_TTL,
+    ProtocolError,
+    clean_contact,
+    clean_location,
+    normalize_message,
+)
 from .util import atomic_write_json, ensure_dir
 
 log = logging.getLogger(__name__)
@@ -239,6 +257,29 @@ def _clean_contact(value: Any) -> Optional[Dict[str, Any]]:
     return cleaned
 
 
+def _clean_expires_in(value: Any) -> Optional[float]:
+    # None stays None (no explicit expiry — the publish pass falls
+    # back to the channel's disappearing default, exactly like an
+    # immediate send with no --expire).  A present value must be a
+    # positive lifetime no longer than the mail TTL, or the entry is
+    # malformed: a scheduled message must not silently drop an expiry
+    # the user asked for, and an expiry longer than the envelope that
+    # might carry the message could never be honoured.
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ScheduledChannelError(
+            "scheduled channel message expires_in must be a number of seconds"
+        )
+    seconds = float(value)
+    if not math.isfinite(seconds) or seconds <= 0 or seconds > MAX_MAIL_TTL:
+        raise ScheduledChannelError(
+            "scheduled channel message expires_in must be more than 0s and "
+            "at most 30d"
+        )
+    return seconds
+
+
 def channel_contact_refusal(
     contact: Dict[str, Any],
     *,
@@ -306,6 +347,14 @@ class ScheduledChannelMessage:
     # "destination_hash": <32 hex>}``.  Defaults to None so queue
     # files written before cards could be scheduled load unchanged.
     contact: Optional[Dict[str, Any]] = None
+    # An explicit expiry on the queued message, in seconds from
+    # publish, like an immediate ``tau channel send --expire``: the
+    # publish pass signs the message with ``expires_at`` that far past
+    # the publish time.  Defaults to None so queue files written
+    # before expiries could be scheduled load unchanged — and a None
+    # here means the channel's disappearing default applies at
+    # publish time, exactly like an immediate send with no --expire.
+    expires_in: Optional[float] = None
 
     def __post_init__(self) -> None:
         # A frozen dataclass still builds through __init__: validate
@@ -327,6 +376,7 @@ class ScheduledChannelMessage:
         object.__setattr__(self, "options", _clean_options(self.options))
         object.__setattr__(self, "location", _clean_location(self.location))
         object.__setattr__(self, "contact", _clean_contact(self.contact))
+        object.__setattr__(self, "expires_in", _clean_expires_in(self.expires_in))
         if self.kind == "poll":
             # A poll is a top-level entry: its options are fixed at
             # schedule time.
@@ -363,6 +413,7 @@ class ScheduledChannelMessage:
             "options": list(self.options),
             "location": self.location,
             "contact": self.contact,
+            "expires_in": self.expires_in,
         }
 
     @classmethod
@@ -386,6 +437,7 @@ class ScheduledChannelMessage:
             options=_clean_options(data.get("options")),
             location=_clean_location(data.get("location")),
             contact=_clean_contact(data.get("contact")),
+            expires_in=_clean_expires_in(data.get("expires_in")),
         )
 
 
@@ -614,6 +666,7 @@ def schedule_channel_message(
     options: Optional[Sequence[str]] = None,
     location: Optional[Dict[str, Any]] = None,
     contact: Optional[Dict[str, Any]] = None,
+    expires_in: Optional[float] = None,
     disappearing_path: Optional[Union[str, Path]] = None,
 ) -> ScheduledChannelMessage:
     """Queue a channel message for *publish_at*; returns the stored entry.
@@ -651,6 +704,17 @@ def schedule_channel_message(
     immediate ``tau channel send --contact``: it is validated here,
     rides in the measured envelope, and the publish pass attaches it
     when the message goes out.  A poll cannot carry one.
+
+    An *expires_in* makes the queued message a disappearing one, like
+    an immediate ``tau channel send --expire``: seconds from publish
+    until the message expires, at most the 30-day mail TTL.  It is
+    validated here, rides in the measured envelope as ``expires_at``
+    that far past the publish time, and the publish pass signs the
+    message with that expiry — winning over the channel's
+    disappearing default, exactly like an explicit ``expires_at``
+    wins in ``ChannelApp.send``.  A poll can carry one: expiry is
+    not a top-level attachment like a pin or a card, and the protocol
+    already allows ``expires_at`` on poll messages.
     """
     clean_channel = _clean_channel(channel)
     clean_text = _clean_text(text)
@@ -683,16 +747,18 @@ def schedule_channel_message(
     clean_contact_value = _clean_contact(contact)
     if clean_kind == "poll" and clean_contact_value is not None:
         raise ScheduledChannelError("a scheduled poll cannot carry a contact card")
+    clean_expires_in = _clean_expires_in(expires_in)
     envelope = {
         # Placeholder author/key at their real lengths (destination
         # hash 32 hex, RNS public key 128 hex): a shorter placeholder
         # would admit a message that only fails once signed.  The
         # remaining signed fields are carried at their real shape too:
         # the version and an empty reply target.  An expiry rides
-        # only when the channel has a disappearing default — the
-        # publish pass applies that same default, and a channel
-        # without one publishes with no expiry at all, so sizing
-        # one in here would reject a poll that fits on the wire.
+        # only when the message will actually carry one at publish
+        # time — an explicit *expires_in* here, else the channel's
+        # disappearing default — and a channel without either
+        # publishes with no expiry at all, so sizing one in here
+        # would reject a poll that fits on the wire.
         "v": CHANNEL_VERSION,
         "channel": clean_channel,
         "author": "0" * 32,
@@ -703,7 +769,9 @@ def schedule_channel_message(
         "reply_to": "",
     }
     default_expire = channel_default_for(disappearing_path, clean_channel)
-    if default_expire is not None:
+    if clean_expires_in is not None:
+        envelope["expires_at"] = publish_at + clean_expires_in
+    elif default_expire is not None:
         envelope["expires_at"] = publish_at + default_expire
     if clean_kind == "poll":
         envelope["poll_options"] = list(clean_options)
@@ -727,6 +795,7 @@ def schedule_channel_message(
         options=clean_options,
         location=clean_location_value,
         contact=clean_contact_value,
+        expires_in=clean_expires_in,
     )
     with scheduled_channel_messages_lock(path):
         queue = load_scheduled_channel_messages(path)
@@ -745,13 +814,16 @@ def schedule_channel_poll(
     ttl: int = 3,
     now: Optional[float] = None,
     name: Optional[str] = None,
+    expires_in: Optional[float] = None,
     disappearing_path: Optional[Union[str, Path]] = None,
 ) -> ScheduledChannelMessage:
     """Queue a poll for *publish_at*; returns the stored entry.
 
     Thin wrapper over :func:`schedule_channel_message` with
     ``kind="poll"``: the question is the entry text and the options
-    ride alongside it.
+    ride alongside it.  An *expires_in* makes the poll a disappearing
+    one, seconds from publish until it expires, like an immediate
+    poll's channel disappearing default — only explicit.
     """
     return schedule_channel_message(
         path,
@@ -764,6 +836,7 @@ def schedule_channel_poll(
         name=name,
         kind="poll",
         options=options,
+        expires_in=expires_in,
         disappearing_path=disappearing_path,
     )
 
@@ -910,7 +983,11 @@ def publish_due_scheduled_channel_messages(
     signed message is created once and its hash saved before sending,
     so retries re-send the same message.  Peers that already accepted
     it are not sent it again.  A queued poll publishes the same way,
-    through ``app.send`` with its question and fixed options.
+    through ``app.send`` with its question and fixed options.  A queued
+    message with an explicit expiry publishes with ``expires_at`` that
+    far past the publish time, winning over the channel's disappearing
+    default; without one the default applies, exactly like an
+    immediate send.
 
     A failed attempt (exception or per-peer errors) keeps the entry
     queued with exponential backoff.  After ``MAX_PUBLISH_ATTEMPTS`` it
@@ -1013,6 +1090,11 @@ def publish_due_scheduled_channel_messages(
                             message.channel,
                             message.text,
                             publish=False,
+                            expires_at=(
+                                at + message.expires_in
+                                if message.expires_in is not None
+                                else None
+                            ),
                             poll_options=(
                                 list(message.options)
                                 if message.kind == "poll"

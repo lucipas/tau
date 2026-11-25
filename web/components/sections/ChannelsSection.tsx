@@ -8,7 +8,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import Avatar from "@/components/chrome/Avatar";
 import UnreadChip from "@/components/chrome/UnreadChip";
 import { useHash } from "../chrome/useHash";
-import { formatCountdown, formatRelative, shortHash } from "@/lib/format";
+import { formatCountdown, formatDuration, formatRelative, shortHash } from "@/lib/format";
 import { addPeer, deleteDraft, getDrafts, getStatus, saveDraft } from "@/lib/api";
 import type { LocationPin, MessageDraft } from "@/lib/types";
 import { useChannels } from "@/lib/use-channels";
@@ -872,6 +872,12 @@ export default function ChannelsSection() {
                           {s.location && <ChannelLocationLink location={s.location} />}
                           {s.contact && (
                             <ChannelContactCard contact={s.contact} own />
+                          )}
+                          {s.expires_in != null && (
+                            <p className="text-xs text-zinc-500">
+                              Disappears {formatDuration(s.expires_in)} after
+                              publishing
+                            </p>
                           )}
                           {s.kind === "poll" &&
                             (s.options ?? []).map((option, i) => (

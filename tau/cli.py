@@ -10538,15 +10538,15 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
         return 2
 
     expires_at = None
+    expire_seconds = None
     expire_text = getattr(args, "expire", None)
     if expire_text is not None:
         try:
-            expires_at = time.time() + _parse_duration(
-                expire_text, flag="--expire"
-            )
+            expire_seconds = _parse_duration(expire_text, flag="--expire")
         except ValueError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
+        expires_at = time.time() + expire_seconds
 
     delay_text = getattr(args, "delay", None)
     if delay_text is not None:
@@ -10590,6 +10590,7 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
                 name=config.name,
                 location=location,
                 contact=contact,
+                expires_in=expire_seconds,
                 disappearing_path=config.disappearing_path,
             )
         except ScheduledChannelError as exc:
@@ -11416,6 +11417,11 @@ def cmd_channel_scheduled(args: argparse.Namespace) -> int:
             # A queued card prints under the text the way it renders
             # in the console once published.
             print(f"  {contact_default_text(card)}")
+        if entry.expires_in is not None:
+            # A queued expiry prints under the text, so a scheduled
+            # disappearing message reads in the terminal the way it
+            # renders in the console once published.
+            print(f"  disappears {_ago(entry.expires_in)} after publishing")
         if entry.kind == "poll":
             for index, option in enumerate(entry.options, start=1):
                 print(f"    {index}. {option}")

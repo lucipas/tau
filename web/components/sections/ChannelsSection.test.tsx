@@ -38,6 +38,7 @@ beforeEach(() => {
             paused_at: 0,
             location: { lat: 34.05, lon: -83.88, name: "Rock Springs Park" },
             contact: { name: "carol", destination_hash: "c".repeat(32) },
+            expires_in: 7200,
           },
           {
             id: "cd34ef56ab78ab12",
@@ -433,6 +434,8 @@ describe("ChannelsSection", () => {
     // The queued card renders like a published one — only the
     // scheduled row carries one in this fixture.
     expect(await screen.findByText("👤 carol")).toBeTruthy();
+    // The queued expiry renders as a disappearing note.
+    expect(screen.getByText("Disappears 2h after publishing")).toBeTruthy();
     // One Cancel per scheduled entry (message + poll).
     const cancelButtons = screen.getAllByRole("button", { name: "Cancel" });
     expect(cancelButtons.length).toBe(2);

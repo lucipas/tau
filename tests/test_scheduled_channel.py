@@ -525,6 +525,103 @@ def test_schedule_contact_wire_preflight(tmp_path):
     assert load_scheduled_channel_messages(path).messages[0].id == entry.id
 
 
+def test_schedule_expires_in_round_trip(tmp_path):
+    path = tmp_path / "scheduled-channel-messages.json"
+    entry = schedule_channel_message(
+        path,
+        channel="general",
+        text="goodbye soon",
+        publish_at=2000.0,
+        now=1000.0,
+        expires_in=7200.0,
+    )
+    queue = load_scheduled_channel_messages(path)
+    assert len(queue) == 1
+    assert queue.messages[0] == entry
+    assert entry.expires_in == 7200.0
+    assert entry.to_dict()["expires_in"] == 7200.0
+
+
+def test_queue_without_expires_in_loads_with_no_expiry(tmp_path):
+    # Queue files written before expiries could be scheduled carry no
+    # expires_in: they load with no explicit expiry, exactly as
+    # before — and a hand-built entry without one publishes with the
+    # channel's disappearing default, like an immediate send.
+    entry = _message()
+    assert entry.expires_in is None
+    loaded = ScheduledChannelMessage.from_dict(
+        {
+            "id": "a" * 16,
+            "channel": "general",
+            "text": "old hello",
+            "publish_at": 1000.0,
+            "created_at": 900.0,
+        }
+    )
+    assert loaded.expires_in is None
+
+
+def test_schedule_rejects_bad_expires_in(tmp_path):
+    path = tmp_path / "scheduled-channel-messages.json"
+    for bad in (0, -5, 0.0, 30 * 24 * 60 * 60 + 1, "2h", True, float("nan")):
+        with pytest.raises(ScheduledChannelError, match="expires_in"):
+            schedule_channel_message(
+                path,
+                channel="general",
+                text="goodbye soon",
+                publish_at=1000.0,
+                now=900.0,
+                expires_in=bad,
+            )
+    assert load_scheduled_channel_messages(path).messages == ()
+
+
+def test_schedule_poll_accepts_expires_in(tmp_path):
+    # Expiry is not a top-level attachment like a pin or a card, so a
+    # scheduled poll can carry one — the protocol already allows
+    # expires_at on poll messages.
+    path = tmp_path / "scheduled-channel-messages.json"
+    entry = schedule_channel_poll(
+        path,
+        channel="general",
+        question="which day?",
+        options=["Saturday", "Sunday"],
+        publish_at=2000.0,
+        now=1000.0,
+        expires_in=3600.0,
+    )
+    assert load_scheduled_channel_messages(path).messages[0].expires_in == 3600.0
+    assert entry.to_dict()["expires_in"] == 3600.0
+
+
+def test_schedule_expires_in_wire_preflight(tmp_path):
+    # 1,922 emoji fit the 8 KiB envelope on their own but overflow
+    # once the expiry (~20 bytes) rides along: refuse at schedule
+    # time, instead of failing every publish attempt forever.  Nothing
+    # is saved.
+    path = tmp_path / "scheduled-channel-messages.json"
+    with pytest.raises(ScheduledChannelError, match="too large"):
+        schedule_channel_message(
+            path,
+            channel="general",
+            text="😀" * 1922,
+            publish_at=1000.0,
+            now=900.0,
+            expires_in=3600.0,
+        )
+    assert load_scheduled_channel_messages(path).messages == ()
+    # And 1,917 emoji with the same expiry still fit.
+    entry = schedule_channel_message(
+        path,
+        channel="general",
+        text="😀" * 1917,
+        publish_at=1000.0,
+        now=900.0,
+        expires_in=3600.0,
+    )
+    assert load_scheduled_channel_messages(path).messages[0].id == entry.id
+
+
 def test_cancel_scheduled_channel_message_end_to_end(tmp_path):
     path = tmp_path / "scheduled-channel-messages.json"
     entry = schedule_channel_message(
@@ -755,8 +852,8 @@ class _FakeChannelApp:
         self.fail_with_errors = fail_with_errors
 
     def send(
-        self, channel, text, *, publish=False, poll_options=None, location=None,
-        contact=None,
+        self, channel, text, *, publish=False, expires_at=None, poll_options=None,
+        location=None, contact=None,
     ):
         message = {
             "hash": "c" * 64,
@@ -764,6 +861,8 @@ class _FakeChannelApp:
             "text": text,
             "created_at": 2000.0,
         }
+        if expires_at is not None:
+            message["expires_at"] = expires_at
         if poll_options is not None:
             message["poll_options"] = list(poll_options)
         if location is not None:
@@ -883,6 +982,48 @@ def test_publish_due_attaches_contact(tmp_path):
     queue = load_scheduled_channel_messages(path)
     assert all(entry.id != shared.id for entry in queue.messages)
     assert len(queue) == 0
+
+
+def test_publish_due_applies_expires_in(tmp_path):
+    # The published message expires that far past the publish time, so
+    # it disappears exactly like one sent immediately with the same
+    # --expire — and the explicit expiry wins over any channel
+    # disappearing default, which the fake app never applies.
+    path = tmp_path / "scheduled-channel-messages.json"
+    expiring = schedule_channel_message(
+        path,
+        channel="general",
+        text="goodbye soon",
+        publish_at=1000.0,
+        now=900.0,
+        expires_in=7200.0,
+    )
+    app = _FakeChannelApp()
+
+    result = publish_due_scheduled_channel_messages(path, app, now=2000.0)
+    assert result == {"published": 1, "kept": 0}
+    assert len(app.created) == 1
+    assert app.created[0]["text"] == "goodbye soon"
+    assert app.created[0]["expires_at"] == 2000.0 + 7200.0
+    assert app.published[0][0]["expires_at"] == 2000.0 + 7200.0
+    queue = load_scheduled_channel_messages(path)
+    assert all(entry.id != expiring.id for entry in queue.messages)
+    assert len(queue) == 0
+
+
+def test_publish_due_without_expires_in_passes_no_expiry(tmp_path):
+    # Without an explicit expiry the publish pass passes none, so the
+    # channel's disappearing default applies at send time — exactly
+    # like an immediate send with no --expire.
+    path = tmp_path / "scheduled-channel-messages.json"
+    schedule_channel_message(
+        path, channel="general", text="hello", publish_at=1000.0, now=900.0
+    )
+    app = _FakeChannelApp()
+
+    result = publish_due_scheduled_channel_messages(path, app, now=2000.0)
+    assert result == {"published": 1, "kept": 0}
+    assert "expires_at" not in app.created[0]
 
 
 def test_channel_contact_refusal_policy():
@@ -1040,6 +1181,30 @@ def test_edit_scheduled_message_keeps_contact(tmp_path):
     )
     assert edited.contact == CARD
     assert load_scheduled_channel_messages(path).messages[0].contact == CARD
+
+
+def test_edit_scheduled_message_keeps_expires_in(tmp_path):
+    # Editing an expiring entry's text keeps its expiry, and the edit
+    # preflight measures the expiry: 1,920 emoji fit without one but
+    # overflow with it, so that edit is refused while a 1,910-emoji
+    # edit (which fits with the expiry) goes through with the expiry
+    # intact.
+    path = tmp_path / "scheduled-channel-messages.json"
+    entry = schedule_channel_message(
+        path,
+        channel="general",
+        text="goodbye soon",
+        publish_at=5000.0,
+        now=1000.0,
+        expires_in=3600.0,
+    )
+    with pytest.raises(ScheduledChannelError, match="too large"):
+        edit_scheduled_channel_message(path, entry.id, text="😀" * 1920, now=1500.0)
+    edited = edit_scheduled_channel_message(
+        path, entry.id, text="😀" * 1910, now=1500.0
+    )
+    assert edited.expires_in == 3600.0
+    assert load_scheduled_channel_messages(path).messages[0].expires_in == 3600.0
 
 
 def test_publish_due_keeps_failed_messages_queued(tmp_path):

@@ -262,7 +262,7 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/channels/join  join a channel (``{"channel": "<name>"}``)
     POST /api/channels/leave leave a channel (``{"channel": "<name>"}``)
     POST /api/channels/send  send a message to a joined channel (``{"channel", "text", "reply_to"?, "expires_in"?, "location"?, "contact"?}``; ``expires_in`` seconds, at most 30d; ``location`` is ``{"lat", "lon", "name"?}`` and is refused on a reply; ``contact`` is ``{"name", "destination_hash"}`` and is refused on a reply)
-    POST /api/channels/schedule  schedule a channel message — or a poll, with ``"poll_options"`` — for later
+    POST /api/channels/schedule  schedule a channel message — or a poll, with ``"poll_options"`` — for later (optional ``"expires_in"`` seconds from publish until it expires)
     GET  /api/channels/scheduled  queued channel messages and polls, soonest first
     POST /api/channels/cancel-scheduled  cancel a queued channel message or poll
     POST /api/channels/edit-scheduled  edit a queued channel message's text/time
@@ -5203,6 +5203,7 @@ class WebBridge:
         poll_options: Optional[List[str]] = None,
         location: Optional[Dict[str, Any]] = None,
         contact: Optional[Dict[str, Any]] = None,
+        expires_in: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Queue a channel message for later, like ``tau channel send --delay``.
 
@@ -5217,7 +5218,9 @@ class WebBridge:
         pins a place on the queued message, like an immediate send;
         a poll cannot carry one.  A *contact* shares a peer's card on
         the queued message, like an immediate send; a poll cannot
-        carry one either.
+        carry one either.  An *expires_in* makes the queued message a
+        disappearing one, seconds from publish until it expires, like
+        an immediate send's ``expires_in`` — and a poll can carry one.
         """
         from .channels import clean_channel_name, is_member
         from .scheduled_channel import schedule_channel_message, schedule_channel_poll
@@ -5243,6 +5246,7 @@ class WebBridge:
                 options=poll_options,
                 publish_at=time.time() + float(send_in),
                 name=getattr(self.node, "name", None),
+                expires_in=expires_in,
                 disappearing_path=config.disappearing_path,
             )
             return entry.to_dict()
@@ -5254,6 +5258,7 @@ class WebBridge:
             name=getattr(self.node, "name", None),
             location=location,
             contact=self._vet_channel_contact(contact),
+            expires_in=expires_in,
             disappearing_path=config.disappearing_path,
         )
         return entry.to_dict()
@@ -17767,12 +17772,34 @@ class _WebHandler(BaseHTTPRequestHandler):
                             400,
                         )
                         return
+                expires_in = body.get("expires_in")
+                if expires_in is not None and (
+                    not isinstance(expires_in, (int, float))
+                    or isinstance(expires_in, bool)
+                    or not _valid_expires_in(expires_in)
+                ):
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "field 'expires_in' must be a number of "
+                                "seconds (0 < expires_in <= 2592000)"
+                            }
+                        },
+                        head_only,
+                        400,
+                    )
+                    return
                 try:
                     scheduled = self.bridge.channel_schedule(
                         channel, text, send_in=float(send_in),
                         poll_options=poll_options,
                         location=body.get("location"),
                         contact=body.get("contact"),
+                        expires_in=(
+                            float(expires_in)
+                            if expires_in is not None
+                            else None
+                        ),
                     )
                 except (ValueError, ProtocolError) as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
