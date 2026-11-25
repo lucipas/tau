@@ -280,6 +280,8 @@ export interface JoinRequest {
   peer: string;
   peer_name: string;
   group_id: string;
+  requested_at?: number;
+  expires_at?: number;
   created_at?: number;
   [key: string]: unknown;
 }
