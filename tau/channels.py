@@ -200,6 +200,7 @@ from .protocol import (
     clean_group_poll_target,
     clean_group_poll_vote,
     clean_group_topic,
+    clean_contact,
     clean_location,
     clean_reaction,
     decode,
@@ -350,6 +351,7 @@ _MESSAGE_COLUMNS = (
     "poll_close",
     "reply_to",
     "location",
+    "contact",
 )
 
 # Column order for reaction rows.  A reaction is keyed by
@@ -454,6 +456,12 @@ def _canonical_body(message: Dict[str, Any]) -> bytes:
         # a pin; absent for plain messages, whose hashes — and
         # verification — are unchanged.
         body["location"] = location
+    contact = message.get("contact")
+    if contact is not None:
+        # Covered by the hash when present, so a relay cannot strip
+        # a shared card; absent for plain messages, whose hashes — and
+        # verification — are unchanged.
+        body["contact"] = contact
     return json.dumps(
         body,
         ensure_ascii=False,
@@ -612,6 +620,26 @@ def _normalize_message(mesg: Dict[str, Any], *, now: Optional[float] = None) -> 
                 "top-level message, not a reply or a poll"
             )
 
+    # A shared card belongs on a plain top-level message too, for the
+    # same reason: a reply already points at its parent, and a poll
+    # question carries its own structured payload.
+    raw_contact = mesg.get("contact")
+    cleaned_contact = None
+    if raw_contact is not None:
+        cleaned_contact = clean_contact(raw_contact)
+        if cleaned_contact is None:
+            raise ChannelError(
+                "channel message contact must be a card with a name "
+                "and a 32-character hex destination hash"
+            )
+        if reply_to or any(
+            mesg.get(field) is not None for field in POLL_FIELDS
+        ):
+            raise ChannelError(
+                "a channel contact card can only be attached to a "
+                "top-level message, not a reply or a poll"
+            )
+
     message = {
         "v": CHANNEL_VERSION,
         "channel": channel,
@@ -631,6 +659,8 @@ def _normalize_message(mesg: Dict[str, Any], *, now: Optional[float] = None) -> 
         message["poll_close"] = cleaned_close
     if cleaned_location is not None:
         message["location"] = cleaned_location
+    if cleaned_contact is not None:
+        message["contact"] = cleaned_contact
     _check_wire_size(message)
     return message
 
@@ -692,6 +722,11 @@ def _canonical_message(message: Dict[str, Any]) -> Dict[str, Any]:
         # Plain messages keep the old wire shape: the pin appears
         # only on located messages, matching how the hash treats it.
         canonical["location"] = message["location"]
+    if message.get("contact") is not None:
+        # Plain messages keep the old wire shape: the card appears
+        # only on messages that share one, matching how the hash
+        # treats it.
+        canonical["contact"] = message["contact"]
     return canonical
 
 
@@ -1383,7 +1418,8 @@ CREATE TABLE IF NOT EXISTS messages (
     poll_vote TEXT,
     poll_close TEXT,
     reply_to TEXT NOT NULL DEFAULT '',
-    location TEXT
+    location TEXT,
+    contact TEXT
 );
 
 CREATE INDEX IF NOT EXISTS messages_channel_created
@@ -1524,6 +1560,11 @@ def init_db(path: Optional[Union[str, Path]] = None) -> sqlite3.Connection:
     columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
     if "location" not in columns:
         conn.execute("ALTER TABLE messages ADD COLUMN location TEXT")
+    # Stores written before contact cards existed have no contact
+    # column: add it in place, the same way.
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
+    if "contact" not in columns:
+        conn.execute("ALTER TABLE messages ADD COLUMN contact TEXT")
     conn.execute(
         "INSERT OR IGNORE INTO meta(key, value) VALUES('version', ?)",
         (str(CHANNEL_VERSION),),
@@ -1554,6 +1595,11 @@ def _row_to_message(row: sqlite3.Row) -> Dict[str, Any]:
         record.pop("location", None)
     else:
         record["location"] = json.loads(raw_location)
+    raw_contact = record.get("contact")
+    if raw_contact is None:
+        record.pop("contact", None)
+    else:
+        record["contact"] = json.loads(raw_contact)
     return _canonical_message(record)
 
 
@@ -1835,8 +1881,8 @@ def store_message(
         with conn:
             conn.execute(
                 "INSERT INTO messages(v, hash, channel, author, key, name, text, "
-                "created_at, expires_at, received_at, sig, poll_options, poll_vote, poll_close, reply_to, location) "
-                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "created_at, expires_at, received_at, sig, poll_options, poll_vote, poll_close, reply_to, location, contact) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     CHANNEL_VERSION,
                     digest,
@@ -1854,6 +1900,7 @@ def store_message(
                     _dump_poll_field(message.get("poll_close")),
                     message.get("reply_to", ""),
                     _dump_poll_field(message.get("location")),
+                    _dump_poll_field(message.get("contact")),
                 ),
             )
             _prune_store(conn, message["channel"])
@@ -2163,6 +2210,7 @@ def create_message(
     poll_close: Optional[Dict[str, Any]] = None,
     reply_to: Optional[str] = None,
     location: Optional[Dict[str, Any]] = None,
+    contact: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Create, sign and store a message owned by *identity*.
 
@@ -2177,6 +2225,11 @@ def create_message(
     ``location`` pins a place on a top-level message (``{"lat": ..,
     "lon": .., "name": ..}``); it is covered by the hash when
     present, and refused on a reply or a poll.
+
+    ``contact`` shares a peer's card on a top-level message
+    (``{"name": .., "destination_hash": <32 hex>}``); it is covered
+    by the hash when present, and refused on a reply or a poll, like
+    a location pin.
 
     """
     timestamp = round(float(now if now is not None else time.time()), 3)
@@ -2207,6 +2260,8 @@ def create_message(
         body["reply_to"] = resolve_message_digest(conn, body["channel"], reply_to)
     if location is not None:
         body["location"] = location
+    if contact is not None:
+        body["contact"] = contact
     normalized = _normalize_message(body, now=timestamp)
     digest = hash_message(normalized)
     mesg = dict(normalized)
@@ -3470,6 +3525,7 @@ class ChannelApp:
         poll_close: Optional[Dict[str, Any]] = None,
         reply_to: Optional[str] = None,
         location: Optional[Dict[str, Any]] = None,
+        contact: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Create a message in a joined channel, gossiping it when asked.
 
@@ -3484,6 +3540,8 @@ class ChannelApp:
         ``reply_to`` is a parent message's hash or unique hex
         prefix in the same channel.  ``location`` pins a place on a
         top-level message; it is refused on a reply or a poll.
+        ``contact`` shares a peer's card on a top-level message; it
+        is refused on a reply or a poll, like a location pin.
         """
         name = clean_channel_name(channel)
         if expires_at is None:
@@ -3510,6 +3568,7 @@ class ChannelApp:
                 poll_close=poll_close,
                 reply_to=reply_to,
                 location=location,
+                contact=contact,
             )
         finally:
             conn.close()

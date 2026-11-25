@@ -223,6 +223,58 @@ describe("ChannelsSection", () => {
     expect(link.getAttribute("href")).toContain("mlat=34.05");
   });
 
+  it("renders a shared contact card with an Add peer button", async () => {
+    calls = mockFetch((url) => {
+      if (url.includes("/api/channels/messages")) {
+        return {
+          channel: "mesh-general",
+          messages: [
+            {
+              v: 1,
+              hash: "m4".padEnd(64, "0"),
+              channel: "mesh-general",
+              author: "b".repeat(32),
+              key: "b".repeat(32),
+              name: "bob",
+              text: "meet carol",
+              created_at: 1003,
+              received_at: 1003,
+              sig: "s",
+              contact: { name: "carol", destination_hash: "c".repeat(32) },
+            },
+          ],
+          count: 1,
+        };
+      }
+      if (url.includes("/api/channels/pins")) {
+        return { channel: "mesh-general", pins: [], count: 0 };
+      }
+      if (url.includes("/api/channels/scheduled")) {
+        return { channel: "mesh-general", scheduled: [], count: 0 };
+      }
+      if (url.includes("/api/channels/topic")) {
+        return { channel: "mesh-general", topic: null };
+      }
+      if (url.includes("/api/status")) {
+        return { node: { destination: "a".repeat(32) } };
+      }
+      if (url.includes("/api/channels")) {
+        return {
+          channels: [{ channel: "mesh-general", joined_at: 900 }],
+          count: 1,
+        };
+      }
+      return { ok: true };
+    }).calls;
+    render(<ChannelsSection />);
+    fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
+    expect(await screen.findByText("👤 carol")).toBeTruthy();
+    expect(screen.getByText(/tau:cccccccc/)).toBeTruthy();
+    fireEvent.click(await screen.findByRole("button", { name: /Add peer/ }));
+    await waitFor(() => expect(calls).toContain("POST /api/peers/add"));
+    expect(await screen.findByText(/Added — you can message them now/)).toBeTruthy();
+  });
+
   it("shows a pinned place's map link even when it left history", async () => {
     mockFetch((url) => {
       if (url.includes("/api/channels/messages")) {

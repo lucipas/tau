@@ -904,6 +904,8 @@ export interface ChannelMessage {
   reply_to?: string;
   /** Static location pin on a top-level message, if any. */
   location?: LocationPin;
+  /** Shared contact card on a top-level message, if any. */
+  contact?: { name: string; destination_hash: string };
   /** Present when the author edited this message; the text shown is the latest edit. */
   edited?: boolean;
   edited_at?: number;
