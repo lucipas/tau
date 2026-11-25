@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from tau.blocklist import BlockList
 from tau.disappearing import DisappearingDefaults, save_disappearing_defaults
 from tau.scheduled_channel import (
     MAX_PUBLISH_ATTEMPTS,
@@ -13,6 +14,7 @@ from tau.scheduled_channel import (
     ScheduledChannelMessage,
     ScheduledChannelMessages,
     cancel_scheduled_channel_message,
+    channel_contact_refusal,
     edit_scheduled_channel_message,
     load_scheduled_channel_messages,
     publish_due_scheduled_channel_messages,
@@ -881,6 +883,117 @@ def test_publish_due_attaches_contact(tmp_path):
     queue = load_scheduled_channel_messages(path)
     assert all(entry.id != shared.id for entry in queue.messages)
     assert len(queue) == 0
+
+
+def test_channel_contact_refusal_policy():
+    # The single policy for immediate and scheduled channel sends:
+    # a clean card for an allowed peer passes, and the refusals —
+    # own card, blocked peer, unreadable block-list — each name
+    # themselves.
+    card = {"name": "carol", "destination_hash": "cc" * 16}
+    assert (
+        channel_contact_refusal(card, own_hash="aa" * 16, blocklist=BlockList())
+        is None
+    )
+    assert "own contact" in (
+        channel_contact_refusal(
+            {"name": "me", "destination_hash": "aa" * 16},
+            own_hash="aa" * 16,
+            blocklist=BlockList(),
+        )
+        or ""
+    )
+    assert "blocked peer" in (
+        channel_contact_refusal(
+            card,
+            own_hash="aa" * 16,
+            blocklist=BlockList(blocked=frozenset({"cc" * 16})),
+        )
+        or ""
+    )
+    assert "block-list could not be read" in (
+        channel_contact_refusal(card, own_hash="aa" * 16, blocklist=None) or ""
+    )
+
+
+def test_publish_due_parks_refused_contact(tmp_path):
+    # A card whose peer was blocked after scheduling is never
+    # published: the entry parks at the attempt cap instead of
+    # burning retries, and stays queued for the user to cancel.
+    path = tmp_path / "scheduled-channel-messages.json"
+    entry = schedule_channel_message(
+        path,
+        channel="general",
+        text="meet carol",
+        publish_at=1000.0,
+        now=900.0,
+        contact=CARD,
+    )
+    app = _FakeChannelApp()
+    vetted = []
+
+    def refuse(card):
+        vetted.append(card)
+        return "cannot share a contact for a blocked peer"
+
+    result = publish_due_scheduled_channel_messages(
+        path, app, contact_refusal=refuse, now=2000.0
+    )
+    assert result == {"published": 0, "kept": 1}
+    assert vetted == [CARD]
+    assert app.created == []
+    assert app.published == []
+    queue = load_scheduled_channel_messages(path)
+    assert len(queue) == 1
+    assert queue.messages[0].id == entry.id
+    assert queue.messages[0].attempts == MAX_PUBLISH_ATTEMPTS
+    # A parked entry is never retried: a later pass leaves it alone.
+    result = publish_due_scheduled_channel_messages(
+        path, app, contact_refusal=refuse, now=3000.0
+    )
+    assert result == {"published": 0, "kept": 0}
+    assert app.created == []
+
+
+def test_publish_due_vet_refuses_stored_message_on_retry(tmp_path):
+    # The vet runs before a stored message is re-published too: a
+    # first attempt that fails to deliver, followed by the peer being
+    # blocked, must not send the stored copy on the retry.
+    path = tmp_path / "scheduled-channel-messages.json"
+    schedule_channel_message(
+        path,
+        channel="general",
+        text="meet carol",
+        publish_at=1000.0,
+        now=900.0,
+        contact=CARD,
+    )
+    app = _FakeChannelApp(fail_with_errors=True)
+
+    def allow(card):
+        return None
+
+    result = publish_due_scheduled_channel_messages(
+        path, app, contact_refusal=allow, now=2000.0
+    )
+    assert result == {"published": 0, "kept": 1}
+    assert len(app.created) == 1
+    assert app.published == []
+    queued = load_scheduled_channel_messages(path).messages[0]
+    assert queued.message_hash == "c" * 64
+    assert queued.attempts == 1
+
+    def refuse(card):
+        return "cannot share a contact for a blocked peer"
+
+    result = publish_due_scheduled_channel_messages(
+        path, app, contact_refusal=refuse, now=3000.0
+    )
+    assert result == {"published": 0, "kept": 1}
+    assert app.published == []
+    queued = load_scheduled_channel_messages(path).messages[0]
+    assert queued.message_hash == "c" * 64
+    assert queued.attempts == MAX_PUBLISH_ATTEMPTS
 
 
 def test_edit_scheduled_message_keeps_location(tmp_path):
