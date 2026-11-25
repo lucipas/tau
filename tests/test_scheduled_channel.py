@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from tau.blocklist import BlockList
 from tau.disappearing import DisappearingDefaults, save_disappearing_defaults
 from tau.scheduled_channel import (
     MAX_PUBLISH_ATTEMPTS,
@@ -13,6 +14,7 @@ from tau.scheduled_channel import (
     ScheduledChannelMessage,
     ScheduledChannelMessages,
     cancel_scheduled_channel_message,
+    channel_contact_refusal,
     edit_scheduled_channel_message,
     load_scheduled_channel_messages,
     publish_due_scheduled_channel_messages,
@@ -321,6 +323,8 @@ def test_queue_without_kind_loads_as_message(tmp_path):
 
 PIN = {"lat": 34.05, "lon": -83.88, "name": "Rock Springs Park"}
 
+CARD = {"name": "carol", "destination_hash": "cc" * 16}
+
 
 def test_schedule_location_round_trip(tmp_path):
     path = tmp_path / "scheduled-channel-messages.json"
@@ -417,6 +421,106 @@ def test_schedule_location_wire_preflight(tmp_path):
         publish_at=1000.0,
         now=900.0,
         location=PIN,
+    )
+    assert load_scheduled_channel_messages(path).messages[0].id == entry.id
+
+
+def test_schedule_contact_round_trip(tmp_path):
+    path = tmp_path / "scheduled-channel-messages.json"
+    entry = schedule_channel_message(
+        path,
+        channel="general",
+        text="meet carol",
+        publish_at=2000.0,
+        now=1000.0,
+        contact=CARD,
+    )
+    queue = load_scheduled_channel_messages(path)
+    assert len(queue) == 1
+    assert queue.messages[0] == entry
+    assert entry.contact == CARD
+    assert entry.to_dict()["contact"] == CARD
+
+
+def test_queue_without_contact_loads_with_no_card(tmp_path):
+    # Queue files written before cards could be scheduled carry no
+    # contact: they load with no card, exactly as before — and a
+    # hand-built entry without one publishes a plain message.
+    entry = _message()
+    assert entry.contact is None
+    loaded = ScheduledChannelMessage.from_dict(
+        {
+            "id": "a" * 16,
+            "channel": "general",
+            "text": "old hello",
+            "publish_at": 1000.0,
+            "created_at": 900.0,
+        }
+    )
+    assert loaded.contact is None
+
+
+def test_schedule_rejects_bad_contact(tmp_path):
+    path = tmp_path / "scheduled-channel-messages.json"
+    for bad in (
+        {"name": "carol"},
+        {"destination_hash": "cc" * 16},
+        {"name": "", "destination_hash": "cc" * 16},
+        {"name": "carol", "destination_hash": "xyz"},
+        {"name": "carol", "destination_hash": "cc" * 15},
+        "carol",
+    ):
+        with pytest.raises(ScheduledChannelError, match="contact is invalid"):
+            schedule_channel_message(
+                path,
+                channel="general",
+                text="meet carol",
+                publish_at=1000.0,
+                now=900.0,
+                contact=bad,
+            )
+    assert load_scheduled_channel_messages(path).messages == ()
+
+
+def test_schedule_poll_rejects_contact(tmp_path):
+    path = tmp_path / "scheduled-channel-messages.json"
+    with pytest.raises(ScheduledChannelError, match="cannot carry a contact card"):
+        schedule_channel_message(
+            path,
+            channel="general",
+            text="which day?",
+            publish_at=1000.0,
+            now=900.0,
+            kind="poll",
+            options=["Saturday", "Sunday"],
+            contact=CARD,
+        )
+    assert load_scheduled_channel_messages(path).messages == ()
+
+
+def test_schedule_contact_wire_preflight(tmp_path):
+    # 1,950 emoji fit the 8 KiB envelope on their own but overflow
+    # once the card (~70 bytes) rides along: refuse at schedule time,
+    # instead of failing every publish attempt forever.  Nothing is saved.
+    path = tmp_path / "scheduled-channel-messages.json"
+    with pytest.raises(ScheduledChannelError, match="too large"):
+        schedule_channel_message(
+            path,
+            channel="general",
+            text="😀" * 1950,
+            publish_at=1000.0,
+            now=900.0,
+            contact=CARD,
+        )
+    assert load_scheduled_channel_messages(path).messages == ()
+    # And 1,850 emoji with the same card still fit.
+    entry = schedule_channel_message(
+        path,
+        channel="general",
+        text="😀" * 1850,
+        publish_at=1000.0,
+        now=900.0,
+        contact=CARD,
     )
     assert load_scheduled_channel_messages(path).messages[0].id == entry.id
 
@@ -650,7 +754,10 @@ class _FakeChannelApp:
         self.fail_publish = fail_publish
         self.fail_with_errors = fail_with_errors
 
-    def send(self, channel, text, *, publish=False, poll_options=None, location=None):
+    def send(
+        self, channel, text, *, publish=False, poll_options=None, location=None,
+        contact=None,
+    ):
         message = {
             "hash": "c" * 64,
             "channel": channel,
@@ -661,6 +768,8 @@ class _FakeChannelApp:
             message["poll_options"] = list(poll_options)
         if location is not None:
             message["location"] = location
+        if contact is not None:
+            message["contact"] = contact
         self.created.append(message)
         self.stored[message["hash"]] = message
         return message
@@ -751,6 +860,142 @@ def test_publish_due_attaches_location(tmp_path):
     assert len(queue) == 0
 
 
+def test_publish_due_attaches_contact(tmp_path):
+    # The published message carries the queued card, so it renders
+    # exactly like one sent immediately with the same card.
+    path = tmp_path / "scheduled-channel-messages.json"
+    shared = schedule_channel_message(
+        path,
+        channel="general",
+        text="meet carol",
+        publish_at=1000.0,
+        now=900.0,
+        contact=CARD,
+    )
+    app = _FakeChannelApp()
+
+    result = publish_due_scheduled_channel_messages(path, app, now=2000.0)
+    assert result == {"published": 1, "kept": 0}
+    assert len(app.created) == 1
+    assert app.created[0]["text"] == "meet carol"
+    assert app.created[0]["contact"] == CARD
+    assert app.published[0][0]["contact"] == CARD
+    queue = load_scheduled_channel_messages(path)
+    assert all(entry.id != shared.id for entry in queue.messages)
+    assert len(queue) == 0
+
+
+def test_channel_contact_refusal_policy():
+    # The single policy for immediate and scheduled channel sends:
+    # a clean card for an allowed peer passes, and the refusals —
+    # own card, blocked peer, unreadable block-list — each name
+    # themselves.
+    card = {"name": "carol", "destination_hash": "cc" * 16}
+    assert (
+        channel_contact_refusal(card, own_hash="aa" * 16, blocklist=BlockList())
+        is None
+    )
+    assert "own contact" in (
+        channel_contact_refusal(
+            {"name": "me", "destination_hash": "aa" * 16},
+            own_hash="aa" * 16,
+            blocklist=BlockList(),
+        )
+        or ""
+    )
+    assert "blocked peer" in (
+        channel_contact_refusal(
+            card,
+            own_hash="aa" * 16,
+            blocklist=BlockList(blocked=frozenset({"cc" * 16})),
+        )
+        or ""
+    )
+    assert "block-list could not be read" in (
+        channel_contact_refusal(card, own_hash="aa" * 16, blocklist=None) or ""
+    )
+
+
+def test_publish_due_parks_refused_contact(tmp_path):
+    # A card whose peer was blocked after scheduling is never
+    # published: the entry parks at the attempt cap instead of
+    # burning retries, and stays queued for the user to cancel.
+    path = tmp_path / "scheduled-channel-messages.json"
+    entry = schedule_channel_message(
+        path,
+        channel="general",
+        text="meet carol",
+        publish_at=1000.0,
+        now=900.0,
+        contact=CARD,
+    )
+    app = _FakeChannelApp()
+    vetted = []
+
+    def refuse(card):
+        vetted.append(card)
+        return "cannot share a contact for a blocked peer"
+
+    result = publish_due_scheduled_channel_messages(
+        path, app, contact_refusal=refuse, now=2000.0
+    )
+    assert result == {"published": 0, "kept": 1}
+    assert vetted == [CARD]
+    assert app.created == []
+    assert app.published == []
+    queue = load_scheduled_channel_messages(path)
+    assert len(queue) == 1
+    assert queue.messages[0].id == entry.id
+    assert queue.messages[0].attempts == MAX_PUBLISH_ATTEMPTS
+    # A parked entry is never retried: a later pass leaves it alone.
+    result = publish_due_scheduled_channel_messages(
+        path, app, contact_refusal=refuse, now=3000.0
+    )
+    assert result == {"published": 0, "kept": 0}
+    assert app.created == []
+
+
+def test_publish_due_vet_refuses_stored_message_on_retry(tmp_path):
+    # The vet runs before a stored message is re-published too: a
+    # first attempt that fails to deliver, followed by the peer being
+    # blocked, must not send the stored copy on the retry.
+    path = tmp_path / "scheduled-channel-messages.json"
+    schedule_channel_message(
+        path,
+        channel="general",
+        text="meet carol",
+        publish_at=1000.0,
+        now=900.0,
+        contact=CARD,
+    )
+    app = _FakeChannelApp(fail_with_errors=True)
+
+    def allow(card):
+        return None
+
+    result = publish_due_scheduled_channel_messages(
+        path, app, contact_refusal=allow, now=2000.0
+    )
+    assert result == {"published": 0, "kept": 1}
+    assert len(app.created) == 1
+    assert app.published == []
+    queued = load_scheduled_channel_messages(path).messages[0]
+    assert queued.message_hash == "c" * 64
+    assert queued.attempts == 1
+
+    def refuse(card):
+        return "cannot share a contact for a blocked peer"
+
+    result = publish_due_scheduled_channel_messages(
+        path, app, contact_refusal=refuse, now=3000.0
+    )
+    assert result == {"published": 0, "kept": 1}
+    assert app.published == []
+    queued = load_scheduled_channel_messages(path).messages[0]
+    assert queued.message_hash == "c" * 64
+    assert queued.attempts == MAX_PUBLISH_ATTEMPTS
+
+
 def test_edit_scheduled_message_keeps_location(tmp_path):
     # Editing a pinned entry's text keeps its pin, and the edit
     # preflight measures the pin: 1,910 emoji fit without one but
@@ -772,6 +1017,29 @@ def test_edit_scheduled_message_keeps_location(tmp_path):
     )
     assert edited.location == PIN
     assert load_scheduled_channel_messages(path).messages[0].location == PIN
+
+
+def test_edit_scheduled_message_keeps_contact(tmp_path):
+    # Editing a card-carrying entry's text keeps its card, and the
+    # edit preflight measures the card: 1,950 emoji fit without one
+    # but overflow with it, so that edit is refused while a 1,850-emoji
+    # edit (which fits with the card) goes through with the card intact.
+    path = tmp_path / "scheduled-channel-messages.json"
+    entry = schedule_channel_message(
+        path,
+        channel="general",
+        text="meet carol",
+        publish_at=5000.0,
+        now=1000.0,
+        contact=CARD,
+    )
+    with pytest.raises(ScheduledChannelError, match="too large"):
+        edit_scheduled_channel_message(path, entry.id, text="😀" * 1950, now=1500.0)
+    edited = edit_scheduled_channel_message(
+        path, entry.id, text="😀" * 1850, now=1500.0
+    )
+    assert edited.contact == CARD
+    assert load_scheduled_channel_messages(path).messages[0].contact == CARD
 
 
 def test_publish_due_keeps_failed_messages_queued(tmp_path):

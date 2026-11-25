@@ -5001,6 +5001,36 @@ class WebBridge:
         left = self._local_channel_app().leave(channel)
         return {"channel": clean_channel_name(channel), "left": left}
 
+    def _vet_channel_contact(
+        self, contact: Optional[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        """Clean a channel contact card and apply the sharing policy.
+
+        Shared by immediate and scheduled channel sends so both refuse
+        the same cards.  Returns ``None`` when no card was given.
+        """
+        from .scheduled_channel import channel_contact_refusal
+
+        if contact is None:
+            return None
+        cleaned = clean_contact(contact)
+        if cleaned is None:
+            raise ValueError(
+                "contact must have a name and a 32 character hex "
+                "destination hash"
+            )
+        # Same refusals as direct and group sends: never publish
+        # your own card, and never amplify a blocked peer to a
+        # channel, failing closed if the block-list is unreadable.
+        refusal = channel_contact_refusal(
+            cleaned,
+            own_hash=getattr(self.node, "destination_hexhash", ""),
+            blocklist=getattr(self.node, "blocklist", None),
+        )
+        if refusal is not None:
+            raise ValueError(refusal)
+        return cleaned
+
     def channel_send(
         self,
         channel: str,
@@ -5033,32 +5063,7 @@ class WebBridge:
             raise WebBridgeError(
                 "public channels are not enabled; run serve --channels"
             )
-        cleaned_contact: Optional[Dict[str, Any]] = None
-        if contact is not None:
-            cleaned_contact = clean_contact(contact)
-            if cleaned_contact is None:
-                raise ValueError(
-                    "contact must have a name and a 32 character hex "
-                    "destination hash"
-                )
-            # Same refusals as direct and group sends: never publish
-            # your own card, and never amplify a blocked peer to a
-            # channel, failing closed if the block-list is unreadable.
-            if cleaned_contact["destination_hash"] == getattr(
-                self.node, "destination_hexhash", ""
-            ):
-                raise ValueError(
-                    "cannot share your own contact: the recipient "
-                    "already has your hash"
-                )
-            blocklist = getattr(self.node, "blocklist", None)
-            if blocklist is None:
-                raise ValueError(
-                    "cannot share a contact: the block-list could not "
-                    "be read"
-                )
-            if blocklist.is_blocked(cleaned_contact["destination_hash"]):
-                raise ValueError("cannot share a contact for a blocked peer")
+        cleaned_contact = self._vet_channel_contact(contact)
         expires_at = None
         if expires_in is not None:
             expires_at = time.time() + float(expires_in)
@@ -5197,6 +5202,7 @@ class WebBridge:
         self, channel: str, text: str, *, send_in: float,
         poll_options: Optional[List[str]] = None,
         location: Optional[Dict[str, Any]] = None,
+        contact: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Queue a channel message for later, like ``tau channel send --delay``.
 
@@ -5209,7 +5215,9 @@ class WebBridge:
         With *poll_options* the entry is a poll instead: the text is
         its question and the options ride alongside it.  A *location*
         pins a place on the queued message, like an immediate send;
-        a poll cannot carry one.
+        a poll cannot carry one.  A *contact* shares a peer's card on
+        the queued message, like an immediate send; a poll cannot
+        carry one either.
         """
         from .channels import clean_channel_name, is_member
         from .scheduled_channel import schedule_channel_message, schedule_channel_poll
@@ -5226,6 +5234,8 @@ class WebBridge:
         if poll_options is not None:
             if location is not None:
                 raise ValueError("a scheduled poll cannot carry a location")
+            if contact is not None:
+                raise ValueError("a scheduled poll cannot carry a contact card")
             entry = schedule_channel_poll(
                 config.scheduled_channel_messages_path,
                 channel=name,
@@ -5243,6 +5253,7 @@ class WebBridge:
             publish_at=time.time() + float(send_in),
             name=getattr(self.node, "name", None),
             location=location,
+            contact=self._vet_channel_contact(contact),
             disappearing_path=config.disappearing_path,
         )
         return entry.to_dict()
@@ -17761,6 +17772,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                         channel, text, send_in=float(send_in),
                         poll_options=poll_options,
                         location=body.get("location"),
+                        contact=body.get("contact"),
                     )
                 except (ValueError, ProtocolError) as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)

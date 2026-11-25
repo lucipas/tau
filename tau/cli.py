@@ -10529,13 +10529,6 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    if contact is not None and getattr(args, "delay", None) is not None:
-        print(
-            "error: --contact cannot be combined with --delay — "
-            "scheduled channel messages cannot carry a contact card yet",
-            file=sys.stderr,
-        )
-        return 2
     text = _message_text_with_contact(args, contact, location)
     json_output = _json_mode(args)
     try:
@@ -10596,6 +10589,7 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
                 ttl=int(getattr(args, "ttl", MAX_GOSSIP_TTL)),
                 name=config.name,
                 location=location,
+                contact=contact,
                 disappearing_path=config.disappearing_path,
             )
         except ScheduledChannelError as exc:
@@ -11417,6 +11411,11 @@ def cmd_channel_scheduled(args: argparse.Namespace) -> int:
             label = pin.get("name") or "Location"
             print(f"  📍 {label} — {pin['lat']}, {pin['lon']}")
             print(f"  {location_maps_url(pin)}")
+        card = clean_contact(entry.contact)
+        if card is not None:
+            # A queued card prints under the text the way it renders
+            # in the console once published.
+            print(f"  {contact_default_text(card)}")
         if entry.kind == "poll":
             for index, option in enumerate(entry.options, start=1):
                 print(f"    {index}. {option}")

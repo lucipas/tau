@@ -5467,7 +5467,10 @@ class TauNode:
         app = getattr(self, "channel_app", None)
         if app is None:
             return
-        from .scheduled_channel import publish_due_scheduled_channel_messages
+        from .scheduled_channel import (
+            channel_contact_refusal,
+            publish_due_scheduled_channel_messages,
+        )
 
         try:
             result = publish_due_scheduled_channel_messages(
@@ -5475,6 +5478,11 @@ class TauNode:
                 app,
                 resolve_peer=self.resolve_peer,
                 should_stop=self._stop_event.is_set,
+                contact_refusal=lambda contact: channel_contact_refusal(
+                    contact,
+                    own_hash=self.destination_hexhash,
+                    blocklist=self.blocklist,
+                ),
             )
         except Exception:  # pragma: no cover - defensive; helper logs
             log.debug("Scheduled channel-message publish failed", exc_info=True)

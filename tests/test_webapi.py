@@ -25327,6 +25327,150 @@ def test_channel_schedule_location_via_api(tmp_path):
         bridge.stop()
 
 
+def test_channel_schedule_contact_via_api(tmp_path):
+    from tau.blocklist import BlockList
+    from tau.channels import init_db as init_channel_db, join_channel
+    from tau.config import TauConfig
+
+    assert cli.main(["init", "--data-dir", str(tmp_path), "--name", "tester"]) == 0
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    conn = init_channel_db(node.config.channels_db_path)
+    try:
+        join_channel(conn, "general")
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # The schedule endpoint enforces the contact-sharing policy,
+        # like the immediate send: no block-list, no card.
+        node.blocklist = BlockList()
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/schedule",
+            method="POST",
+            body={
+                "channel": "general",
+                "text": "meet carol",
+                "send_in": 3600,
+                "contact": {
+                    "name": "carol",
+                    "destination_hash": "cc" * 16,
+                },
+            },
+        )
+        assert status == 200
+        scheduled = payload["scheduled"]
+        assert scheduled["contact"] == {
+            "name": "carol",
+            "destination_hash": "cc" * 16,
+        }
+
+        # The scheduled list carries the card.
+        status, _, payload = _json(bridge, "/api/channels/scheduled")
+        assert status == 200
+        assert payload["count"] == 1
+        assert payload["scheduled"][0]["contact"] == {
+            "name": "carol",
+            "destination_hash": "cc" * 16,
+        }
+
+        # A malformed card is a bad request, not a silently dropped card.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/schedule",
+            method="POST",
+            body={
+                "channel": "general",
+                "text": "meet carol",
+                "send_in": 60,
+                "contact": {"name": "carol"},
+            },
+        )
+        assert status == 400
+        assert "contact" in payload["error"]["message"]
+
+        # A poll cannot carry a card.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/schedule",
+            method="POST",
+            body={
+                "channel": "general",
+                "text": "which day?",
+                "send_in": 60,
+                "poll_options": ["Saturday", "Sunday"],
+                "contact": {
+                    "name": "carol",
+                    "destination_hash": "cc" * 16,
+                },
+            },
+        )
+        assert status == 400
+        assert "contact" in payload["error"]["message"]
+
+        # A blocked peer's card must not be queued, and neither may
+        # your own — the recipient already has your hash.
+        node.blocklist = BlockList(blocked=frozenset({"cc" * 16}))
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/schedule",
+            method="POST",
+            body={
+                "channel": "general",
+                "text": "meet carol",
+                "send_in": 60,
+                "contact": {
+                    "name": "carol",
+                    "destination_hash": "cc" * 16,
+                },
+            },
+        )
+        assert status == 400
+        assert "blocked peer" in payload["error"]["message"]
+        node.blocklist = BlockList()
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/schedule",
+            method="POST",
+            body={
+                "channel": "general",
+                "text": "meet me",
+                "send_in": 60,
+                "contact": {
+                    "name": "tester",
+                    "destination_hash": node.destination_hexhash,
+                },
+            },
+        )
+        assert status == 400
+        assert "own contact" in payload["error"]["message"]
+
+        # Without a readable block-list the endpoint fails closed:
+        # it cannot tell a blocked peer from an allowed one.
+        node.blocklist = None
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/schedule",
+            method="POST",
+            body={
+                "channel": "general",
+                "text": "meet carol",
+                "send_in": 60,
+                "contact": {
+                    "name": "carol",
+                    "destination_hash": "cc" * 16,
+                },
+            },
+        )
+        assert status == 400
+        assert "block-list" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
 def test_channel_schedule_rejects_bad_requests(tmp_path):
     from tau.channels import init_db as init_channel_db, join_channel
     from tau.config import TauConfig

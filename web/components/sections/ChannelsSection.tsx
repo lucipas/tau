@@ -34,9 +34,10 @@ function ChannelLocationLink({ location }: { location: LocationPin }) {
 
 /** A shared contact card on a channel message, with an Add-peer
  *  button — the channel twin of the card MessageBubble renders on
- *  DMs and groups. Shared by the history list and the pinned strip:
- *  a card can outlive its presence in the fetched history page, so
- *  the strip needs it too. */
+ *  DMs and groups. Shared by the history list, the pinned strip, and
+ *  the scheduled list: a card can outlive its presence in the fetched
+ *  history page, so the strip needs it too, and a queued card
+ *  renders like a published one. */
 function ChannelContactCard({
   contact,
   own,
@@ -869,6 +870,9 @@ export default function ChannelsSection() {
                           )}
                           <p className="text-sm whitespace-pre-wrap text-zinc-300">{s.text}</p>
                           {s.location && <ChannelLocationLink location={s.location} />}
+                          {s.contact && (
+                            <ChannelContactCard contact={s.contact} own />
+                          )}
                           {s.kind === "poll" &&
                             (s.options ?? []).map((option, i) => (
                               <p key={i} className="text-xs text-zinc-500">
