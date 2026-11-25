@@ -140,14 +140,20 @@ export default function MessageBubble({
 
           {message.file && message.file.voice ? (
             <span className="mt-1 block">
-              <span className="mb-1 block text-xs opacity-80">🎙️ Voice note</span>
-              <audio
-                controls
-                preload="metadata"
-                src={fileUrl(message.peer ?? "", message.file.name)}
-                className="max-w-full"
-                aria-label={`Voice note (${formatBytes(message.file.size)})`}
-              />
+              <span className="mb-1 block text-xs opacity-80">
+                🎙️ Voice note{own ? " sent" : ""}
+              </span>
+              {/* Only inbound notes can be played back: the bytes of an
+                  outgoing note are not kept, so the player would 404. */}
+              {!own && (
+                <audio
+                  controls
+                  preload="metadata"
+                  src={fileUrl(message.peer ?? "", message.file.name)}
+                  className="max-w-full"
+                  aria-label={`Voice note (${formatBytes(message.file.size)})`}
+                />
+              )}
             </span>
           ) : (
             message.file && (
