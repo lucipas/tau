@@ -831,18 +831,3 @@ export default function PeerPanel({
     </div>
   );
 }
-group?
-            </ActionButton>
-          ) : (
-            <ActionButton danger onClick={() => setConfirmIgnore(true)}>Ignore group</ActionButton>
-          ))}
-      </div>
-
-      {error && (
-        <p role="alert" className="mt-2 text-xs text-red-400">
-          {error}
-        </p>
-      )}
-    </div>
-  );
-}
