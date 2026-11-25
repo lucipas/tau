@@ -3222,6 +3222,11 @@ class TauNode:
         if not pending:
             raise ValueError("no pending join request from that peer")
         if peer_hash in group["members"]:
+            # The peer was added some other way: the request is now
+            # redundant, so clear it instead of leaving it pending.
+            resolve_join_request(
+                self.config.join_requests_path, group["name"], peer_hash
+            )
             return {"status": "already_member", "group": _invite_group_summary(group)}
         if peer_hash in (group.get("banned") or []):
             raise ValueError(

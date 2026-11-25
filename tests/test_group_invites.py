@@ -688,6 +688,41 @@ def test_closed_group_join_queues_request(tmp_path, monkeypatch):
         node.approve_join_request(group["name"], carol.hexhash)
 
 
+def test_approve_clears_request_for_peer_already_added(tmp_path, monkeypatch):
+    node, identity, own_hash = _invite_node(tmp_path)
+    _, bob = _peer_identity("bob")
+    carol_identity, carol = _peer_identity(JOINER)
+    group = _group(node, own_hash, bob)
+    link = mint_invite(
+        node.config.invites_path,
+        identity,
+        group_name=group["name"],
+        creator_hash=own_hash,
+        mode="closed",
+    )
+    monkeypatch.setattr(node, "send_group_message", lambda *args, **kwargs: None)
+    node._handle_message(
+        "/tau/message",
+        encode_message(link, kind="group-join-request", message_id="m-1"),
+        b"req-1",
+        carol_identity,
+        1000.0,
+    )
+    assert len(node.list_join_requests(group["name"])) == 1
+    # The creator adds Carol to the roster separately while her request
+    # is still pending.
+    node.groups.update_members(
+        group["id"],
+        list(group["members"]) + [carol.hexhash],
+        created_by=own_hash,
+        identity=node.identity,
+    )
+    outcome = node.approve_join_request(group["name"], carol.hexhash)
+    assert outcome["status"] == "already_member"
+    # The redundant request is cleared, not left pending.
+    assert node.list_join_requests(group["name"]) == []
+
+
 # --- node: roster-change announcements --------------------------------------
 
 
