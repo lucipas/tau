@@ -844,12 +844,20 @@ def test_edit_scheduled_channel_message_rejects_bad_time(tmp_path):
 class _FakeChannelApp:
     """ChannelApp stand-in: records creates and publishes, delivers to nobody."""
 
-    def __init__(self, fail_publish: bool = False, fail_with_errors: bool = False):
+    def __init__(
+        self,
+        fail_publish: bool = False,
+        fail_with_errors: bool = False,
+        default_lifetime=None,
+    ):
         self.created = []
         self.published = []
         self.stored = {}
         self.fail_publish = fail_publish
         self.fail_with_errors = fail_with_errors
+        # Simulated channel disappearing default, applied only when the
+        # caller passes no explicit expires_at (as ChannelApp.send does).
+        self.default_lifetime = default_lifetime
 
     def send(
         self, channel, text, *, publish=False, expires_at=None, poll_options=None,
@@ -861,6 +869,8 @@ class _FakeChannelApp:
             "text": text,
             "created_at": 2000.0,
         }
+        if expires_at is None and self.default_lifetime is not None:
+            expires_at = message["created_at"] + self.default_lifetime
         if expires_at is not None:
             message["expires_at"] = expires_at
         if poll_options is not None:
@@ -1009,6 +1019,53 @@ def test_publish_due_applies_expires_in(tmp_path):
     queue = load_scheduled_channel_messages(path)
     assert all(entry.id != expiring.id for entry in queue.messages)
     assert len(queue) == 0
+
+
+def test_publish_due_applies_expires_in_to_a_poll(tmp_path):
+    path = tmp_path / "scheduled-channel-messages.json"
+    poll = schedule_channel_poll(
+        path,
+        channel="general",
+        question="which day?",
+        options=["Saturday", "Sunday"],
+        publish_at=1000.0,
+        now=900.0,
+        expires_in=3600.0,
+    )
+    app = _FakeChannelApp()
+
+    result = publish_due_scheduled_channel_messages(path, app, now=2000.0)
+    assert result == {"published": 1, "kept": 0}
+    assert app.created[0]["expires_at"] == 2000.0 + 3600.0
+    assert app.published[0][0]["expires_at"] == 2000.0 + 3600.0
+    assert app.published[0][0]["poll_options"] == ["Saturday", "Sunday"]
+    queue = load_scheduled_channel_messages(path)
+    assert all(entry.id != poll.id for entry in queue.messages)
+
+
+def test_publish_due_explicit_expires_in_wins_over_channel_default(tmp_path):
+    # With a channel disappearing default in force, an entry carrying its
+    # own expires_in keeps that expiry, while one without it takes the
+    # default — the same precedence an immediate send applies.
+    path = tmp_path / "scheduled-channel-messages.json"
+    schedule_channel_message(
+        path,
+        channel="general",
+        text="explicit",
+        publish_at=1000.0,
+        now=900.0,
+        expires_in=7200.0,
+    )
+    schedule_channel_message(
+        path, channel="general", text="default", publish_at=1000.0, now=900.0
+    )
+    app = _FakeChannelApp(default_lifetime=86400.0)
+
+    result = publish_due_scheduled_channel_messages(path, app, now=2000.0)
+    assert result == {"published": 2, "kept": 0}
+    expires = {m["text"]: m["expires_at"] for m in app.created}
+    assert expires["explicit"] == 2000.0 + 7200.0
+    assert expires["default"] == 2000.0 + 86400.0
 
 
 def test_publish_due_without_expires_in_passes_no_expiry(tmp_path):
