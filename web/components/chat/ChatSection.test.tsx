@@ -1,6 +1,7 @@
 // ChatSection.test.tsx — chat draft seeding: saving a draft must not
 // pour it straight back into the composer (#609).
 
+import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import ChatSection from "./ChatSection";
@@ -33,6 +34,10 @@ function defer<T>() {
   return { promise, resolve };
 }
 let heldGet: ReturnType<typeof defer<unknown>> | null = null;
+/** A deferred the next GET /api/messages?group=… waits on: the test
+ *  resolves it to prove snapshot moves during an in-flight history
+ *  fetch still let a result commit instead of starving the thread. */
+let heldHistoryGet: ReturnType<typeof defer<unknown>> | null = null;
 
 /** The next POST /api/groups/join answers with this payload, so a
  *  join test can stage a named or a label-free queued reply. */
@@ -50,6 +55,7 @@ function stubFetch() {
   groupHistory = [];
   groupHistoryFails = false;
   heldGet = null;
+  heldHistoryGet = null;
   nextJoin = null;
   vi.stubGlobal(
     "fetch",
@@ -119,6 +125,31 @@ function stubFetch() {
             ok: false,
             status: 500,
             text: async () => JSON.stringify({ error: { message: "boom" } }),
+          } as Response;
+        }
+        if (heldHistoryGet) {
+          const held = heldHistoryGet;
+          heldHistoryGet = null;
+          // Honor the fetch's abort signal, like a real fetch: the
+          // timeout test aborts the stalled request this way.
+          const aborted = new Promise<never>((_resolve, reject) => {
+            const signal = init?.signal;
+            if (!signal) return;
+            if (signal.aborted) {
+              reject(new DOMException("The operation was aborted.", "AbortError"));
+              return;
+            }
+            signal.addEventListener(
+              "abort",
+              () => reject(new DOMException("The operation was aborted.", "AbortError")),
+              { once: true },
+            );
+          });
+          const payload = await Promise.race([held.promise, aborted]);
+          return {
+            ok: true,
+            status: 200,
+            text: async () => JSON.stringify(payload),
           } as Response;
         }
         payload = { messages: groupHistory };
@@ -634,9 +665,8 @@ describe("ChatSection join group", () => {
 describe("ChatSection ignored groups", () => {
   const GROUP_ID = "g".repeat(32);
 
-  function renderIgnoredGroup(messages: ReturnType<typeof makeMessage>[] = []) {
-    window.location.hash = `#chat?group=${GROUP_ID}`;
-    return render(
+  function ignoredGroupUi(messages: ReturnType<typeof makeMessage>[] = []) {
+    return (
       <TauContext.Provider
         value={fakeTau({
           peers: [makePeer({ destination: PEER_HASH, name: "Alice" })],
@@ -657,8 +687,13 @@ describe("ChatSection ignored groups", () => {
         })}
       >
         <ChatSection />
-      </TauContext.Provider>,
+      </TauContext.Provider>
     );
+  }
+
+  function renderIgnoredGroup(messages: ReturnType<typeof makeMessage>[] = []) {
+    window.location.hash = `#chat?group=${GROUP_ID}`;
+    return render(ignoredGroupUi(messages));
   }
 
   const groupHistoryUrl = `GET /api/messages?group=${GROUP_ID}&include_ignored=1&limit=200`;
@@ -724,6 +759,44 @@ describe("ChatSection ignored groups", () => {
     );
   });
 
+  it("rapid snapshot moves during an in-flight fetch still commit a result", async () => {
+    groupHistory = [
+      makeMessage({
+        id: 2,
+        group: GROUP_ID,
+        group_name: "crew",
+        peer: PEER_HASH,
+        peer_name: "Alice",
+        text: "crew history",
+      }),
+    ];
+    // Hold the first history fetch so snapshot moves land mid-flight.
+    const held = defer();
+    heldHistoryGet = held;
+    const { rerender } = renderIgnoredGroup();
+    await waitFor(() => expect(calls).toContain(groupHistoryUrl));
+    // Three snapshot moves while the fetch is in flight: before the fix
+    // each bumped the seq and starved the thread — no response could
+    // commit. Now they coalesce: no new fetch starts mid-flight.
+    for (let i = 1; i <= 3; i++) {
+      rerender(
+        ignoredGroupUi([
+          makeMessage({ id: 10 + i, peer: PEER_HASH, text: `dm ${i}` }),
+        ]),
+      );
+    }
+    expect(calls.filter((c) => c === groupHistoryUrl).length).toBe(1);
+    held.resolve({ messages: groupHistory });
+    await waitFor(() => expect(screen.getByText("crew history")).toBeTruthy());
+    // Exactly one follow-up fetch ran for the moves that landed mid-flight.
+    await waitFor(
+      () =>
+        expect(
+          calls.filter((c) => c === groupHistoryUrl).length,
+        ).toBe(2),
+    );
+  });
+
   it("a failed history load shows a retryable error, not an empty thread", async () => {
     groupHistoryFails = true;
     groupHistory = [
@@ -750,5 +823,106 @@ describe("ChatSection ignored groups", () => {
     expect(
       screen.queryByText("Couldn't load this group's history."),
     ).toBeNull();
+  });
+
+  it("StrictMode remount still loads history for a directly linked ignored group", async () => {
+    groupHistory = [
+      makeMessage({
+        id: 2,
+        group: GROUP_ID,
+        group_name: "crew",
+        peer: PEER_HASH,
+        peer_name: "Alice",
+        text: "crew history",
+      }),
+    ];
+    // A direct link opens the ignored group at mount. StrictMode runs
+    // the mount effects, then their cleanup, then the effects again on
+    // the same instance: the cleanup must reset all of the coalescing
+    // state, or the fresh request queues behind the invalidated one
+    // and history never appears.
+    window.location.hash = `#chat?group=${GROUP_ID}`;
+    render(<StrictMode>{ignoredGroupUi()}</StrictMode>);
+    await waitFor(() => expect(screen.getByText("crew history")).toBeTruthy());
+    expect(calls.filter((c) => c === groupHistoryUrl).length).toBe(2);
+  });
+
+  it("a stalled history fetch times out instead of blocking refresh", async () => {
+    groupHistory = [
+      makeMessage({
+        id: 2,
+        group: GROUP_ID,
+        group_name: "crew",
+        peer: PEER_HASH,
+        peer_name: "Alice",
+        text: "crew history",
+      }),
+    ];
+    // Hold the first history fetch so it stalls past the timeout; the
+    // stub rejects the held request when its abort signal fires.
+    const held = defer();
+    heldHistoryGet = held;
+    const { rerender } = renderIgnoredGroup();
+    await waitFor(() => expect(calls).toContain(groupHistoryUrl));
+    // A snapshot move lands while the fetch is stalled: queued, not started.
+    rerender(
+      ignoredGroupUi([
+        makeMessage({ id: 11, peer: PEER_HASH, text: "dm 1" }),
+      ]),
+    );
+    expect(calls.filter((c) => c === groupHistoryUrl).length).toBe(1);
+    // Hold the follow-up too, so the timeout's retryable error stays
+    // visible instead of flashing past before the assertion polls.
+    const heldFollowUp = defer();
+    heldHistoryGet = heldFollowUp;
+    await waitFor(
+      () =>
+        expect(
+          screen.getByText("Couldn't load this group's history."),
+        ).toBeTruthy(),
+      { timeout: 17000 },
+    );
+    // The queued move ran its follow-up fetch once the stalled one
+    // timed out — the thread is unblocked.
+    await waitFor(
+      () =>
+        expect(
+          calls.filter((c) => c === groupHistoryUrl).length,
+        ).toBe(2),
+    );
+    heldFollowUp.resolve({ messages: groupHistory });
+    await waitFor(() => expect(screen.getByText("crew history")).toBeTruthy());
+    expect(
+      screen.queryByText("Couldn't load this group's history."),
+    ).toBeNull();
+  }, 25000);
+
+  it("no follow-up fetch fires after the chat unmounts", async () => {
+    groupHistory = [
+      makeMessage({
+        id: 2,
+        group: GROUP_ID,
+        group_name: "crew",
+        peer: PEER_HASH,
+        peer_name: "Alice",
+        text: "crew history",
+      }),
+    ];
+    const held = defer();
+    heldHistoryGet = held;
+    const { rerender, unmount } = renderIgnoredGroup();
+    await waitFor(() => expect(calls).toContain(groupHistoryUrl));
+    // A snapshot move queues a follow-up while the fetch is in flight.
+    rerender(
+      ignoredGroupUi([
+        makeMessage({ id: 11, peer: PEER_HASH, text: "dm 1" }),
+      ]),
+    );
+    unmount();
+    held.resolve({ messages: groupHistory });
+    // Let the settled fetch's finally run: without the unmount cleanup
+    // it would start a follow-up fetch for a chat that no longer exists.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(calls.filter((c) => c === groupHistoryUrl).length).toBe(1);
   });
 });
