@@ -819,7 +819,12 @@ def test_print_message_entry_shows_location_pin(tmp_path, capsys):
     )
     out = capsys.readouterr().out
     assert "📍 Rock Springs Park — 34.05, -83.88" in out
-    assert "openstreetmap.org" in out
+    # The map link is printed verbatim on its own line; check the whole
+    # line, not a substring of the URL.
+    assert (
+        "  https://www.openstreetmap.org/?mlat=34.05&mlon=-83.88"
+        "#map=15/34.05/-83.88" in out.splitlines()
+    )
     assert "mlat=34.05&mlon=-83.88" in out
 
 
@@ -15478,7 +15483,12 @@ def test_channel_send_delay_with_location_schedules_and_lists(tmp_path, capsys):
     assert "#general" in out
     assert "meet here" in out
     assert "📍 Rock Springs Park — 34.05, -83.88" in out
-    assert "openstreetmap.org" in out
+    # The map link is printed verbatim on its own line; check the whole
+    # line, not a substring of the URL.
+    assert (
+        "  https://www.openstreetmap.org/?mlat=34.05&mlon=-83.88"
+        "#map=15/34.05/-83.88" in out.splitlines()
+    )
 
 
 def test_channel_send_delay_rejects_bad_combinations(tmp_path, capsys):
