@@ -5642,6 +5642,10 @@ class WebBridge:
                 )
                 if forwarded_from is not None:
                     file_meta["forwarded_from"] = forwarded_from
+                # The voice marker rides on the entry so restored voice
+                # notes render as players and forward as voice notes.
+                if record.get("voice") is True:
+                    file_meta["voice"] = True
             else:
                 text = str(record.get("text") or "")
             message = self._append_message(

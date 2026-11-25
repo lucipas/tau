@@ -12416,6 +12416,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
                             if isinstance(record.get("forwarded_from"), dict)
                             else {}
                         ),
+                        **({"voice": True} if record.get("voice") is True else {}),
                     },
                 }
             )
