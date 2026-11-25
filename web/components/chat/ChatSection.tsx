@@ -240,6 +240,11 @@ export default function ChatSection() {
   const ignoredHistoryInFlight = useRef(false);
   const ignoredHistoryPending = useRef(false);
   const ignoredHistoryKey = useRef<string | null>(null);
+  // The group whose fetched history stays on screen after it was
+  // un-ignored while open (e.g. from another tab). The snapshot does not
+  // carry its posts yet, so the history is held until a fresh snapshot
+  // lands.
+  const ignoredHistoryHeld = useRef<string | null>(null);
   // Ignoring or un-ignoring the open group keeps its key, so the
   // ignored flag must be a dependency too.
   const selectedIgnoredGroup = selected?.kind === "group" && !!selected.ignored;
@@ -247,6 +252,59 @@ export default function ChatSection() {
     const groupId =
       selected?.kind === "group" && selectedIgnoredGroup ? selected.key : null;
     if (!groupId) {
+      if (
+        selected?.kind === "group" &&
+        ignoredHistoryKey.current !== null &&
+        selected.key === ignoredHistoryKey.current
+      ) {
+        // Un-ignored while open: keep the history so the thread does not
+        // blank, then refresh the snapshot and drop the history once it
+        // has landed. A failed refresh keeps the history on screen.
+        const heldKey = ignoredHistoryKey.current;
+        ignoredHistoryKey.current = null;
+        ignoredHistoryPending.current = false;
+        ignoredHistoryHeld.current = heldKey;
+        // A history fetch that started before the un-ignore must not
+        // commit after the refresh clears the thread: invalidate its
+        // sequence so its completion is a no-op, and drop the in-flight
+        // flag it would otherwise leave set.
+        ignoredHistorySeq.current += 1;
+        ignoredHistoryInFlight.current = false;
+        void tau.refresh().then((snap) => {
+          // A newer ignored-history fetch owns the thread now (the group
+          // was re-ignored): its posts must not be cleared by this
+          // stale refresh.
+          if (
+            snap &&
+            ignoredHistoryHeld.current === heldKey &&
+            ignoredHistoryKey.current === null
+          ) {
+            ignoredHistoryHeld.current = null;
+            setIgnoredHistory([]);
+            setIgnoredHistoryError(false);
+          }
+        });
+        return;
+      }
+      if (
+        selected?.kind === "group" &&
+        ignoredHistoryHeld.current !== null &&
+        selected.key === ignoredHistoryHeld.current
+      ) {
+        // Still viewing the held thread: keep the history until a fresh
+        // snapshot carries this group's posts. That release also covers
+        // a refresh that failed — the snapshot can land through the
+        // normal poll or a live event instead, and the held posts must
+        // not outlive it.
+        const heldKey = ignoredHistoryHeld.current;
+        if (tau.messages.some((m) => m.group === heldKey)) {
+          ignoredHistoryHeld.current = null;
+          setIgnoredHistory([]);
+          setIgnoredHistoryError(false);
+        }
+        return;
+      }
+      ignoredHistoryHeld.current = null;
       // Leaving the ignored thread (or un-ignoring it) invalidates any
       // fetch still running for it; the newer fetch owns the flags.
       ignoredHistorySeq.current += 1;
@@ -293,7 +351,10 @@ export default function ChatSection() {
     if (groupId !== ignoredHistoryKey.current) {
       // New selection (or newly ignored): drop any in-flight fetch for
       // the old thread — a slow response must not overwrite a newer
-      // selection — and start fresh for this one.
+      // selection — and start fresh for this one. Re-ignoring also
+      // invalidates the un-ignore hold: the pending refresh must not
+      // clear the fresh history this fetch loads.
+      ignoredHistoryHeld.current = null;
       ignoredHistoryKey.current = groupId;
       ignoredHistoryPending.current = false;
       startFetch(groupId);

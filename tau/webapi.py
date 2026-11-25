@@ -11539,6 +11539,18 @@ class WebBridge:
             event["restored"] = restored
         self.bus.publish(event)
 
+    def _publish_groups(self) -> None:
+        """Push the current group list (with ignore flags) to every console.
+
+        Ignore state lives in a file the snapshot reads fresh, but no
+        snapshot is pushed when it changes — a console that re-read
+        /api/groups/left in between would suppress a freshly ignored
+        group from the Ignored section until the next snapshot (#784).
+        Publishing the groups keeps every open console's snapshot
+        current, which also re-triggers its left-list re-read.
+        """
+        self.bus.publish({"type": "groups", "groups": self.groups()})
+
     def muted_conversations(self, *, visible_only: bool = False) -> Dict[str, Any]:
         """All muted conversations, for the console load.
 
@@ -11854,6 +11866,11 @@ class WebBridge:
         }
 
     def groups(self) -> List[Dict[str, Any]]:
+        described = self._read_groups()
+        return [] if described is None else described
+
+    def _read_groups(self) -> Optional[List[Dict[str, Any]]]:
+        """The described group list, or None when the store cannot be read."""
         try:
             ignored = load_ignored_group_ids(
                 getattr(self.node.config, "ignored_groups_path", None)
@@ -11867,7 +11884,7 @@ class WebBridge:
             return described
         except Exception:  # pragma: no cover - defensive
             log.debug("Could not read group store", exc_info=True)
-            return []
+            return None
 
     def _describe_group(
         self,
@@ -12222,8 +12239,11 @@ class WebBridge:
         if not already:
             # The group's posts stop lighting the badge at once: push
             # the recomputed counts so every open console reconciles
-            # without waiting for the next message.
+            # without waiting for the next message.  Push the groups
+            # too, so the snapshot's ignored flag never lags the
+            # ignore file (#784).
             self.bus.publish({"type": "unread", "unread": self.unread()})
+            self._publish_groups()
         return {
             "group": group_id,
             "name": group["name"],
@@ -12275,6 +12295,12 @@ class WebBridge:
             if was_ignored:
                 ignored = ignored.with_removed(group_id)
                 save_ignored_groups(path, ignored)
+                # Publish the groups under the lock, so events reach
+                # consoles in the same order as the saved states (#784).
+                # This also makes every console re-read /api/groups/left,
+                # which clears an orphan row for a group whose record is
+                # gone.
+                self._publish_groups()
         if was_ignored:
             # Stored history returns on unignore, including its unread
             # posts: push the recomputed counts so every open console

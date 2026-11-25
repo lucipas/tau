@@ -4051,6 +4051,65 @@ def test_api_groups_ignore_and_unignore_round_trip(bridge, node, tmp_path):
     assert left["ignored"] == []
 
 
+def test_api_groups_ignore_publishes_groups_event(bridge, node, tmp_path):
+    group_id = _learned_group(node, tmp_path)
+
+    def groups_events():
+        return [
+            event for event in bridge.bus.replay(0) if event["type"] == "groups"
+        ]
+
+    _json(
+        bridge, "/api/groups/ignore", method="POST", body={"group": "weekend"}
+    )
+    events = groups_events()
+    assert len(events) == 1
+    assert events[-1]["groups"][0]["id"] == group_id
+    assert events[-1]["groups"][0]["ignored"] is True
+    # A no-op ignore (already ignored) publishes nothing new: no state
+    # changed, so no console needs to reconcile.
+    _json(
+        bridge, "/api/groups/ignore", method="POST", body={"group": "weekend"}
+    )
+    assert len(groups_events()) == 1
+    _json(
+        bridge,
+        "/api/groups/unignore",
+        method="POST",
+        body={"group": "weekend"},
+    )
+    events = groups_events()
+    assert len(events) == 2
+    assert events[-1]["groups"][0]["ignored"] is False
+
+
+def test_api_groups_unignore_orphan_publishes_groups_event(
+    bridge, node, tmp_path
+):
+    group_id = _learned_group(node, tmp_path)
+    _json(
+        bridge, "/api/groups/ignore", method="POST", body={"group": "weekend"}
+    )
+    assert node.groups.delete(group_id)
+    before = len(
+        [event for event in bridge.bus.replay(0) if event["type"] == "groups"]
+    )
+    _json(
+        bridge,
+        "/api/groups/unignore",
+        method="POST",
+        body={"group": group_id[:8]},
+    )
+    events = [
+        event for event in bridge.bus.replay(0) if event["type"] == "groups"
+    ]
+    # The record is gone so the list is empty, but the event still
+    # fires: every open console re-reads /api/groups/left and the
+    # orphan row clears (#784).
+    assert len(events) == before + 1
+    assert events[-1]["groups"] == []
+
+
 def test_api_groups_ignore_unknown_group_is_400(bridge, node, tmp_path):
     _learned_group(node, tmp_path)
     status, _, payload = _json(

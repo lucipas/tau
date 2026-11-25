@@ -133,6 +133,14 @@ function applyEvent(
           : [...snapshot.peers, peer];
       return { ...snapshot, peers };
     }
+    case "groups": {
+      // The bridge publishes the full group list when ignore state
+      // changes, so the snapshot's ignored flags never lag the
+      // ignore file (#784). Replacing the list also re-triggers the
+      // conversation list's /api/groups/left re-read.
+      const groups = (event as { groups: Group[] }).groups;
+      return { ...snapshot, groups };
+    }
     case "unread": {
       const unread = (event as { unread?: UnreadCounts }).unread;
       return unread ? { ...snapshot, unread } : null;
@@ -176,6 +184,11 @@ export function useTau(): UseTauResult {
   const restTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const retryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const stopped = useRef(false);
+  // Count of groups events seen, and the newest group list they carried.
+  // A REST refresh that started before a groups event must not replace
+  // the flags that event set with its older response.
+  const groupsSeq = useRef(0);
+  const latestGroups = useRef<Group[] | null>(null);
 
   snapshotRef.current = snapshot;
 
@@ -185,9 +198,14 @@ export function useTau(): UseTauResult {
       setSnapshot((event as { snapshot: Snapshot }).snapshot);
       return;
     }
+    if (event.type === "groups") {
+      groupsSeq.current += 1;
+      latestGroups.current = (event as { groups: Group[] }).groups;
+    }
     if (!current) return;
-    const next = applyEvent(current, event);
-    if (next) setSnapshot(next);
+    // Functional update: several live events can land in one batch, and
+    // each must build on the previous one rather than on the last render.
+    setSnapshot((prev) => (prev ? applyEvent(prev, event) ?? prev : prev));
     if (event.type === "typing") {
       const ev = event as { peer?: string; group?: string; state?: string; name?: string };
       const key = ev.group ? `group:${ev.group}` : ev.peer;

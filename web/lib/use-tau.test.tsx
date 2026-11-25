@@ -187,6 +187,39 @@ describe("useTau live socket", () => {
     expect(result.current.peers[0].name).toBe("alice-renamed");
   });
 
+  it("replaces the group list on a groups event", async () => {
+    const group: Group = {
+      id: "g".repeat(32),
+      name: "crew",
+      members: [],
+      created_at: 900,
+      topic: "",
+      created_by_me: true,
+      can_leave: false,
+      ignored: false,
+    };
+    // The mount refresh fetches a snapshot too: it must carry the
+    // same group, or its late resolution would overwrite the socket
+    // frame with an empty group list.
+    fetchImpl = async () =>
+      ({ ok: true, status: 200, text: async () => JSON.stringify(makeSnapshot({ groups: [group] })) }) as Response;
+    const { result } = renderHook(() => useTau());
+    const ws = FakeWebSocket.instances[0];
+    await act(async () => {
+      ws.open();
+      ws.receive({ type: "snapshot", snapshot: makeSnapshot({ groups: [group] }) });
+    });
+    await waitFor(() => expect(result.current.groups).toHaveLength(1));
+    expect(result.current.groups[0].ignored).toBe(false);
+    // An ignore-state change on the bridge publishes the fresh list,
+    // so the snapshot's ignored flag follows the ignore file (#784).
+    await act(async () => {
+      ws.receive({ type: "groups", groups: [{ ...group, ignored: true }] });
+    });
+    expect(result.current.groups).toHaveLength(1);
+    expect(result.current.groups[0].ignored).toBe(true);
+  });
+
   it("falls back to REST when WebSocket is unavailable", async () => {
     vi.unstubAllGlobals();
     vi.stubGlobal(
