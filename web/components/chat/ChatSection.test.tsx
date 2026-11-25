@@ -7,7 +7,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import ChatSection from "./ChatSection";
 import { TauContext } from "../chrome/TauContext";
 import { fakeTau, makeMessage, makePeer, makeUnread } from "../test-utils";
-import type { MessageDraft, Reminder } from "@/lib/types";
+import type { MessageDraft, Reminder, Snapshot } from "@/lib/types";
 
 const PEER_HASH = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6";
 const NEW_GROUP_ID = "d".repeat(32);
@@ -665,7 +665,13 @@ describe("ChatSection join group", () => {
 describe("ChatSection ignored groups", () => {
   const GROUP_ID = "g".repeat(32);
 
-  function ignoredGroupUi(messages: ReturnType<typeof makeMessage>[] = []) {
+  function ignoredGroupUi(
+    messages: ReturnType<typeof makeMessage>[] = [],
+    opts: {
+      ignored?: boolean;
+      refresh?: () => Promise<Snapshot | null>;
+    } = {},
+  ) {
     return (
       <TauContext.Provider
         value={fakeTau({
@@ -681,9 +687,10 @@ describe("ChatSection ignored groups", () => {
               topic: "",
               created_by_me: true,
               can_leave: true,
-              ignored: true,
+              ignored: opts.ignored ?? true,
             },
           ],
+          ...(opts.refresh ? { refresh: opts.refresh } : {}),
         })}
       >
         <ChatSection />
@@ -924,5 +931,119 @@ describe("ChatSection ignored groups", () => {
     // it would start a follow-up fetch for a chat that no longer exists.
     await new Promise((resolve) => setTimeout(resolve, 100));
     expect(calls.filter((c) => c === groupHistoryUrl).length).toBe(1);
+  });
+
+  it("a history fetch that started before un-ignore cannot repopulate the thread", async () => {
+    groupHistory = [
+      makeMessage({
+        id: 2,
+        group: GROUP_ID,
+        group_name: "crew",
+        peer: PEER_HASH,
+        peer_name: "Alice",
+        text: "crew history",
+      }),
+    ];
+    // Hold the first history fetch so it is still in flight at un-ignore.
+    const held = defer();
+    heldHistoryGet = held;
+    const { rerender } = renderIgnoredGroup();
+    await waitFor(() => expect(calls).toContain(groupHistoryUrl));
+    // Un-ignore while the fetch is in flight: the snapshot has not landed
+    // yet, so the thread holds its (empty) history.
+    rerender(ignoredGroupUi([], { ignored: false }));
+    // The late fetch resolves after the un-ignore: its sequence was
+    // invalidated, so it must not commit its older response.
+    held.resolve({ messages: groupHistory });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(screen.queryByText("crew history")).toBeNull();
+  });
+
+  it("re-ignoring a held thread keeps its history when the stale refresh lands", async () => {
+    groupHistory = [
+      makeMessage({
+        id: 2,
+        group: GROUP_ID,
+        group_name: "crew",
+        peer: PEER_HASH,
+        peer_name: "Alice",
+        text: "crew history",
+      }),
+    ];
+    const { rerender } = renderIgnoredGroup();
+    await waitFor(() => expect(screen.getByText("crew history")).toBeTruthy());
+    // Un-ignore with the refresh held open, so it is still pending when
+    // the group is re-ignored.
+    const heldRefresh = defer<Snapshot | null>();
+    rerender(
+      ignoredGroupUi([], {
+        ignored: false,
+        refresh: () => heldRefresh.promise,
+      }),
+    );
+    // Re-ignore before the refresh lands: a fresh history fetch starts,
+    // held so the stale refresh lands first.
+    const heldFetch = defer();
+    heldHistoryGet = heldFetch;
+    rerender(
+      ignoredGroupUi([], {
+        ignored: true,
+        refresh: () => heldRefresh.promise,
+      }),
+    );
+    await waitFor(() =>
+      expect(calls.filter((c) => c === groupHistoryUrl).length).toBe(2),
+    );
+    // The stale un-ignore refresh lands after the re-ignore: it must not
+    // clear the history the fresh fetch is about to load.
+    heldRefresh.resolve({} as unknown as Snapshot);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(screen.getByText("crew history")).toBeTruthy();
+    // The fresh fetch lands and the history is still there.
+    heldFetch.resolve({ messages: groupHistory });
+    await waitFor(() =>
+      expect(screen.getByText("crew history")).toBeTruthy(),
+    );
+  });
+
+  it("a failed un-ignore refresh releases the held history once a snapshot lands", async () => {
+    groupHistory = [
+      makeMessage({
+        id: 2,
+        group: GROUP_ID,
+        group_name: "crew",
+        peer: PEER_HASH,
+        peer_name: "Alice",
+        text: "crew history",
+      }),
+    ];
+    const { rerender } = renderIgnoredGroup();
+    await waitFor(() => expect(screen.getByText("crew history")).toBeTruthy());
+    // Un-ignore while the snapshot still hides the posts: the default
+    // refresh answers null (bridge down), so the hold stays in place.
+    rerender(ignoredGroupUi([], { ignored: false }));
+    expect(screen.getByText("crew history")).toBeTruthy();
+    // A later snapshot lands carrying the group's posts: the hold
+    // releases even though the refresh failed, so the stale held posts
+    // give way to the snapshot.
+    rerender(
+      ignoredGroupUi(
+        [
+          makeMessage({
+            id: 3,
+            group: GROUP_ID,
+            group_name: "crew",
+            peer: PEER_HASH,
+            peer_name: "Alice",
+            text: "snapshot post",
+          }),
+        ],
+        { ignored: false },
+      ),
+    );
+    await waitFor(() =>
+      expect(screen.getAllByText("snapshot post").length).toBeGreaterThanOrEqual(1),
+    );
+    expect(screen.queryByText("crew history")).toBeNull();
   });
 });
