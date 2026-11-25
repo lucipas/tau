@@ -1990,14 +1990,17 @@ class GroupStore:
                         continue
                     if expected != pred_id:
                         continue
-                if self._lineage_creators.get(pred_id) != creator:
-                    self._lineage_creators[pred_id] = creator
-                    changed = True
                 if pred_id not in [
                     str(item).lower() for item in renamed_from
                 ]:
+                    # A full lineage cannot take another predecessor:
+                    # it would be truncated away, so it is not recorded.
+                    if len(renamed_from) >= MAX_RENAME_LINEAGE:
+                        continue
                     renamed_from.append(pred_id)
-                    renamed_from = renamed_from[:MAX_RENAME_LINEAGE]
+                    changed = True
+                if self._lineage_creators.get(pred_id) != creator:
+                    self._lineage_creators[pred_id] = creator
                     changed = True
                 recorded += 1
             if changed:
