@@ -38,6 +38,29 @@ export function canRecordVoice(): boolean {
   );
 }
 
+/** A live voice recording: its recorder, its microphone stream, and a
+    flag marking it abandoned (unmount, chat change, runtime error) so
+    its output is never attached. */
+type VoiceSession = {
+  recorder: MediaRecorder;
+  stream: MediaStream;
+  discard: boolean;
+};
+
+/** Abandon a voice recording: stop the recorder (its onstop sees the
+    discard flag and drops the output) and release the microphone. */
+function releaseVoiceSession(session: VoiceSession): void {
+  session.discard = true;
+  if (session.recorder.state !== "inactive") {
+    try {
+      session.recorder.stop();
+    } catch {
+      // Already stopped or errored; the tracks still need releasing.
+    }
+  }
+  session.stream.getTracks().forEach((t) => t.stop());
+}
+
 export function validatePoll(question: string, options: string[]): string | null {
   if (!question.trim()) return "A poll needs a question.";
   const filled = options.map((o) => o.trim()).filter(Boolean);
@@ -771,11 +794,6 @@ export default function Composer({
       {error && (
         <p role="alert" className="mt-2 text-xs text-red-400">
           {error}
-        </p>
-      )}
-    </form>
-  );
-}
         </p>
       )}
     </form>
