@@ -235,19 +235,15 @@ export function useTau(): UseTauResult {
         // Keep the live flags (and any groups the live list learned
         // since) instead of letting the stale fetch overwrite them.
         // The fetched snapshot still wins for everything else.
-        const prev = snapshotRef.current;
-        if (prev) {
-          const live = new Map(prev.groups.map((g) => [g.id, g]));
-          const merged = snap.groups.map((g) => {
-            const current = live.get(g.id);
-            return current ? { ...g, ignored: current.ignored } : g;
-          });
-          const fetchedIds = new Set(snap.groups.map((g) => g.id));
-          for (const g of prev.groups) {
-            if (!fetchedIds.has(g.id)) merged.push(g);
-          }
-          next = { ...snap, groups: merged };
-        }
+        // Membership comes from the fetched status, which reflects any
+        // deletion that happened after the event. Re-adding groups the
+        // fetch no longer lists would resurrect removed groups.
+        const live = new Map((liveGroups.current ?? []).map((g) => [g.id, g]));
+        const merged = snap.groups.map((g) => {
+          const current = live.get(g.id);
+          return current ? { ...g, ignored: current.ignored } : g;
+        });
+        next = { ...snap, groups: merged };
       }
       setSnapshot(next);
       setError(null);
@@ -944,6 +940,12 @@ export function usePeerActions(): PeerActions {
       mute: (target, muted) => setMuted(target, muted),
       pin: (target, pinned) => setPinnedConversation(target, pinned),
       markRead: (target = {}) => markRead(target),
+      markUnread: (target, all) => markUnread(target, all),
+    }),
+    [],
+  );
+}
+ markRead(target),
       markUnread: (target, all) => markUnread(target, all),
     }),
     [],
