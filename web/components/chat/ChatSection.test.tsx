@@ -721,6 +721,74 @@ describe("ChatSection ignored groups", () => {
     await waitFor(() => expect(screen.getByText("crew history")).toBeTruthy());
   });
 
+  it("keeps the fetched history when the open group is un-ignored elsewhere", async () => {
+    groupHistory = [
+      makeMessage({
+        id: 2,
+        group: GROUP_ID,
+        group_name: "crew",
+        peer: PEER_HASH,
+        peer_name: "Alice",
+        text: "crew history",
+      }),
+    ];
+    const groupUi = (ignored: boolean, messages: ReturnType<typeof makeMessage>[] = []) => (
+      <TauContext.Provider
+        value={fakeTau({
+          peers: [makePeer({ destination: PEER_HASH, name: "Alice" })],
+          messages,
+          groups: [
+            {
+              id: GROUP_ID,
+              name: "crew",
+              members: [],
+              created_at: 1700000000,
+              topic: "",
+              created_by_me: true,
+              can_leave: true,
+              ignored,
+            },
+          ],
+        })}
+      >
+        <ChatSection />
+      </TauContext.Provider>
+    );
+    const { rerender } = renderIgnoredGroup();
+    await waitFor(() =>
+      expect(
+        screen.getByText("crew history", { selector: "p" }),
+      ).toBeTruthy(),
+    );
+    // Another tab un-ignores the group: the groups event flips the
+    // flag, but the snapshot's messages still hide the group's posts
+    // — the thread must keep its fetched history, not go empty.
+    rerender(groupUi(false));
+    expect(
+      screen.getByText("crew history", { selector: "p" }),
+    ).toBeTruthy();
+    // The next snapshot refresh carries the group's posts: the stale
+    // copy drops and the thread still shows the post, now from the
+    // snapshot.
+    rerender(
+      groupUi(false, [
+        makeMessage({
+          id: 2,
+          group: GROUP_ID,
+          group_name: "crew",
+          peer: PEER_HASH,
+          peer_name: "Alice",
+          text: "crew history",
+        }),
+      ]),
+    );
+    await waitFor(() =>
+      expect(
+        screen.getByText("crew history", { selector: "p" }),
+      ).toBeTruthy(),
+    );
+  });
+
   it("re-fetches history when the snapshot's messages move", async () => {
     groupHistory = [
       makeMessage({

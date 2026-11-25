@@ -11548,8 +11548,19 @@ class WebBridge:
         group from the Ignored section until the next snapshot (#784).
         Publishing the groups keeps every open console's snapshot
         current, which also re-triggers its left-list re-read.
+
+        A failed group read publishes nothing: the [] fallback is for
+        a snapshot that must not crash, not an authoritative empty
+        list — broadcasting it would clear every console's sidebar
+        while the request still reports success.
         """
-        self.bus.publish({"type": "groups", "groups": self.groups()})
+        groups = self._read_groups()
+        if groups is None:
+            log.debug(
+                "Could not read group store for groups event", exc_info=True
+            )
+            return
+        self.bus.publish({"type": "groups", "groups": groups})
 
     def muted_conversations(self, *, visible_only: bool = False) -> Dict[str, Any]:
         """All muted conversations, for the console load.
@@ -12229,21 +12240,25 @@ class WebBridge:
         if path is None:
             raise ValueError("ignored-groups is not configured for this node")
         # Reload inside the lock: two ignore commands racing must not
-        # discard each other's change to a different group.
+        # discard each other's change to a different group.  The
+        # publishes stay inside it too: the groups event is read from
+        # the file, so publishing after the lock is released could let
+        # a newer ignore-state change publish first and leave every
+        # console with stale flags (#784).
         with ignored_groups_lock(path):
             ignored = load_ignored_groups(path)
             already = ignored.is_ignored(group_id)
             if not already:
                 ignored = ignored.with_added(group_id)
                 save_ignored_groups(path, ignored)
-        if not already:
-            # The group's posts stop lighting the badge at once: push
-            # the recomputed counts so every open console reconciles
-            # without waiting for the next message.  Push the groups
-            # too, so the snapshot's ignored flag never lags the
-            # ignore file (#784).
-            self.bus.publish({"type": "unread", "unread": self.unread()})
-            self._publish_groups()
+            if not already:
+                # The group's posts stop lighting the badge at once:
+                # push the recomputed counts so every open console
+                # reconciles without waiting for the next message.
+                # Push the groups too, so the snapshot's ignored flag
+                # never lags the ignore file (#784).
+                self.bus.publish({"type": "unread", "unread": self.unread()})
+                self._publish_groups()
         return {
             "group": group_id,
             "name": group["name"],
