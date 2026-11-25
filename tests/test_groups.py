@@ -5461,6 +5461,7 @@ def _stub_group_send_file(node, *, fail_for=()):
         deadline=None,
         forwarded_from=None,
         group=None,
+        voice=False,
     ):
         calls.append(
             (target, name, timeout, discover_timeout, data, deadline, forwarded_from)

@@ -876,6 +876,13 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="SECONDS",
         help="how long to wait for an unknown peer to announce",
     )
+    send_file.add_argument(
+        "--voice",
+        action="store_true",
+        help="mark the file as a voice note: the receiver stores the "
+        "marker on the file record and the console renders an audio "
+        "player instead of a download link",
+    )
     send_file.set_defaults(func=cmd_send_file)
 
     # Files queued with `--delay` wait here until a serving node
@@ -3419,6 +3426,13 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="SECONDS",
         help="how long to wait for an unknown peer to announce",
     )
+    group_send_file.add_argument(
+        "--voice",
+        action="store_true",
+        help="mark the file as a voice note: each member stores the "
+        "marker on the file record and the console renders an audio "
+        "player instead of a download link",
+    )
     group_send_file.set_defaults(func=cmd_group_send_file)
 
     group_pin = group_sub.add_parser(
@@ -3689,6 +3703,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=10.0,
         metavar="SECONDS",
         help="how long to wait for an unknown peer to announce",
+    )
+    broadcast_send_file.add_argument(
+        "--voice",
+        action="store_true",
+        help="mark the file as a voice note: each member stores the "
+        "marker on the file record and the console renders an audio "
+        "player instead of a download link",
     )
     broadcast_send_file.set_defaults(func=cmd_broadcast_send_file)
 
@@ -12395,6 +12416,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
                             if isinstance(record.get("forwarded_from"), dict)
                             else {}
                         ),
+                        **({"voice": True} if record.get("voice") is True else {}),
                     },
                 }
             )
@@ -16638,6 +16660,7 @@ def _forward_file(
                 forwarded_from,
                 file_timeout=file_timeout,
                 discover_timeout=discover_timeout,
+                voice=record.get("voice") is True,
             )
         return _forward_file_to_peers(
             args,
@@ -16650,6 +16673,7 @@ def _forward_file(
             targets,
             file_timeout=file_timeout,
             discover_timeout=discover_timeout,
+            voice=record.get("voice") is True,
         )
 
 
@@ -16724,6 +16748,7 @@ def _forward_file_to_peers(
     *,
     file_timeout: float,
     discover_timeout: float,
+    voice: bool = False,
 ) -> int:
     """Forward a stored file to peers: one file leg each.
 
@@ -16741,6 +16766,7 @@ def _forward_file_to_peers(
             file_timeout,
             discover_timeout,
             forwarded_from=forwarded_from,
+            voice=voice,
         )
         _record_forwarded_file(
             node,
@@ -16785,6 +16811,7 @@ def _forward_file_send_peers(
     discover_timeout: float,
     *,
     forwarded_from: Optional[Dict[str, Any]] = None,
+    voice: bool = False,
 ) -> List[Dict[str, Any]]:
     """Send the staged file to each peer, reporting per-recipient results."""
     results: List[Dict[str, Any]] = []
@@ -16796,6 +16823,7 @@ def _forward_file_send_peers(
                 timeout=file_timeout,
                 discover_timeout=discover_timeout,
                 forwarded_from=forwarded_from,
+                voice=voice,
             )
         except (NodeError, PeerError, ValueError, OSError) as exc:
             results.append({"target": target, "ok": False, "error": str(exc)})
@@ -16815,6 +16843,7 @@ def _forward_file_to_group(
     *,
     file_timeout: float,
     discover_timeout: float,
+    voice: bool = False,
 ) -> int:
     """Forward a stored file into a group: one file leg per member.
 
@@ -16832,6 +16861,7 @@ def _forward_file_to_group(
             timeout=file_timeout,
             discover_timeout=discover_timeout,
             forwarded_from=forwarded_from,
+            voice=voice,
         )
         _record_forwarded_file(
             node,
@@ -16881,6 +16911,7 @@ def _queue_file_for_later(
     group_members: Tuple[str, ...] = (),
     timeout: float = 300.0,
     discover_timeout: float = 10.0,
+    voice: bool = False,
 ) -> ScheduledFile:
     """Stage *path* and queue it for *target* at *send_after*.
 
@@ -16899,6 +16930,15 @@ def _queue_file_for_later(
         data, name, digest = read_file_payload(path)
     except ScheduledFileError as exc:
         raise NodeError(str(exc)) from exc
+    descriptor: Dict[str, Any] = {
+        "sha256": digest,
+        "size": len(data),
+        "name": name,
+    }
+    if voice is True:
+        # The marker rides in the descriptor, so the publish pass
+        # sends it as a voice note at send time.
+        descriptor["voice"] = True
     entry_id = new_scheduled_file_id()
     with scheduled_files_lock(config.scheduled_files_path):
         stage_file(config.scheduled_files_dir, entry_id, name, data)
@@ -16909,7 +16949,7 @@ def _queue_file_for_later(
                     id=entry_id,
                     target=target,
                     kind=kind,
-                    file={"sha256": digest, "size": len(data), "name": name},
+                    file=descriptor,
                     publish_at=send_after,
                     created_at=time.time(),
                     group_id=group_id,
@@ -16998,6 +17038,7 @@ def cmd_send_file(args: argparse.Namespace) -> int:
             send_after=time.time() + delay,
             timeout=float(getattr(args, "timeout", 300.0)),
             discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
+            voice=bool(getattr(args, "voice", False)),
         )
         if _json_mode(args):
             _emit_scheduled_file(entry)
@@ -17023,6 +17064,7 @@ def cmd_send_file(args: argparse.Namespace) -> int:
             timeout=float(getattr(args, "timeout", 300.0)),
             discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
             progress_callback=on_progress,
+            voice=bool(getattr(args, "voice", False)),
         )
     finally:
         node.stop()
@@ -22835,6 +22877,7 @@ def cmd_group_send_file(args: argparse.Namespace) -> int:
             group_members=tuple(sorted(group["members"])),
             timeout=float(getattr(args, "timeout", 300.0)),
             discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
+            voice=bool(getattr(args, "voice", False)),
         )
         if _json_mode(args):
             _emit_scheduled_file(entry)
@@ -22850,6 +22893,7 @@ def cmd_group_send_file(args: argparse.Namespace) -> int:
             args.path,
             timeout=float(getattr(args, "timeout", 300.0)),
             discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
+            voice=bool(getattr(args, "voice", False)),
         )
     finally:
         node.stop()
@@ -23189,6 +23233,7 @@ def cmd_broadcast_send_file(args: argparse.Namespace) -> int:
             group_members=tuple(sorted(broadcast["members"])),
             timeout=float(getattr(args, "timeout", 300.0)),
             discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
+            voice=bool(getattr(args, "voice", False)),
         )
         if _json_mode(args):
             _emit_scheduled_file(entry)
@@ -23203,6 +23248,7 @@ def cmd_broadcast_send_file(args: argparse.Namespace) -> int:
             args.path,
             timeout=float(getattr(args, "timeout", 300.0)),
             discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
+            voice=bool(getattr(args, "voice", False)),
         )
     finally:
         node.stop()

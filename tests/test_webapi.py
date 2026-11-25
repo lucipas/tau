@@ -813,6 +813,7 @@ class FakeNode:
         discover_timeout=None,
         progress_callback=None,
         forwarded_from=None,
+        voice=False,
     ):
         import hashlib
         from pathlib import Path
@@ -821,7 +822,7 @@ class FakeNode:
         peer = target if isinstance(target, Peer) else self.resolve_peer(target)
         self.sent_files.append((peer.name, Path(path).name, data))
         self.sent_file_kwargs.append(
-            {"timeout": timeout, "forwarded_from": forwarded_from}
+            {"timeout": timeout, "forwarded_from": forwarded_from, "voice": voice}
         )
         return {
             "ok": True,
@@ -840,6 +841,7 @@ class FakeNode:
         timeout=300.0,
         discover_timeout=None,
         forwarded_from=None,
+        voice=False,
     ):
         import hashlib
         from pathlib import Path
@@ -850,7 +852,7 @@ class FakeNode:
         digest = hashlib.sha256(data).hexdigest()
         self.group_sent_files.append((group["name"], Path(path).name, data))
         self.group_sent_file_kwargs.append(
-            {"timeout": timeout, "forwarded_from": forwarded_from}
+            {"timeout": timeout, "forwarded_from": forwarded_from, "voice": voice}
         )
         names = {PEER_HASH: "alice", BOB_HASH: "bob"}
         results = []
@@ -885,7 +887,7 @@ class FakeNode:
         }
 
     def send_broadcast_file(
-        self, broadcast, path, *, timeout=300.0, discover_timeout=None
+        self, broadcast, path, *, timeout=300.0, discover_timeout=None, voice=False
     ):
         import hashlib
         from pathlib import Path
@@ -15008,6 +15010,24 @@ def test_stored_file_metadata_survives_load_and_bad_shapes_drop():
 
     entry["file"] = {"name": "x", "size": -1, "sha256": "a" * 64}
     assert "file" not in _clean_stored_message(entry)
+
+
+def test_stored_file_keeps_voice_marker_and_drops_non_bool():
+    from tau.webapi import _clean_stored_file, _clean_stored_message
+
+    voice = {"name": "voice-note-1.webm", "size": 10, "sha256": "a" * 64, "voice": True}
+    assert _clean_stored_file(voice) == voice
+    assert _clean_stored_file({**voice, "voice": "yes"}) == {
+        "name": "voice-note-1.webm",
+        "size": 10,
+        "sha256": "a" * 64,
+    }
+
+    entry = _stored_message(1, "Sent file: voice-note-1.webm (10 bytes)", direction="out")
+    entry["file"] = voice
+    cleaned = _clean_stored_message(entry)
+    assert cleaned is not None
+    assert cleaned["file"]["voice"] is True
 
 
 def test_stored_location_pin_survives_load_and_bad_shapes_drop():

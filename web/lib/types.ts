@@ -307,6 +307,8 @@ export interface StoredFile {
   name: string;
   size: number;
   sha256: string;
+  /** A voice note: the console renders an audio player, not a download link. */
+  voice?: boolean;
 }
 
 export interface ReplyRef {

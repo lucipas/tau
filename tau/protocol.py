@@ -2394,6 +2394,7 @@ def build_file_offer(
     sent_at: Optional[float] = None,
     forwarded_from: Optional[Dict[str, Any]] = None,
     group: Optional[str] = None,
+    voice: bool = False,
 ) -> bytes:
     """Encode a signed file offer for the ``/tau/file`` request.
 
@@ -2424,6 +2425,12 @@ def build_file_offer(
     file — before any bytes move, instead of trusting the sender's
     word that the send side already refused it.  Absent on direct
     and broadcast files.
+
+    ``voice`` marks the file as a voice note: it rides inside the
+    signed payload, so the receiver stores it on the file record and
+    the console renders an audio player instead of a download link.
+    Absent (``False``) on ordinary files, and peers that predate the
+    field ignore it; the file itself still arrives fine.
     """
     clean_name = sanitize_file_name(name)
     if not clean_name:
@@ -2457,6 +2464,8 @@ def build_file_offer(
         payload["forwarded_from"] = _clean_forwarded_from(forwarded_from)
     if group is not None:
         payload["group"] = _clean_hexhash(group, "group")
+    if voice is True:
+        payload["voice"] = True
     signature = sender_identity.sign(encode(payload))
     if signature is None:  # pragma: no cover - identity without private keys
         raise ProtocolError("sender identity cannot sign")
@@ -2572,6 +2581,13 @@ def parse_file_offer(
         # offer.  Absent on offers that are not group files, and on
         # offers from older peers.
         result["group"] = _clean_hexhash(payload.get("group"), "group")
+    if payload.get("voice") is True:
+        # Inside the signed payload, so a tampered marker fails the
+        # signature check above.  Only the literal ``True`` counts:
+        # any other value is ignored, so a peer that writes the field
+        # some other way cannot smuggle a marker in.  Absent on
+        # ordinary files, and on offers from older peers.
+        result["voice"] = True
     return result
 
 

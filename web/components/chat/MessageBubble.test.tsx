@@ -120,6 +120,25 @@ describe("MessageBubble", () => {
     expect(link.getAttribute("href")).toContain("notes.txt");
   });
 
+  it("renders a voice note as an audio player, not a download link", () => {
+    render(
+      <MessageBubble
+        message={makeMessage({
+          id: 11,
+          text: "Sent file: voice-note-1.webm (12 bytes)",
+          file: { name: "voice-note-1.webm", size: 12, sha256: "ab".repeat(32), voice: true },
+        })}
+        now={1700000060}
+      />,
+    );
+    expect(screen.getByText(/Voice note/)).toBeTruthy();
+    const audio = document.querySelector("audio");
+    expect(audio).toBeTruthy();
+    expect(audio?.getAttribute("src")).toContain("/api/files/");
+    expect(audio?.getAttribute("src")).toContain("voice-note-1.webm");
+    expect(document.querySelector("a[download]")).toBeNull();
+  });
+
   it("renders poll options and votes through onVotePoll", () => {
     const onVotePoll = vi.fn();
     render(
