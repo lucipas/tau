@@ -2112,11 +2112,13 @@ def test_mark_unread_moves_cursor_back_to_before_the_message(identities, tmp_pat
     assert marked["unread"] == 1
     assert channel_unread_counts(conn) == {"general": 1}
 
-    # Re-opening at the oldest message deletes the cursor: the whole
-    # channel reads unread again.
+    # Re-opening at the oldest message sets a sentinel cursor just
+    # before it: the whole channel reads unread again, and the
+    # pre-join rule is kept — deleting the cursor would drop it, so a
+    # reminder fired on a pre-join cached message would not relight.
     marked = mark_channel_unread(conn, "general", one["hash"])
-    assert marked["hash"] is None
-    assert marked["created_at"] is None
+    assert marked["hash"] == ""
+    assert marked["created_at"] == 1001
     assert marked["unread"] == 2
     assert channel_unread_counts(conn) == {"general": 2}
 
