@@ -31,6 +31,7 @@ import {
   getChannelTopic,
   getDrafts,
   getGroupInviteStatus,
+  getGroupMessages,
   getMessages,
   getOwnProfile,
   getQuietHours,
@@ -133,6 +134,14 @@ describe("GET endpoints", () => {
     expect(captured[0].url).toBe("/api/messages?limit=50");
     expect(captured[0].init?.headers).toEqual({ "Content-Type": "application/json" });
     expect(captured[0].init?.method).toBeUndefined();
+  });
+
+  it("fetches one group's history with include-ignored", async () => {
+    nextJson = { messages: [] };
+    await getGroupMessages("g".repeat(32));
+    expect(captured[0].url).toBe(
+      `/api/messages?group=${"g".repeat(32)}&include_ignored=1&limit=200`,
+    );
   });
 
   it("builds the Tan timeline query (all / author / tag)", async () => {

@@ -14124,7 +14124,33 @@ class _WebHandler(BaseHTTPRequestHandler):
                     if pinned_only
                     else _int_param(query, "limit", default=200, minimum=1, maximum=500)
                 )
-                items = self.bridge.messages(limit, strict_pins=pinned_only)
+                # An explicit single-group lookup may ask for that
+                # group's ignored posts: opening an ignored group
+                # fetches its stored history this way. The default
+                # listing keeps hiding ignored posts, and
+                # include_ignored without a group is ignored, so the
+                # feed can never leak them by accident.
+                group_id = (query.get("group") or [None])[0]
+                include_ignored = (
+                    group_id is not None and query.get("include_ignored") == ["1"]
+                )
+                fetch_limit = -1 if group_id is not None else limit
+                items = self.bridge.messages(
+                    fetch_limit,
+                    strict_pins=pinned_only,
+                    include_ignored=include_ignored,
+                )
+                if group_id is not None:
+                    # Slice after filtering: the window is the group's
+                    # own newest messages, not the node's. A pinned
+                    # view already spans the whole log (limit -1).
+                    items = [
+                        item
+                        for item in items
+                        if str(item.get("group") or "") == group_id
+                    ]
+                    if limit >= 0:
+                        items = items[-limit:]
                 if pinned_only:
                     items = [item for item in items if item.get("pinned")]
                 self._send_json({"messages": items}, head_only)

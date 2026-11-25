@@ -21,6 +21,7 @@ import {
   forwardMessage,
   getArchivedConversations,
   getDrafts,
+  getGroupMessages,
   getMutedConversations,
   getReminders,
   joinGroupViaLink,
@@ -216,6 +217,54 @@ export default function ChatSection() {
       .catch(() => undefined);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedKey]);
+
+  // History of the open ignored group, fetched explicitly: the
+  // snapshot's default listing hides ignored posts, so the thread would
+  // look empty without it. Kept apart from tau.messages so ignored
+  // posts never leak into the feed or the conversation list — only the
+  // open thread sees them. A slow response must not overwrite a newer
+  // selection, and a failed fetch shows a retryable error instead of
+  // silently leaving the thread empty.
+  const [ignoredHistory, setIgnoredHistory] = useState<ChatMessage[]>([]);
+  const [ignoredHistoryError, setIgnoredHistoryError] = useState(false);
+  const [ignoredHistoryRetry, setIgnoredHistoryRetry] = useState(0);
+  const ignoredHistorySeq = useRef(0);
+  // Ignoring or un-ignoring the open group keeps its key, so the
+  // ignored flag must be a dependency too.
+  const selectedIgnoredGroup = selected?.kind === "group" && !!selected.ignored;
+  useEffect(() => {
+    const seq = ++ignoredHistorySeq.current;
+    if (!selected || !selectedIgnoredGroup) {
+      setIgnoredHistory([]);
+      setIgnoredHistoryError(false);
+      return;
+    }
+    // Re-fetch when the snapshot's messages move: the snapshot never
+    // carries ignored posts, so without this a new post, edit, or
+    // deletion in the open ignored group would never reach the thread.
+    void (async () => {
+      try {
+        const history = await getGroupMessages(selected.key);
+        if (seq !== ignoredHistorySeq.current) return;
+        setIgnoredHistory(history);
+        setIgnoredHistoryError(false);
+      } catch {
+        if (seq === ignoredHistorySeq.current) setIgnoredHistoryError(true);
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedKey, selectedIgnoredGroup, tau.messages, ignoredHistoryRetry]);
+
+  // The open thread sees the snapshot plus the ignored group's explicit
+  // history; the snapshot's copy wins on overlap (a group un-ignored
+  // while open lands in both). The list and feed keep tau.messages.
+  const threadMessages = useMemo(() => {
+    if (ignoredHistory.length === 0) return tau.messages;
+    const byId = new Map<number, ChatMessage>();
+    for (const message of ignoredHistory) byId.set(message.id, message);
+    for (const message of tau.messages) byId.set(message.id, message);
+    return [...byId.values()];
+  }, [tau.messages, ignoredHistory]);
 
   const refreshDrafts = useCallback(async () => {
     try {
@@ -861,10 +910,18 @@ export default function ChatSection() {
               onRefresh={beacons.refresh}
               onError={(message) => setError(message)}
             />
+            {selected.ignored && ignoredHistoryError && (
+              <p role="alert" className="border-b border-zinc-800 bg-zinc-900 px-3 py-1.5 text-xs text-zinc-300">
+                Couldn&apos;t load this group&apos;s history.
+                <button type="button" onClick={() => setIgnoredHistoryRetry((n) => n + 1)} className="ml-2 underline">
+                  Retry
+                </button>
+              </p>
+            )}
             <div className="min-h-0 flex-1">
               <ThreadView
                 conversation={selected}
-                messages={tau.messages}
+                messages={threadMessages}
                 typingName={typingName}
                 replyTo={replyTo}
                 onReplyToChange={setReplyTo}

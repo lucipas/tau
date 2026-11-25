@@ -433,20 +433,24 @@ export interface IgnoredGroup {
  * snapshot carries the name for every group whose record still exists;
  * an id the snapshot does not know is an orphan whose record was
  * deleted (or whose backup restored the ignore list without
- * groups.json), shown by id prefix so it still has a way out.
+ * groups.json), shown by id prefix so it still has a way out. A left
+ * entry the snapshot still knows is stale, not an orphan — the group
+ * was un-ignored elsewhere and the cached entry has not refreshed yet —
+ * so it produces no row.
  */
 export function mergeIgnoredGroups(
   groups: Group[],
   leftIgnored: { id: string; name: string }[],
 ): IgnoredGroup[] {
   const merged = new Map<string, IgnoredGroup>();
+  const knownIds = new Set(groups.map((g) => g.id));
   for (const group of groups) {
     if (group.ignored) {
       merged.set(group.id, { id: group.id, name: group.name, openable: true });
     }
   }
   for (const entry of leftIgnored) {
-    if (!merged.has(entry.id)) {
+    if (!merged.has(entry.id) && !knownIds.has(entry.id)) {
       merged.set(entry.id, {
         id: entry.id,
         name: entry.name || entry.id.slice(0, 8),

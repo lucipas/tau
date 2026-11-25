@@ -4186,6 +4186,50 @@ def test_api_messages_hide_ignored_group_posts(bridge, node, tmp_path):
     ]
 
 
+def test_api_messages_group_include_ignored(bridge, node, tmp_path):
+    group_id = _learned_group(node, tmp_path)
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "crew chat",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "kind": "group",
+            "group": group_id,
+            "group_name": "weekend",
+        }
+    )
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "plain dm",
+            "sent_at": 102.0,
+            "received_at": 103.0,
+        }
+    )
+    _json(
+        bridge, "/api/groups/ignore", method="POST", body={"group": "weekend"}
+    )
+    # The default listing still hides the ignored group's posts.
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [m["text"] for m in feed["messages"]] == ["plain dm"]
+    # A bare group lookup hides them too: only the explicit
+    # include-ignored flag on a single-group lookup brings them back,
+    # so an open ignored thread can show its history.
+    _, _, feed = _json(bridge, f"/api/messages?group={group_id}")
+    assert feed["messages"] == []
+    _, _, feed = _json(
+        bridge, f"/api/messages?group={group_id}&include_ignored=1"
+    )
+    assert [m["text"] for m in feed["messages"]] == ["crew chat"]
+    # include_ignored without a group is ignored: the feed must never
+    # leak ignored posts by accident.
+    _, _, feed = _json(bridge, "/api/messages?include_ignored=1")
+    assert [m["text"] for m in feed["messages"]] == ["plain dm"]
+
+
 def test_api_unread_excludes_ignored_group_posts(bridge, node, tmp_path):
     group_id = _learned_group(node, tmp_path)
     _inbound_record(
