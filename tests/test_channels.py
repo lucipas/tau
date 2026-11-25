@@ -8,6 +8,8 @@ import RNS
 
 from tau.blocklist import BlockList, save_blocklist
 from tau.channels import (
+    CHANNEL_EXPORT_FORMAT,
+    CHANNEL_EXPORT_VERSION,
     CHANNEL_FEED_PATH,
     CHANNEL_POST_PATH,
     CHANNEL_REACT_PATH,
@@ -21,6 +23,7 @@ from tau.channels import (
     create_message,
     create_topic,
     create_reaction,
+    export_channel_document,
     get_message,
     get_topic,
     init_db,
@@ -4191,3 +4194,135 @@ def test_cli_channel_send_expire_rejects_bad_durations(tmp_path, capsys):
             == 2
         )
         assert "error" in capsys.readouterr().err
+
+
+# -- export --------------------------------------------------------------------
+
+
+def test_export_channel_document_returns_oldest_first(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    create_message(conn, alice, "general", "one", name="alice", now=1000)
+    create_message(conn, alice, "general", "two", name="alice", now=1001)
+    create_message(conn, alice, "general", "three", name="alice", now=1002)
+    create_message(conn, alice, "other", "elsewhere", name="alice", now=1003)
+
+    document = export_channel_document(conn, "general")
+
+    assert document["format"] == CHANNEL_EXPORT_FORMAT
+    assert document["version"] == CHANNEL_EXPORT_VERSION
+    assert document["channel"] == "general"
+    assert document["exported_at"] > 0
+    assert [item["text"] for item in document["messages"]] == [
+        "one",
+        "two",
+        "three",
+    ]
+    assert all(item["hash"] and item["author"] for item in document["messages"])
+
+
+def test_export_channel_document_empty_channel(identities, tmp_path):
+    conn = init_db(tmp_path / "channels.sqlite3")
+
+    document = export_channel_document(conn, "general")
+
+    assert document["format"] == CHANNEL_EXPORT_FORMAT
+    assert document["channel"] == "general"
+    assert document["messages"] == []
+
+
+def test_export_channel_document_excludes_retracted_and_expired(
+    identities, tmp_path
+):
+    alice, bob = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    now = time.time()
+    create_message(conn, bob, "general", "keep me", name="bob", now=1000)
+    drop = create_message(conn, bob, "general", "drop me", name="bob", now=1001)
+    create_retraction(conn, bob, "general", drop["hash"], now=1002)
+    create_message(
+        conn, alice, "general", "gone by now", name="alice",
+        now=now - 7200, expires_at=now - 3600,
+    )
+    create_message(
+        conn, alice, "general", "still here", name="alice",
+        now=now - 60, expires_at=now + 3600,
+    )
+
+    document = export_channel_document(conn, "general")
+
+    assert [item["text"] for item in document["messages"]] == [
+        "keep me",
+        "still here",
+    ]
+
+
+def test_export_channel_document_rejects_bad_name(tmp_path):
+    conn = init_db(tmp_path / "channels.sqlite3")
+    with pytest.raises(ChannelError):
+        export_channel_document(conn, "has spaces")
+
+
+def test_cli_channel_export_round_trip(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert (
+        main(["channel", "join", "--data-dir", str(data_dir), "general"]) == 0
+    )
+    assert (
+        main(
+            [
+                "channel",
+                "send",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "general",
+                "hello from the cli",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    assert (
+        main(["channel", "export", "--data-dir", str(data_dir), "general"]) == 0
+    )
+    document = json.loads(capsys.readouterr().out)
+    assert document["format"] == CHANNEL_EXPORT_FORMAT
+    assert document["channel"] == "general"
+    assert [item["text"] for item in document["messages"]] == [
+        "hello from the cli"
+    ]
+
+    out_file = tmp_path / "general.json"
+    assert (
+        main(
+            [
+                "channel",
+                "export",
+                "--data-dir",
+                str(data_dir),
+                "--output",
+                str(out_file),
+                "general",
+            ]
+        )
+        == 0
+    )
+    assert "Exported 1 messages (#general)" in capsys.readouterr().out
+    assert json.loads(out_file.read_text())["messages"][0]["text"] == (
+        "hello from the cli"
+    )
+
+
+def test_cli_channel_export_rejects_bad_name(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert (
+        main(
+            ["channel", "export", "--data-dir", str(data_dir), "has spaces"]
+        )
+        == 2
+    )
+    assert "error" in capsys.readouterr().err
