@@ -474,6 +474,39 @@ describe("PeerPanel join requests", () => {
     ).toHaveLength(1);
   });
 
+  it("shows a load error apart from action errors, and clears it on a fresh load", async () => {
+    let calls = 0;
+    mockFetchBodies((url) => {
+      if (url.includes("/api/groups/join-requests")) {
+        calls += 1;
+        if (calls === 1) {
+          throw new Error("boom");
+        }
+        return { requests: [joinRequest({ group_id: OTHER_GROUP })], count: 1 };
+      }
+      return inviteOnly(url);
+    });
+    const other = {
+      ...groupConv(),
+      key: OTHER_GROUP,
+      name: "crew2",
+      group: { ...groupConv().group!, id: OTHER_GROUP },
+    };
+    const { rerender } = renderPanel(groupConv());
+    await waitFor(() =>
+      expect(screen.getByText(/Couldn't load join requests/)).toBeTruthy(),
+    );
+    expect(screen.queryByText("Join requests")).toBeNull();
+    rerender(
+      <TauContext.Provider value={fakeTauSections()}>
+        <PeerPanel conversation={other} />
+      </TauContext.Provider>,
+    );
+    await waitFor(() => expect(screen.getByText("Join requests")).toBeTruthy());
+    expect(screen.queryByText(/Couldn't load join requests/)).toBeNull();
+    expect(screen.getByText("carol")).toBeTruthy();
+  });
+
   it("shows no section when there are no pending requests", async () => {
     mockFetch((url) => {
       if (url.includes("/api/groups/join-requests")) {

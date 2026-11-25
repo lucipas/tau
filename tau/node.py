@@ -3227,6 +3227,19 @@ class TauNode:
             resolve_join_request(
                 self.config.join_requests_path, group["name"], peer_hash
             )
+            # The roster can change under this call — a removal in
+            # another tab or process landing between the membership
+            # check above and the resolve — so re-read it before
+            # reporting already_member: the request stays resolved
+            # (as after a deny) but the call must not claim a peer
+            # the successor roster no longer contains is a member.
+            # find() raises when the group itself is gone.
+            current = self.groups.find(group["name"])
+            if peer_hash not in current["members"]:
+                raise ValueError(
+                    f"roster changed while approving: {peer_hash[:8]} is "
+                    f"no longer a member of {group['name']!r}"
+                )
             return {"status": "already_member", "group": _invite_group_summary(group)}
         if peer_hash in (group.get("banned") or []):
             raise ValueError(

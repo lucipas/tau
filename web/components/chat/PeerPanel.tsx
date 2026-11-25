@@ -11,7 +11,7 @@
 
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   addGroupMembers,
   approveJoinRequest,
@@ -115,6 +115,15 @@ export default function PeerPanel({
   // Pending join requests for a group this node created (closed invite
   // links only): the peer who asked and when, or null while loading.
   const [requests, setRequests] = useState<JoinRequest[] | null>(null);
+  // A load failure is a join-requests problem, not an action failure:
+  // it gets its own message, cleared by the next successful load, so
+  // a transient poll failure never sticks beside a fresh list and
+  // never replaces an error from a decision.
+  const [requestsError, setRequestsError] = useState<string | null>(null);
+  // Generation of the latest requests load: a slow poll that started
+  // before a decision (or a newer poll) must not overwrite the newer
+  // list with its older result.
+  const requestsGen = useRef(0);
   // Roster management (creator only): the peer picked to add, and the
   // member awaiting a remove confirm.
   const [addPeer, setAddPeer] = useState("");
@@ -182,19 +191,26 @@ export default function PeerPanel({
   // the panel is open so requests arriving from closed invite links show
   // up without reopening it. The request names the group, so filter by
   // the group id to keep another group's requests out of this panel.
+  // A load applies only when no newer load has superseded it (see
+  // requestsGen): a slow poll must not overwrite a newer list.
   useEffect(() => {
     setRequests(null);
+    setRequestsError(null);
     if (!groupCreatedByMe || !groupId) return;
     let cancelled = false;
     const load = () => {
+      const gen = ++requestsGen.current;
       void getJoinRequests()
         .then((all) => {
-          if (!cancelled) {
+          if (!cancelled && requestsGen.current === gen) {
             setRequests(all.filter((r) => r.group_id === groupId));
+            setRequestsError(null);
           }
         })
         .catch((err) => {
-          if (!cancelled) setError(err instanceof Error ? err.message : String(err));
+          if (!cancelled && requestsGen.current === gen) {
+            setRequestsError(err instanceof Error ? err.message : String(err));
+          }
         });
     };
     load();
@@ -316,10 +332,28 @@ export default function PeerPanel({
       }
       // A navigation above already changed the hash, so the
       // successor's own load owns its list; commit here only when
-      // the panel still shows this decision's group.
+      // the panel still shows this decision's group. The reload is
+      // generation-guarded like the polls (see requestsGen), and a
+      // reload failure is a load problem, not an action error — the
+      // decision itself already succeeded.
       if (window.location.hash === startedAt && !successorMissing) {
-        const fresh = await getJoinRequests();
-        setRequests(fresh.filter((r) => r.group_id === nextId));
+        const gen = ++requestsGen.current;
+        try {
+          const fresh = await getJoinRequests();
+          if (
+            requestsGen.current === gen &&
+            window.location.hash === startedAt
+          ) {
+            setRequests(fresh.filter((r) => r.group_id === nextId));
+          }
+        } catch (err) {
+          if (
+            requestsGen.current === gen &&
+            window.location.hash === startedAt
+          ) {
+            setRequestsError(err instanceof Error ? err.message : String(err));
+          }
+        }
       }
     } catch (err) {
       // A switch mid-flight means this error belongs to a group the
@@ -597,6 +631,12 @@ export default function PeerPanel({
             </div>
           )}
         </div>
+      )}
+
+      {isGroup && groupCreatedByMe && requestsError !== null && (
+        <p role="alert" className="mt-2 text-xs text-amber-300">
+          Couldn&apos;t load join requests — {requestsError}
+        </p>
       )}
 
       {isGroup && groupCreatedByMe && requests !== null && requests.length > 0 && (

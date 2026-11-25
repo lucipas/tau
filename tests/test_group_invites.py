@@ -723,6 +723,66 @@ def test_approve_clears_request_for_peer_already_added(tmp_path, monkeypatch):
     assert node.list_join_requests(group["name"]) == []
 
 
+def test_approve_already_member_rereads_roster_after_resolve(
+    tmp_path, monkeypatch
+):
+    node, identity, own_hash = _invite_node(tmp_path)
+    _, bob = _peer_identity("bob")
+    carol_identity, carol = _peer_identity(JOINER)
+    group = _group(node, own_hash, bob)
+    link = mint_invite(
+        node.config.invites_path,
+        identity,
+        group_name=group["name"],
+        creator_hash=own_hash,
+        mode="closed",
+    )
+    monkeypatch.setattr(
+        node,
+        "send_group_message",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("no welcome for an already-admitted peer")
+        ),
+    )
+    response = decode(
+        node._handle_message(
+            "/tau/message",
+            encode_message(link, kind="group-join-request", message_id="m-1"),
+            b"req-1",
+            carol_identity,
+            1000.0,
+        )
+    )
+    assert response["status"] == "pending"
+    # The creator adds carol separately, without approving.
+    node.groups.update_members(
+        group["id"],
+        [own_hash, bob.hexhash, carol.hexhash],
+        created_by=own_hash,
+    )
+    # A removal landing between the membership check and the resolve:
+    # resolve through a wrapper that drops carol from the roster first.
+    import tau.node as node_module
+
+    real_resolve = node_module.resolve_join_request
+
+    def resolving_remove(path, group_name, peer):
+        current = node.groups.find(group_name)
+        node.groups.update_members(
+            current["id"],
+            [own_hash, bob.hexhash],
+            created_by=own_hash,
+        )
+        return real_resolve(path, group_name, peer)
+
+    monkeypatch.setattr(node_module, "resolve_join_request", resolving_remove)
+    # The call must not report already_member for a peer the successor
+    # roster no longer contains — even though the request is resolved.
+    with pytest.raises(ValueError, match="no longer a member"):
+        node.approve_join_request(group["name"], carol.hexhash)
+    assert node.list_join_requests(group["name"]) == []
+
+
 # --- node: roster-change announcements --------------------------------------
 
 
