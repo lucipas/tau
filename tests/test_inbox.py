@@ -1282,6 +1282,29 @@ def test_export_document_filters_by_peer(tmp_path):
     assert [entry["id"] for entry in document["messages"]] == ["a1"]
 
 
+def test_export_document_filters_by_group(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="g1", kind="group", group="cc" * 16))
+    inbox.append(_record(id="g2", kind="group", group="dd" * 16))
+    inbox.append(_record(id="d1"))
+
+    document = inbox.export_document(group="cc" * 16)
+    assert [entry["id"] for entry in document["messages"]] == ["g1"]
+
+
+def test_export_document_filters_by_group_set(tmp_path):
+    # A renamed group's history spans two ids: the export takes the
+    # whole lineage, not just the current id.
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="g1", kind="group", group="cc" * 16))
+    inbox.append(_record(id="g2", kind="group", group="dd" * 16))
+    inbox.append(_record(id="g3", kind="group", group="ee" * 16))
+    inbox.append(_record(id="d1"))
+
+    document = inbox.export_document(group=["cc" * 16, "dd" * 16])
+    assert [entry["id"] for entry in document["messages"]] == ["g1", "g2"]
+
+
 def test_export_document_sees_messages_committed_by_another_process(tmp_path):
     # A serving node's in-memory inbox goes stale when another process
     # (e.g. `tau messages import`) commits to the same file: the export
