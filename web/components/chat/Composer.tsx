@@ -153,7 +153,15 @@ export default function Composer({
   const [voiceFile, setVoiceFile] = useState(false);
   const [recording, setRecording] = useState(false);
   const [recordingSeconds, setRecordingSeconds] = useState(0);
-  const recorderRef = useRef<MediaRecorder | null>(null);
+  // The live recording, if any. A ref, not state: the stop callback and
+  // the cleanup effects must see the latest value.
+  const voiceSessionRef = useRef<VoiceSession | null>(null);
+  // Set from the click until the recorder is running or has failed, so a
+  // second click during the permission prompt cannot start another one.
+  const startingRef = useRef(false);
+  // Bumped whenever a recording must be abandoned (unmount, chat change),
+  // so a permission prompt that resolves late does not start one.
+  const voiceGenRef = useRef(0);
   const [savingDraft, setSavingDraft] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
 
@@ -165,15 +173,42 @@ export default function Composer({
     return () => clearInterval(timer);
   }, [recording]);
 
+  // Unmount: release the microphone whatever stage the recording is at.
+  useEffect(() => {
+    return () => {
+      voiceGenRef.current += 1;
+      const session = voiceSessionRef.current;
+      voiceSessionRef.current = null;
+      if (session) releaseVoiceSession(session);
+    };
+  }, []);
+
+  // A recording belongs to the chat it began in: a chat change discards
+  // it, so its output can never be attached to the newly open chat.
+  useEffect(() => {
+    voiceGenRef.current += 1;
+    const session = voiceSessionRef.current;
+    voiceSessionRef.current = null;
+    if (session) {
+      releaseVoiceSession(session);
+      setRecording(false);
+    }
+  }, [conversationKey]);
+
   // A contact picked in one thread must not ride into the next:
   // the composer is reused across conversations, so reset contact
   // mode and the selected peer when the conversation changes. (The
-  // text draft is per-conversation already, via draftSeed.)
+  // text draft is per-conversation already, via draftSeed.) A completed
+  // voice note from the previous chat is dropped the same way.
   const [contactConversationKey, setContactConversationKey] = useState<string | null>(null);
   if (conversationKey !== undefined && contactConversationKey !== conversationKey) {
     setContactConversationKey(conversationKey);
     setContactPeer("");
     setMode("message");
+    if (voiceFile) {
+      setFile(null);
+      setVoiceFile(false);
+    }
   }
 
   // Editing pre-fills the box; keep local edits once the user starts typing.
@@ -337,15 +372,25 @@ export default function Composer({
   }
 
   async function startRecording() {
-    if (recording || disabled) return;
+    if (recording || disabled || startingRef.current) return;
+    startingRef.current = true;
     setError(null);
+    const generation = voiceGenRef.current;
     let stream: MediaStream;
     try {
       stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     } catch (err) {
+      startingRef.current = false;
       setError(
         `Microphone unavailable: ${err instanceof Error ? err.message : String(err)}`,
       );
+      return;
+    }
+    // The composer unmounted or the chat changed while the permission
+    // prompt was open: give the microphone straight back.
+    if (generation !== voiceGenRef.current) {
+      stream.getTracks().forEach((t) => t.stop());
+      startingRef.current = false;
       return;
     }
     // Opus in WebM is the smallest widely supported recording; fall
@@ -361,18 +406,23 @@ export default function Composer({
           : new MediaRecorder(stream);
     } catch (err) {
       stream.getTracks().forEach((t) => t.stop());
+      startingRef.current = false;
       setError(
         `Could not start recording: ${err instanceof Error ? err.message : String(err)}`,
       );
       return;
     }
+    const session: VoiceSession = { recorder, stream, discard: false };
     const chunks: Blob[] = [];
     recorder.ondataavailable = (e) => {
       if (e.data.size > 0) chunks.push(e.data);
     };
     recorder.onstop = () => {
       stream.getTracks().forEach((t) => t.stop());
-      recorderRef.current = null;
+      if (voiceSessionRef.current === session) voiceSessionRef.current = null;
+      // An abandoned recording (chat change, unmount, runtime error)
+      // never becomes an attachment.
+      if (session.discard) return;
       const type = recorder.mimeType || "audio/webm";
       const recorded = new File([new Blob(chunks, { type })], `voice-note-${Date.now()}.webm`, {
         type,
@@ -388,14 +438,33 @@ export default function Composer({
       setFile(recorded);
       setVoiceFile(true);
     };
-    recorderRef.current = recorder;
+    recorder.onerror = (e) => {
+      if (session.discard) return;
+      const reason = (e as { error?: { message?: string } }).error?.message ?? "unknown error";
+      releaseVoiceSession(session);
+      if (voiceSessionRef.current === session) voiceSessionRef.current = null;
+      setRecording(false);
+      setError(`Recording failed: ${reason}`);
+    };
+    voiceSessionRef.current = session;
+    startingRef.current = false;
     setRecordingSeconds(0);
     setRecording(true);
-    recorder.start();
+    try {
+      recorder.start();
+    } catch (err) {
+      releaseVoiceSession(session);
+      if (voiceSessionRef.current === session) voiceSessionRef.current = null;
+      setRecording(false);
+      setError(
+        `Could not start recording: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 
   function stopRecording() {
-    recorderRef.current?.stop();
+    const session = voiceSessionRef.current;
+    if (session && session.recorder.state !== "inactive") session.recorder.stop();
     setRecording(false);
   }
 
@@ -567,7 +636,7 @@ export default function Composer({
         <button
           type="button"
           onClick={() => fileRef.current?.click()}
-          disabled={disabled}
+          disabled={disabled || recording}
           title="Attach a file (≤10 MiB)"
           className="rounded-full border border-zinc-700 px-3 py-1 text-xs font-medium text-zinc-300 hover:bg-zinc-900 disabled:opacity-50"
         >
@@ -702,6 +771,11 @@ export default function Composer({
       {error && (
         <p role="alert" className="mt-2 text-xs text-red-400">
           {error}
+        </p>
+      )}
+    </form>
+  );
+}
         </p>
       )}
     </form>
