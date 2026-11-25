@@ -239,6 +239,30 @@ def _clean_contact(value: Any) -> Optional[Dict[str, Any]]:
     return cleaned
 
 
+def channel_contact_refusal(
+    contact: Dict[str, Any],
+    *,
+    own_hash: str,
+    blocklist: Any,
+) -> Optional[str]:
+    """Why a cleaned *contact* card may not be shared to a channel, or ``None``.
+
+    The single policy for immediate and scheduled channel sends: never
+    publish your own card, never amplify a blocked peer, and fail closed
+    when the block-list is unavailable (``blocklist is None``).
+    """
+    if contact["destination_hash"] == own_hash:
+        return (
+            "cannot share your own contact: the recipient "
+            "already has your hash"
+        )
+    if blocklist is None:
+        return "cannot share a contact: the block-list could not be read"
+    if blocklist.is_blocked(contact["destination_hash"]):
+        return "cannot share a contact for a blocked peer"
+    return None
+
+
 @dataclass(frozen=True)
 class ScheduledChannelMessage:
     """One queued channel message, waiting for its publish time."""
@@ -870,6 +894,7 @@ def publish_due_scheduled_channel_messages(
     resolve_peer: Optional[Callable[[str], Any]] = None,
     now: Optional[float] = None,
     should_stop: Optional[Callable[[], bool]] = None,
+    contact_refusal: Optional[Callable[[Dict[str, Any]], Optional[str]]] = None,
 ) -> Dict[str, int]:
     """Publish every due queued channel message through *app* (a ``ChannelApp``).
 
@@ -942,6 +967,22 @@ def publish_due_scheduled_channel_messages(
                     break
                 if time.monotonic() > deadline:
                     break
+                if message.contact is not None and contact_refusal is not None:
+                    # Re-check the card's policy now, not only when it was
+                    # queued: the peer may have been blocked since.  A
+                    # refused entry is parked (never published or retried
+                    # automatically) and stays queued for the user to cancel.
+                    refusal = contact_refusal(message.contact)
+                    if refusal is not None:
+                        log.warning(
+                            "Scheduled channel message %s not published: %s",
+                            message.id,
+                            refusal,
+                        )
+                        message = replace(message, attempts=MAX_PUBLISH_ATTEMPTS)
+                        queue = queue.with_replaced(message)
+                        save_scheduled_channel_messages(path, queue)
+                        continue
                 failed_peers: Optional[Tuple[str, ...]] = None
                 try:
                     targets = _resolve_publish_targets(
