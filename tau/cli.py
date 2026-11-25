@@ -436,6 +436,7 @@ from .channels import (
     create_edit as create_channel_edit,
     create_message as create_channel_message,
     create_reaction as create_channel_reaction,
+    export_channel_document,
     get_message as get_channel_message,
     get_visible_message as get_visible_channel_message,
     HASH_HEX_LENGTH,
@@ -5006,6 +5007,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="show the newest N messages (default 20)",
     )
     channel_read.set_defaults(func=cmd_channel_read)
+
+    channel_export = channel_sub.add_parser(
+        "export",
+        parents=[common],
+        help="back up a channel's stored history as a JSON export",
+    )
+    channel_export.add_argument(
+        "channel", metavar="NAME", help="channel to export"
+    )
+    channel_export.add_argument(
+        "--output",
+        type=Path,
+        metavar="FILE",
+        help="write the export to a file instead of stdout",
+    )
+    channel_export.set_defaults(func=cmd_channel_export)
 
     channel_mark_read = channel_sub.add_parser(
         "mark-read",
@@ -10773,6 +10790,67 @@ def cmd_channel_read(args: argparse.Namespace) -> int:
     finally:
         conn.close()
     _print_channel_messages(messages, json_output=json_output, channel=name, reactions=reactions)
+    return _EXIT_OK
+
+
+def cmd_channel_export(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    try:
+        name = clean_channel_name(args.channel)
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    # Same block rules the reader applies: a blocked author's stored
+    # posts stay out of the archive, and an unreadable block-list
+    # fails closed, leaving the archive without messages.
+    blocked = load_blocked_set(config.blocklist_path)
+    app = ChannelApp(config, _tan_identity(config), name=config.name)
+    is_member = any(item["channel"] == name for item in app.memberships())
+    conn = init_channel_db(config.channels_db_path)
+    try:
+        # A channel the node has never seen is an error, not an empty
+        # archive; a joined channel with no messages still exports.
+        # Any stored record counts as having seen the channel: a
+        # retraction deletes its message, so a channel whose last
+        # message was retracted leaves only the retraction behind.
+        seen = is_member
+        for table in (
+            "messages",
+            "topics",
+            "retractions",
+            "reactions",
+            "edits",
+            "pins",
+        ):
+            if seen:
+                break
+            seen = (
+                conn.execute(
+                    f"SELECT 1 FROM {table} WHERE channel = ? LIMIT 1", (name,)
+                ).fetchone()
+                is not None
+            )
+        if not seen:
+            print(f"error: unknown channel: {args.channel!r}", file=sys.stderr)
+            return 2
+        document = export_channel_document(conn, name)
+    finally:
+        conn.close()
+    if blocked is None:
+        document["messages"] = []
+    else:
+        document["messages"] = [
+            message
+            for message in document["messages"]
+            if str(message.get("author", "")) not in blocked
+        ]
+    count = len(document["messages"])
+    text = json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True)
+    if getattr(args, "output", None):
+        atomic_write_text(args.output, text + "\n")
+        print(f"Exported {count} messages (#{name}) to {args.output}")
+    else:
+        print(text)
     return _EXIT_OK
 
 

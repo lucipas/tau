@@ -246,6 +246,10 @@ DEFAULT_CHANNEL_LIMIT = 20
 MAX_GOSSIP_TTL = 3
 GOSSIP_FANOUT = 3
 MAX_SYNC_PAGES = 32
+# The JSON document ``tau channel export`` writes, mirroring the
+# ``tau-messages-export`` / Tan export envelopes.
+CHANNEL_EXPORT_FORMAT = "tau-channel-export"
+CHANNEL_EXPORT_VERSION = 1
 # Bound on how many edit notices one channel may hold: an edit is
 # small, but a peer spamming re-edits must not grow the store
 # without limit.  The newest 500 win; older ones are pruned.
@@ -2587,6 +2591,49 @@ def channel_messages_visible(
         (name, time.time()),
     ).fetchall()
     return [_row_to_message(row) for row in rows]
+
+
+def export_channel_document(
+    conn: sqlite3.Connection,
+    channel: str,
+) -> Dict[str, Any]:
+    """Return a portable backup of one channel's stored history.
+
+    Messages are the ones a reader sees — expired and retracted
+    messages are left out, exactly as :func:`channel_history` shows
+    them — in stored (oldest-first) order.  Every retained message is
+    included: history is walked page by page, so pinned messages kept
+    beyond the newest-500 window are not dropped.  Each message keeps
+    its stored shape (hash, author, text, timestamps, reply linkage).
+    The document is export-only: there is no channel import, because
+    sync already re-fetches posts from peers and re-ingesting an
+    export would need the full gossip verification path.
+    """
+    name = clean_channel_name(channel)
+    newest_first: List[Dict[str, Any]] = []
+    before: Optional[float] = None
+    before_hash: Optional[str] = None
+    while True:
+        page, has_more = channel_history_page(
+            conn,
+            name,
+            limit=MAX_CHANNEL_HISTORY,
+            before=before,
+            before_hash=before_hash,
+            apply_edits=False,
+        )
+        newest_first.extend(page)
+        if not has_more or not page:
+            break
+        before = float(page[-1]["created_at"])
+        before_hash = str(page[-1]["hash"])
+    return {
+        "format": CHANNEL_EXPORT_FORMAT,
+        "version": CHANNEL_EXPORT_VERSION,
+        "channel": name,
+        "exported_at": time.time(),
+        "messages": list(reversed(newest_first)),
+    }
 
 
 def search_channel_messages(
