@@ -1,6 +1,7 @@
 // ChatSection.test.tsx — chat draft seeding: saving a draft must not
 // pour it straight back into the composer (#609).
 
+import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import ChatSection from "./ChatSection";
@@ -822,6 +823,28 @@ describe("ChatSection ignored groups", () => {
     expect(
       screen.queryByText("Couldn't load this group's history."),
     ).toBeNull();
+  });
+
+  it("StrictMode remount still loads history for a directly linked ignored group", async () => {
+    groupHistory = [
+      makeMessage({
+        id: 2,
+        group: GROUP_ID,
+        group_name: "crew",
+        peer: PEER_HASH,
+        peer_name: "Alice",
+        text: "crew history",
+      }),
+    ];
+    // A direct link opens the ignored group at mount. StrictMode runs
+    // the mount effects, then their cleanup, then the effects again on
+    // the same instance: the cleanup must reset all of the coalescing
+    // state, or the fresh request queues behind the invalidated one
+    // and history never appears.
+    window.location.hash = `#chat?group=${GROUP_ID}`;
+    render(<StrictMode>{ignoredGroupUi()}</StrictMode>);
+    await waitFor(() => expect(screen.getByText("crew history")).toBeTruthy());
+    expect(calls.filter((c) => c === groupHistoryUrl).length).toBe(2);
   });
 
   it("a stalled history fetch times out instead of blocking refresh", async () => {

@@ -251,6 +251,7 @@ export default function ChatSection() {
       // fetch still running for it; the newer fetch owns the flags.
       ignoredHistorySeq.current += 1;
       ignoredHistoryKey.current = null;
+      ignoredHistoryInFlight.current = false;
       ignoredHistoryPending.current = false;
       setIgnoredHistory([]);
       setIgnoredHistoryError(false);
@@ -315,10 +316,16 @@ export default function ChatSection() {
   // Leaving the chat invalidates outstanding history work so a queued
   // follow-up never fires a request after navigation unmounts the
   // section. Mount-only: ordinary dependency changes must keep
-  // coalescing snapshot updates, not cancel them.
+  // coalescing snapshot updates, not cancel them. Reset all of the
+  // coalescing state, not just the sequence: in development Strict
+  // Mode React re-runs the effects after cleanup on the same instance,
+  // and a stale key or in-flight flag would queue the fresh request
+  // behind the invalidated one forever.
   useEffect(() => {
     return () => {
       ignoredHistorySeq.current += 1;
+      ignoredHistoryKey.current = null;
+      ignoredHistoryInFlight.current = false;
       ignoredHistoryPending.current = false;
     };
   }, []);
