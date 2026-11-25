@@ -9,7 +9,7 @@ import Avatar from "@/components/chrome/Avatar";
 import UnreadChip from "@/components/chrome/UnreadChip";
 import { useHash } from "../chrome/useHash";
 import { formatCountdown, formatRelative, shortHash } from "@/lib/format";
-import { deleteDraft, getDrafts, getStatus, saveDraft } from "@/lib/api";
+import { addPeer, deleteDraft, getDrafts, getStatus, saveDraft } from "@/lib/api";
 import type { LocationPin, MessageDraft } from "@/lib/types";
 import { useChannels } from "@/lib/use-channels";
 
@@ -29,6 +29,51 @@ function ChannelLocationLink({ location }: { location: LocationPin }) {
         📍 {location.name ?? `${location.lat.toFixed(5)}, ${location.lon.toFixed(5)}`}
       </a>
     </p>
+  );
+}
+
+/** A shared contact card on a channel message, with an Add-peer
+ *  button — the channel twin of the card MessageBubble renders on
+ *  DMs and groups. Shared by the history list and the pinned strip:
+ *  a card can outlive its presence in the fetched history page, so
+ *  the strip needs it too. */
+function ChannelContactCard({
+  contact,
+  own,
+}: {
+  contact: { name: string; destination_hash: string };
+  own: boolean;
+}) {
+  const [peerAdded, setPeerAdded] = useState(false);
+  const [addPeerError, setAddPeerError] = useState<string | null>(null);
+  return (
+    <div className="mt-1 rounded-lg border border-zinc-600/60 bg-zinc-900/60 px-2 py-1.5 text-sm">
+      <p className="font-semibold">👤 {contact.name}</p>
+      <p className="text-xs text-zinc-400">tau:{contact.destination_hash.slice(0, 8)}…</p>
+      {!own && !peerAdded && (
+        <button
+          type="button"
+          onClick={async () => {
+            setAddPeerError(null);
+            try {
+              await addPeer(contact.destination_hash);
+              setPeerAdded(true);
+            } catch (err) {
+              setAddPeerError(err instanceof Error ? err.message : String(err));
+            }
+          }}
+          className="mt-1 underline text-cyan-300 hover:text-zinc-200"
+        >
+          Add peer
+        </button>
+      )}
+      {peerAdded && <p className="mt-1 text-xs text-zinc-400">Added — you can message them now.</p>}
+      {addPeerError && (
+        <p role="alert" className="mt-1 text-xs text-red-300">
+          {addPeerError}
+        </p>
+      )}
+    </div>
   );
 }
 
@@ -887,6 +932,12 @@ export default function ChannelsSection() {
                         {m.text}
                       </p>
                       {m.location && <ChannelLocationLink location={m.location} />}
+                      {m.contact && (
+                        <ChannelContactCard
+                          contact={m.contact}
+                          own={ownHash !== null && m.author === ownHash}
+                        />
+                      )}
                     </div>
                     <button
                       type="button"
@@ -981,6 +1032,12 @@ export default function ChannelsSection() {
                     </p>
                   )}
                   {m.location && <ChannelLocationLink location={m.location} />}
+                  {m.contact && (
+                    <ChannelContactCard
+                      contact={m.contact}
+                      own={ownHash !== null && m.author === ownHash}
+                    />
+                  )}
 {m.poll_options && (
                     <div className="mt-2 flex flex-col gap-1.5" role="group" aria-label="Poll">
                       {m.poll_options.map((option, i) => {
