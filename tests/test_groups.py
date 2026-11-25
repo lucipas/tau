@@ -2889,6 +2889,145 @@ def test_group_store_lineage_drops_predecessor_without_evidence(tmp_path):
     assert store.lineage(new_id) == [new_id]
 
 
+def test_group_store_record_imported_lineage(tmp_path):
+    # #801: evidence restored from an export re-verifies against the
+    # known creator before it is recorded.
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    renamed = store.rename(group["id"], "road trip", created_by=OWN_HASH)
+    # The destination knows only the current group: the same record,
+    # with no predecessor evidence.
+    target = GroupStore(tmp_path / "other-groups.json")
+    target.create("road trip", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    assert target.lineage(renamed["id"]) == [renamed["id"]]
+    # Unknown groups, a non-list section, malformed entries and a
+    # too-short roster record nothing — and never raise.
+    assert target.record_imported_lineage("ff" * 16, []) == 0
+    assert target.record_imported_lineage(renamed["id"], "not-a-list") == 0
+    assert (
+        target.record_imported_lineage(
+            renamed["id"],
+            [
+                {"id": group["id"], "name": "weekend", "members": [OWN_HASH]},
+                {"id": group["id"], "name": "weekend"},
+                {"name": "weekend", "members": [OWN_HASH, OTHER_HASH]},
+                {
+                    "id": group["id"],
+                    "name": 42,
+                    "members": [OWN_HASH, OTHER_HASH],
+                },
+            ],
+        )
+        == 0
+    )
+    assert target.lineage(renamed["id"]) == [renamed["id"]]
+    # The genuine entry records, and a re-import is a no-op.
+    genuine = {
+        "id": group["id"],
+        "name": "weekend",
+        "members": [OTHER_HASH, OWN_HASH],
+    }
+    assert target.record_imported_lineage(renamed["id"], [genuine]) == 1
+    assert target.lineage(renamed["id"]) == [renamed["id"], group["id"]]
+    assert target.record_imported_lineage(renamed["id"], [genuine]) == 1
+    assert target.lineage(renamed["id"]) == [renamed["id"], group["id"]]
+    # The evidence survives a reload: the creator is persisted.
+    reloaded = GroupStore(tmp_path / "other-groups.json")
+    assert reloaded.lineage(renamed["id"]) == [renamed["id"], group["id"]]
+    # A group with no creator on record has nothing to verify
+    # against: nothing records.
+    legacy_path = tmp_path / "legacy-groups.json"
+    legacy_path.write_text(
+        json.dumps(
+            {
+                "groups": [
+                    {
+                        "id": renamed["id"],
+                        "name": "road trip",
+                        "members": [OWN_HASH, OTHER_HASH],
+                        "created_at": 1000.0,
+                        "creator": "",
+                        "created_by": "",
+                        "local": True,
+                        "renamed_from": [],
+                    }
+                ],
+                "retired": [],
+                "retired_groups": [],
+                "left": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    legacy = GroupStore(legacy_path)
+    assert legacy.record_imported_lineage(renamed["id"], [genuine]) == 0
+
+
+def test_group_store_record_imported_lineage_secret(tmp_path):
+    # #801: a secret group's predecessor verifies by attestation,
+    # not derivation — its id is opaque.
+    store, creator, _, creator_hash, member_hash, group = (
+        _secret_store_fixture(tmp_path)
+    )
+    renamed = store.rename(
+        group["id"], "renamed", created_by=creator_hash, identity=creator
+    )
+    members = sorted([creator_hash, member_hash])
+    # The destination learned only the current group, from the
+    # creator's message: same attestation, no predecessor evidence.
+    target = GroupStore(tmp_path / "other-groups.json")
+    assert target.record(
+        renamed["id"],
+        "renamed",
+        members,
+        creator=creator_hash,
+        sender=creator_hash,
+        roster_attestation=renamed["roster_attestation"],
+    )
+    assert target.lineage(renamed["id"]) == [renamed["id"]]
+    genuine = {
+        "id": group["id"],
+        "name": "weekend",
+        "members": members,
+        "roster_attestation": group["roster_attestation"],
+    }
+    assert target.record_imported_lineage(renamed["id"], [genuine]) == 1
+    assert target.lineage(renamed["id"]) == [renamed["id"], group["id"]]
+    # A forged attestation — the predecessor's attestation rebound
+    # to another name — verifies nothing and records nothing, and a
+    # secret predecessor without its attestation cannot re-derive:
+    # the opaque id never matches the derivation.
+    other = GroupStore(tmp_path / "third-groups.json")
+    assert other.record(
+        renamed["id"],
+        "renamed",
+        members,
+        creator=creator_hash,
+        sender=creator_hash,
+        roster_attestation=renamed["roster_attestation"],
+    )
+    assert (
+        other.record_imported_lineage(
+            renamed["id"], [dict(genuine, name="forged-name")]
+        )
+        == 0
+    )
+    assert (
+        other.record_imported_lineage(
+            renamed["id"],
+            [
+                {
+                    key: value
+                    for key, value in genuine.items()
+                    if key != "roster_attestation"
+                }
+            ],
+        )
+        == 0
+    )
+    assert other.lineage(renamed["id"]) == [renamed["id"]]
+
+
 def test_group_store_rename_refusals(tmp_path):
     store = GroupStore(tmp_path / "groups.json")
     group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)

@@ -8574,6 +8574,228 @@ def test_group_export_spans_rename(tmp_path, capsys):
     assert [entry["id"] for entry in document["messages"]] == ["g-1", "g-2"]
 
 
+def test_group_export_import_restores_predecessor_visibility(tmp_path, capsys):
+    # Regression test (#801, Qodo Warning on PR #800): a destination
+    # that knows the current group but has no predecessor evidence
+    # must see the imported pre-rename messages in the group view —
+    # and a re-export from it must include them again.
+    from tau.groups import GroupStore
+
+    data_dir = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()  # drain the --json output of `tau init`
+    own_hash = _id_destination(data_dir, capsys)
+    member = "cd" * 16
+    store = GroupStore(data_dir / "groups.json")
+    group = store.create("weekend", [own_hash, member], created_by=own_hash)
+    config = TauConfig.resolve(data_dir=data_dir, name="alice")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": own_hash,
+            "text": "before the rename",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "g-1",
+            "kind": "group",
+            "group": group["id"],
+        }
+    )
+    renamed = store.rename(group["id"], "weekend-plans", created_by=own_hash)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": own_hash,
+            "text": "after the rename",
+            "sent_at": 11.0,
+            "received_at": 21.0,
+            "id": "g-2",
+            "kind": "group",
+            "group": renamed["id"],
+        }
+    )
+    export_path = tmp_path / "weekend-plans.json"
+
+    code = cli.main(
+        [
+            "group",
+            "export",
+            "--data-dir",
+            str(data_dir),
+            "--output",
+            str(export_path),
+            "weekend-plans",
+        ]
+    )
+    assert code == 0
+    document = json.loads(export_path.read_text(encoding="utf-8"))
+    assert document["group_id"] == renamed["id"]
+    assert [entry["id"] for entry in document["messages"]] == ["g-1", "g-2"]
+    # The export carries the (name, roster) needed to re-derive the
+    # predecessor from the known creator.
+    assert document["group_lineage"] == [
+        {
+            "id": group["id"],
+            "name": "weekend",
+            "members": sorted([own_hash, member]),
+        }
+    ]
+
+    # The destination knows the current group — same creator, name
+    # and roster, so the same derived id — but nothing of the rename.
+    target_dir = _init_node(tmp_path, "other-node", "alice")
+    capsys.readouterr()  # drain the --json output of `tau init`
+    target_store = GroupStore(target_dir / "groups.json")
+    target_store.create("weekend-plans", [own_hash, member], created_by=own_hash)
+    assert target_store.lineage(renamed["id"]) == [renamed["id"]]
+
+    code = cli.main(
+        ["messages", "import", "--data-dir", str(target_dir), str(export_path)]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "Imported 2 messages (0 already present, 0 skipped)" in out
+    assert "Recorded 1 group lineage entries" in out
+    assert target_store.lineage(renamed["id"]) == [renamed["id"], group["id"]]
+
+    code = cli.main(
+        [
+            "messages",
+            "--data-dir",
+            str(target_dir),
+            "--group",
+            "weekend-plans",
+            "--json",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [item["id"] for item in payload["messages"]] == ["g-2", "g-1"]
+
+    # A re-export from the destination spans the rename again.
+    code = cli.main(
+        ["group", "export", "--data-dir", str(target_dir), "weekend-plans"]
+    )
+    assert code == 0
+    document = json.loads(capsys.readouterr().out)
+    assert [entry["id"] for entry in document["messages"]] == ["g-1", "g-2"]
+
+
+def test_group_export_import_rejects_forged_lineage(tmp_path, capsys):
+    # The lineage evidence is verified on import: an entry whose
+    # roster does not re-derive its id is skipped, so a tampered
+    # export cannot attach another group's history to this one.
+    # The messages themselves still import — they are only hidden
+    # from the group-scoped view, exactly as before #801.
+    from tau.groups import GroupStore
+
+    data_dir = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()  # drain the --json output of `tau init`
+    own_hash = _id_destination(data_dir, capsys)
+    member = "cd" * 16
+    store = GroupStore(data_dir / "groups.json")
+    group = store.create("weekend", [own_hash, member], created_by=own_hash)
+    config = TauConfig.resolve(data_dir=data_dir, name="alice")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": own_hash,
+            "text": "before the rename",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "g-1",
+            "kind": "group",
+            "group": group["id"],
+        }
+    )
+    renamed = store.rename(group["id"], "weekend-plans", created_by=own_hash)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": own_hash,
+            "text": "after the rename",
+            "sent_at": 11.0,
+            "received_at": 21.0,
+            "id": "g-2",
+            "kind": "group",
+            "group": renamed["id"],
+        }
+    )
+    export_path = tmp_path / "weekend-plans.json"
+
+    code = cli.main(
+        [
+            "group",
+            "export",
+            "--data-dir",
+            str(data_dir),
+            "--output",
+            str(export_path),
+            "weekend-plans",
+        ]
+    )
+    assert code == 0
+    document = json.loads(export_path.read_text(encoding="utf-8"))
+    # Tamper with the evidence: the roster no longer re-derives the id.
+    document["group_lineage"][0]["members"] = sorted([own_hash, "ab" * 16])
+    export_path.write_text(
+        json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+    target_dir = _init_node(tmp_path, "other-node", "alice")
+    capsys.readouterr()  # drain the --json output of `tau init`
+    target_store = GroupStore(target_dir / "groups.json")
+    target_store.create("weekend-plans", [own_hash, member], created_by=own_hash)
+
+    code = cli.main(
+        ["messages", "import", "--data-dir", str(target_dir), str(export_path)]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "Imported 2 messages (0 already present, 0 skipped)" in out
+    assert "Recorded" not in out
+    assert target_store.lineage(renamed["id"]) == [renamed["id"]]
+
+    code = cli.main(
+        [
+            "messages",
+            "--data-dir",
+            str(target_dir),
+            "--group",
+            "weekend-plans",
+            "--json",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [item["id"] for item in payload["messages"]] == ["g-2"]
+
+    # The pre-rename message is not lost: it still shows unfiltered.
+    code = cli.main(["messages", "--data-dir", str(target_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [item["id"] for item in payload["messages"]] == ["g-2", "g-1"]
+
+
+def test_group_export_without_rename_carries_no_lineage(tmp_path, capsys):
+    # A group with no predecessors exports exactly the document
+    # `tau messages import` already accepted: no lineage section.
+    from tau.groups import GroupStore
+
+    data_dir = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()  # drain the --json output of `tau init`
+    own_hash = _id_destination(data_dir, capsys)
+    store = GroupStore(data_dir / "groups.json")
+    store.create("weekend", [own_hash, "cd" * 16], created_by=own_hash)
+
+    code = cli.main(["group", "export", "--data-dir", str(data_dir), "weekend"])
+    assert code == 0
+    document = json.loads(capsys.readouterr().out)
+    assert "group_lineage" not in document
+
+
 def test_messages_import_skips_retracted_group_messages(tmp_path, capsys):
     # Regression test (CodeRabbit Major on PR #322): a group message
     # retracted on the target node must not come back through an
