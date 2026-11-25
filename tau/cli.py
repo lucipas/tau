@@ -23812,7 +23812,7 @@ def cmd_remind_list(args: argparse.Namespace) -> int:
         # reminders stay hidden — fail closed — while the rest list.
         try:
             channels = ChannelApp(config, _tan_identity(config), name=config.name)
-        except NodeError:
+        except (NodeError, IdentityError):
             channels = None
     reminders = [
         _describe_reminder(reminder, config)
