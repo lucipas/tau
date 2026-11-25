@@ -969,6 +969,7 @@ export type LiveEvent =
   | { type: "message_updated"; message: ChatMessage }
   | { type: "message_deleted"; message_id: number }
   | { type: "peer"; peer: Peer }
+  | { type: "groups"; groups: Group[] }
   | { type: "post"; post: TanPost }
   | { type: "channel-message"; message: ChannelMessage }
   | { type: "unread"; unread: UnreadCounts; restored?: unknown[] }

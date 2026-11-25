@@ -11539,6 +11539,18 @@ class WebBridge:
             event["restored"] = restored
         self.bus.publish(event)
 
+    def _publish_groups(self) -> None:
+        """Push the current group list (with ignore flags) to every console.
+
+        Ignore state lives in a file the snapshot reads fresh, but no
+        snapshot is pushed when it changes — a console that re-read
+        /api/groups/left in between would suppress a freshly ignored
+        group from the Ignored section until the next snapshot (#784).
+        Publishing the groups keeps every open console's snapshot
+        current, which also re-triggers its left-list re-read.
+        """
+        self.bus.publish({"type": "groups", "groups": self.groups()})
+
     def muted_conversations(self, *, visible_only: bool = False) -> Dict[str, Any]:
         """All muted conversations, for the console load.
 
@@ -12222,8 +12234,11 @@ class WebBridge:
         if not already:
             # The group's posts stop lighting the badge at once: push
             # the recomputed counts so every open console reconciles
-            # without waiting for the next message.
+            # without waiting for the next message.  Push the groups
+            # too, so the snapshot's ignored flag never lags the
+            # ignore file (#784).
             self.bus.publish({"type": "unread", "unread": self.unread()})
+            self._publish_groups()
         return {
             "group": group_id,
             "name": group["name"],
@@ -12287,6 +12302,11 @@ class WebBridge:
             self._publish_unread(
                 counts, restored=[entry] if entry is not None else None
             )
+            # Push the groups too, so the snapshot's ignored flag
+            # never lags the ignore file (#784) — and every console
+            # re-reads /api/groups/left, which also clears an orphan
+            # row for a group whose record is gone.
+            self._publish_groups()
         return {
             "group": group_id,
             "name": name,

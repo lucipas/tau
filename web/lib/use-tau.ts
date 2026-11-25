@@ -133,6 +133,14 @@ function applyEvent(
           : [...snapshot.peers, peer];
       return { ...snapshot, peers };
     }
+    case "groups": {
+      // The bridge publishes the full group list when ignore state
+      // changes, so the snapshot's ignored flags never lag the
+      // ignore file (#784). Replacing the list also re-triggers the
+      // conversation list's /api/groups/left re-read.
+      const groups = (event as { groups: Group[] }).groups;
+      return { ...snapshot, groups };
+    }
     case "unread": {
       const unread = (event as { unread?: UnreadCounts }).unread;
       return unread ? { ...snapshot, unread } : null;
