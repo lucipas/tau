@@ -11,7 +11,7 @@
 
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   addGroupMembers,
   approveJoinRequest,
@@ -120,10 +120,14 @@ export default function PeerPanel({
   const [addPeer, setAddPeer] = useState("");
   const [confirmRemove, setConfirmRemove] = useState<string | null>(null);
   const { section, navigate } = useHash();
+  // The group id this panel is displaying, read after awaits so a late
+  // decision response can tell whether its list still belongs here.
+  const activeGroupRef = useRef<string | null>(null);
 
   const peer: Peer | undefined = conversation?.peer;
   const isGroup = conversation?.kind === "group";
   const groupId = isGroup ? conversation.key : null;
+  activeGroupRef.current = groupId;
   const groupCreatedByMe = Boolean(isGroup && conversation.group?.created_by_me);
   // The creator's own row carries no Remove button: the backend refuses
   // removing the creator, so it is hidden rather than left to fail.
@@ -178,24 +182,30 @@ export default function PeerPanel({
   }, [groupId, groupCreatedByMe]);
 
   // Join requests are creator-managed too: only fetch them for groups
-  // this node created, and reload them after every decision. The
-  // request names the group, so filter by the resolved group id to
-  // keep another group's requests out of this panel.
+  // this node created, reload them after every decision, and poll while
+  // the panel is open so requests arriving from closed invite links show
+  // up without reopening it. The request names the group, so filter by
+  // the group id to keep another group's requests out of this panel.
   useEffect(() => {
     setRequests(null);
     if (!groupCreatedByMe || !groupId) return;
     let cancelled = false;
-    void getJoinRequests()
-      .then((all) => {
-        if (!cancelled) {
-          setRequests(all.filter((r) => r.group_id === groupId));
-        }
-      })
-      .catch((err) => {
-        if (!cancelled) setError(err instanceof Error ? err.message : String(err));
-      });
+    const load = () => {
+      void getJoinRequests()
+        .then((all) => {
+          if (!cancelled) {
+            setRequests(all.filter((r) => r.group_id === groupId));
+          }
+        })
+        .catch((err) => {
+          if (!cancelled) setError(err instanceof Error ? err.message : String(err));
+        });
+    };
+    load();
+    const timer = window.setInterval(load, 10_000);
     return () => {
       cancelled = true;
+      window.clearInterval(timer);
     };
   }, [groupId, groupCreatedByMe]);
 
@@ -287,11 +297,13 @@ export default function PeerPanel({
       };
       const nextId = result.group?.id ?? groupId;
       const snap = await tau.refresh();
+      let navigated = false;
       if (approve && nextId !== groupId && window.location.hash === startedAt) {
         const successorVisible =
           snap?.groups.some((g) => g.id === nextId) ?? false;
         if (successorVisible) {
           navigate(section, { group: nextId });
+          navigated = true;
         } else {
           setError(
             "Member added, but the new group couldn't be loaded yet — it will appear when the connection recovers.",
@@ -805,6 +817,21 @@ export default function PeerPanel({
           ) : confirmIgnore ? (
             <ActionButton danger disabled={busy === "ignore"} onClick={() => void run("ignore", () => actions.ignoreGroup(conversation.key)).then(() => setConfirmIgnore(false))}>
               Confirm ignore group?
+            </ActionButton>
+          ) : (
+            <ActionButton danger onClick={() => setConfirmIgnore(true)}>Ignore group</ActionButton>
+          ))}
+      </div>
+
+      {error && (
+        <p role="alert" className="mt-2 text-xs text-red-400">
+          {error}
+        </p>
+      )}
+    </div>
+  );
+}
+group?
             </ActionButton>
           ) : (
             <ActionButton danger onClick={() => setConfirmIgnore(true)}>Ignore group</ActionButton>
