@@ -2123,6 +2123,36 @@ def test_mark_unread_moves_cursor_back_to_before_the_message(identities, tmp_pat
     assert channel_unread_counts(conn) == {"general": 2}
 
 
+def test_mark_unread_oldest_without_cursor_leaves_late_posts_unread(
+    identities, tmp_path
+):
+    _, bob = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    source = init_db(tmp_path / "source.sqlite3")
+    _join_at(conn, "general", 1000)
+    one = _store_from(identities, source, bob, "general", "one", 1001)
+    two = _store_from(identities, source, bob, "general", "two", 1002)
+    store_message(conn, one, now=1001)
+    store_message(conn, two, now=1002)
+    # No mark_channel_read: there is no cursor yet, so both messages
+    # are already unread — and nothing may write one, or a late gossip
+    # post created before them would stop counting.
+    marked = mark_channel_unread(conn, "general", one["hash"])
+    assert marked["hash"] is None
+    assert marked["created_at"] is None
+    assert marked["unread"] == 2
+    assert channel_unread_counts(conn) == {"general": 2}
+
+    # A gossip straggler created before the oldest message but
+    # received after joining still counts.
+    store_message(
+        conn,
+        _store_from(identities, source, bob, "general", "late", 1000),
+        now=5000,
+    )
+    assert channel_unread_counts(conn) == {"general": 3}
+
+
 def test_mark_unread_never_moves_the_cursor_forward(identities, tmp_path):
     _, bob = identities
     conn = init_db(tmp_path / "channels.sqlite3")

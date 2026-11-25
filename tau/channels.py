@@ -2884,11 +2884,31 @@ def mark_channel_unread(
     # absent cursor only counts messages received after joining, so a
     # target cached from before the join needs an explicit cursor.
     # The oldest stored message gets a sentinel (empty hash) at its own
-    # timestamp: every stored message then sorts after it, and deleting
-    # the cursor is not an option because that drops the pre-join rule.
+    # timestamp — every stored message then sorts after it — but only
+    # when one is actually needed: with no cursor and a target
+    # received since joining, the message is already unread, and
+    # writing a cursor would switch counting to creation time and
+    # hide a late gossip post created before it.  The sentinel stays
+    # for a previously-read message (a cursor exists and sits at or
+    # after the target) or a pre-join cached one.
     move_to: Optional[Tuple[str, float]] = None
     if previous is None:
-        move_to = ("", visible["created_at"])
+        if cursor is None and (
+            received is not None and received["received_at"] > row["joined_at"]
+        ):
+            # Already unread with no cursor: nothing moves.
+            move_to = None
+        elif cursor is not None and (
+            cursor["last_read_at"] < visible["created_at"]
+            or (
+                cursor["last_read_at"] == visible["created_at"]
+                and cursor["last_read_hash"] < visible["hash"]
+            )
+        ):
+            # Cursor already sits before the target: it is unread.
+            move_to = None
+        else:
+            move_to = ("", visible["created_at"])
     elif cursor is None:
         if received is None or received["received_at"] <= row["joined_at"]:
             move_to = (previous["hash"], previous["created_at"])
