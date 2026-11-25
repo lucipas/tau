@@ -2848,10 +2848,11 @@ def mark_channel_unread(
     badge to light — and the message must still be visible (an
     expired or retracted message is gone).  The cursor only ever moves
     backward: when it already sits at or before the message, it is
-    left alone, so firing a reminder never marks unread messages read,
-    and when there is no cursor yet the message is already unread, so
-    nothing moves.  Returns the cursor plus how many messages are
-    unread now.
+    left alone, so firing a reminder never marks unread messages read.
+    With no cursor, a message received since joining is already
+    unread and nothing moves; an older cached one gets a cursor just
+    before it, so it always counts as unread.  Returns the cursor plus
+    how many messages are unread now.
     """
     name = clean_channel_name(channel)
     row = conn.execute(
@@ -2875,16 +2876,22 @@ def mark_channel_unread(
         "SELECT last_read_hash, last_read_at FROM read_cursors WHERE channel = ?",
         (name,),
     ).fetchone()
+    received = conn.execute(
+        "SELECT received_at FROM messages WHERE channel = ? AND hash = ?",
+        (name, visible["hash"]),
+    ).fetchone()
+    # Where the cursor must sit so the target counts as unread.  An
+    # absent cursor only counts messages received after joining, so a
+    # target cached from before the join needs an explicit cursor.
+    # The oldest stored message gets a sentinel (empty hash) at its own
+    # timestamp: every stored message then sorts after it, and deleting
+    # the cursor is not an option because that drops the pre-join rule.
+    move_to: Optional[Tuple[str, float]] = None
     if previous is None:
-        # The target is the oldest stored message: deleting the cursor
-        # re-opens the whole channel, which is exactly its position.
-        with conn:
-            conn.execute("DELETE FROM read_cursors WHERE channel = ?", (name,))
-        new_hash, new_at = None, None
+        move_to = ("", visible["created_at"])
     elif cursor is None:
-        # No cursor yet: everything since joining is already unread,
-        # so the target is unread and nothing moves.
-        new_hash, new_at = None, None
+        if received is None or received["received_at"] <= row["joined_at"]:
+            move_to = (previous["hash"], previous["created_at"])
     elif (
         cursor["last_read_at"] < previous["created_at"]
         or (
@@ -2893,8 +2900,10 @@ def mark_channel_unread(
         )
     ):
         # Already at or before the predecessor: the target is unread.
-        new_hash, new_at = cursor["last_read_hash"], cursor["last_read_at"]
+        move_to = None
     else:
+        move_to = (previous["hash"], previous["created_at"])
+    if move_to is not None:
         with conn:
             conn.execute(
                 "INSERT INTO read_cursors(channel, last_read_hash, last_read_at) "
@@ -2902,9 +2911,14 @@ def mark_channel_unread(
                 "ON CONFLICT(channel) DO UPDATE SET "
                 "last_read_hash = excluded.last_read_hash, "
                 "last_read_at = excluded.last_read_at",
-                (name, previous["hash"], previous["created_at"]),
+                (name, move_to[0], move_to[1]),
             )
-        new_hash, new_at = previous["hash"], previous["created_at"]
+        new_hash, new_at = move_to
+    elif cursor is not None:
+        new_hash, new_at = cursor["last_read_hash"], cursor["last_read_at"]
+    else:
+        # No cursor and the target counts already: nothing moves.
+        new_hash, new_at = None, None
     unread = channel_unread_counts(conn, exclude_authors=exclude_authors).get(
         name, 0
     )
