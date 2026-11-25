@@ -11,7 +11,7 @@
 
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import {
   addGroupMembers,
   approveJoinRequest,
@@ -120,14 +120,10 @@ export default function PeerPanel({
   const [addPeer, setAddPeer] = useState("");
   const [confirmRemove, setConfirmRemove] = useState<string | null>(null);
   const { section, navigate } = useHash();
-  // The group id this panel is displaying, read after awaits so a late
-  // decision response can tell whether its list still belongs here.
-  const activeGroupRef = useRef<string | null>(null);
 
   const peer: Peer | undefined = conversation?.peer;
   const isGroup = conversation?.kind === "group";
   const groupId = isGroup ? conversation.key : null;
-  activeGroupRef.current = groupId;
   const groupCreatedByMe = Boolean(isGroup && conversation.group?.created_by_me);
   // The creator's own row carries no Remove button: the backend refuses
   // removing the creator, so it is hidden rather than left to fail.
@@ -280,8 +276,11 @@ export default function PeerPanel({
   // Answer one pending join request. Approving adds the peer, so the
   // roster rotates to a successor id and the panel follows it exactly
   // like a roster change does (see changeMembers); denying only
-  // resolves the request, so no follow is needed. Either way the list
-  // is reloaded for the group the panel is now showing.
+  // resolves the request, so no follow is needed. The reloaded list
+  // is committed only for the group this decision started for: a
+  // switch mid-flight leaves the new group's own load in charge of
+  // its list, and when the successor cannot be loaded yet the list
+  // stays as-is until the successor is actually selected.
   async function decideJoinRequest(request: JoinRequest, approve: boolean) {
     if (!groupId || busy !== null) return;
     // Only follow the successor if the user is still on this thread when
@@ -297,14 +296,14 @@ export default function PeerPanel({
       };
       const nextId = result.group?.id ?? groupId;
       const snap = await tau.refresh();
-      let navigated = false;
+      let successorMissing = false;
       if (approve && nextId !== groupId && window.location.hash === startedAt) {
         const successorVisible =
           snap?.groups.some((g) => g.id === nextId) ?? false;
         if (successorVisible) {
           navigate(section, { group: nextId });
-          navigated = true;
         } else {
+          successorMissing = true;
           setError(
             "Member added, but the new group couldn't be loaded yet — it will appear when the connection recovers.",
           );
@@ -315,10 +314,19 @@ export default function PeerPanel({
           onSuccessorPending?.(nextId, startedAt);
         }
       }
-      const fresh = await getJoinRequests();
-      setRequests(fresh.filter((r) => r.group_id === nextId));
+      // A navigation above already changed the hash, so the
+      // successor's own load owns its list; commit here only when
+      // the panel still shows this decision's group.
+      if (window.location.hash === startedAt && !successorMissing) {
+        const fresh = await getJoinRequests();
+        setRequests(fresh.filter((r) => r.group_id === nextId));
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      // A switch mid-flight means this error belongs to a group the
+      // panel no longer shows; leave the new panel's state alone.
+      if (window.location.hash === startedAt) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
     } finally {
       setBusy(null);
     }

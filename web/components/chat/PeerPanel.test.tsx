@@ -396,6 +396,84 @@ describe("PeerPanel join requests", () => {
     ).toBe(true);
   });
 
+  it("approving a peer who is already a member clears the stale request", async () => {
+    let requests = [joinRequest()];
+    const { calls } = mockFetchBodies((url, method) => {
+      if (url.includes("/api/groups/approve-join")) {
+        requests = [];
+        return {
+          ok: true,
+          status: "already_member",
+          group: { id: GROUP_ID, name: "crew", members: [], creator: "" },
+        };
+      }
+      if (url.includes("/api/groups/join-requests")) {
+        return { requests, count: requests.length };
+      }
+      return inviteOnly(url);
+    });
+    renderRequestsPanel(groupConv());
+    await waitFor(() =>
+      expect(screen.getByLabelText("Approve carol to join")).toBeTruthy(),
+    );
+    fireEvent.click(screen.getByLabelText("Approve carol to join"));
+    await waitFor(() => expect(screen.queryByText("Join requests")).toBeNull());
+    expect(window.location.hash).toBe("");
+    expect(
+      calls.some(
+        (c) =>
+          c.method === "POST" &&
+          c.url.includes("/api/groups/approve-join") &&
+          JSON.stringify(c.body) ===
+            JSON.stringify({ group: GROUP_ID, peer: CAROL }),
+      ),
+    ).toBe(true);
+  });
+
+  it("stays put and keeps the list when the refresh cannot load the successor", async () => {
+    // The approval landed but the snapshot fetch failed, so the
+    // successor is not in any snapshot: navigating would point the
+    // thread at a group the console cannot display yet, and the
+    // retired panel must not take on the successor's requests.
+    const onSuccessorPending = vi.fn();
+    const { calls } = mockFetchBodies((url, method) => {
+      if (url.includes("/api/groups/approve-join")) {
+        return {
+          ok: true,
+          status: "added",
+          group: { id: SUCCESSOR_ID, name: "crew", members: [], creator: "" },
+        };
+      }
+      if (url.includes("/api/groups/join-requests")) {
+        return { requests: [joinRequest()], count: 1 };
+      }
+      return inviteOnly(url);
+    });
+    renderRequestsPanel(groupConv(), null, onSuccessorPending);
+    await waitFor(() =>
+      expect(screen.getByLabelText("Approve carol to join")).toBeTruthy(),
+    );
+    fireEvent.click(screen.getByLabelText("Approve carol to join"));
+    await waitFor(() =>
+      expect(
+        screen.getByText(
+          "Member added, but the new group couldn't be loaded yet — it will appear when the connection recovers.",
+        ),
+      ).toBeTruthy(),
+    );
+    expect(window.location.hash).toBe("");
+    expect(onSuccessorPending).toHaveBeenCalledWith(SUCCESSOR_ID, "");
+    // The request stays listed: the retired panel never took on the
+    // successor's list, so deciding it again would not send the
+    // retired id.
+    expect(screen.getByLabelText("Approve carol to join")).toBeTruthy();
+    expect(
+      calls.filter(
+        (c) => c.method === "GET" && c.url.includes("/api/groups/join-requests"),
+      ),
+    ).toHaveLength(1);
+  });
+
   it("shows no section when there are no pending requests", async () => {
     mockFetch((url) => {
       if (url.includes("/api/groups/join-requests")) {
