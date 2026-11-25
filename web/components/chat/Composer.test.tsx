@@ -7,6 +7,7 @@ import Composer, {
   validateFile,
   validateLocation,
   validatePoll,
+  voiceFileExtension,
 } from "./Composer";
 describe("validateFile", () => {
   it("accepts files at or under 10 MiB", () => {
@@ -295,13 +296,22 @@ describe("formatVoiceDuration", () => {
   });
 });
 
+describe("voiceFileExtension", () => {
+  it("maps recorder containers to extensions", () => {
+    expect(voiceFileExtension("audio/webm;codecs=opus")).toBe("webm");
+    expect(voiceFileExtension("audio/mp4")).toBe("m4a");
+    expect(voiceFileExtension("audio/ogg;codecs=opus")).toBe("ogg");
+    expect(voiceFileExtension("audio/x-matroska")).toBe("webm");
+  });
+});
+
 describe("voice recording", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
 
-  function installVoiceMocks(opts?: { deferPermission?: boolean }) {
+  function installVoiceMocks(opts?: { deferPermission?: boolean; mimeType?: string }) {
     const stopTrack = vi.fn();
     const stream = {
       getTracks: () => [{ stop: stopTrack }],
@@ -325,12 +335,13 @@ describe("voice recording", () => {
       onerror: ((e: unknown) => void) | null;
       stop: () => void;
     }[] = [];
+    const mimeType = opts?.mimeType ?? "audio/webm;codecs=opus";
     class FakeRecorder {
       static isTypeSupported = () => true;
       ondataavailable: ((e: { data: Blob }) => void) | null = null;
       onstop: (() => void) | null = null;
       onerror: ((e: unknown) => void) | null = null;
-      mimeType = "audio/webm;codecs=opus";
+      mimeType = mimeType;
       state = "inactive";
       constructor(
         public stream: MediaStream,
@@ -431,6 +442,28 @@ describe("voice recording", () => {
     mocks.recorders[0].stop();
     expect(screen.queryByText(/Voice note:/)).toBeNull();
     expect(onSendFile).not.toHaveBeenCalled();
+  });
+
+  it("names a non-WebM recording with the matching extension", async () => {
+    installVoiceMocks({ mimeType: "audio/mp4" });
+    const onSendFile = vi.fn();
+    render(<Composer onSend={() => undefined} onSendFile={onSendFile} />);
+
+    fireEvent.click(screen.getByLabelText("Record a voice note"));
+    await vi.waitFor(() =>
+      expect(screen.getByLabelText("Stop recording")).toBeTruthy(),
+    );
+
+    fireEvent.click(screen.getByLabelText("Stop recording"));
+    await vi.waitFor(() => expect(screen.getByText(/Voice note:/)).toBeTruthy());
+
+    fireEvent.click(screen.getByText("Send"));
+    await vi.waitFor(() =>
+      expect(onSendFile).toHaveBeenCalledWith(
+        expect.objectContaining({ name: expect.stringMatching(/^voice-note-.*\.m4a$/) }),
+        expect.objectContaining({ voice: true }),
+      ),
+    );
   });
 
   it("sends a picked file without the voice marker", async () => {
