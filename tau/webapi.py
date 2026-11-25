@@ -5568,7 +5568,12 @@ class WebBridge:
                         group_id, entries
                     )
                 except OSError:
+                    log.exception("could not record imported group lineage")
                     recorded = 0
+                    result["group_lineage_error"] = (
+                        "messages were imported, but group lineage could not "
+                        "be recorded; retry the import to restore it"
+                    )
                 if recorded:
                     result["group_lineage_recorded"] = recorded
         # An invalid entry's id comes from untrusted JSON and may hold
