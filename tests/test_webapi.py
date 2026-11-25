@@ -4083,6 +4083,74 @@ def test_api_groups_ignore_publishes_groups_event(bridge, node, tmp_path):
     assert events[-1]["groups"][0]["ignored"] is False
 
 
+def test_api_groups_ignore_serializes_publish_with_mutation(
+    bridge, node, tmp_path, monkeypatch
+):
+    _learned_group(node, tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+    original_publish_groups = bridge._publish_groups
+
+    def blocking_publish_groups():
+        entered.set()
+        assert release.wait(timeout=10)
+        original_publish_groups()
+
+    monkeypatch.setattr(bridge, "_publish_groups", blocking_publish_groups)
+    results = {}
+
+    def do_ignore():
+        results["ignore"] = bridge.ignore_group("weekend")
+
+    ignoring = threading.Thread(target=do_ignore)
+    ignoring.start()
+    assert entered.wait(timeout=10)
+    # The ignore has saved but its publish is still blocked inside
+    # the lock: a racing unignore must wait for it, so it cannot
+    # publish a newer state first and leave stale flags behind.
+    finished = threading.Event()
+
+    def do_unignore():
+        results["unignore"] = bridge.unignore_group("weekend")
+        finished.set()
+
+    unignoring = threading.Thread(target=do_unignore)
+    unignoring.start()
+    assert not finished.wait(timeout=0.5)
+    release.set()
+    ignoring.join(timeout=10)
+    unignoring.join(timeout=10)
+    assert results["ignore"]["changed"] is True
+    assert results["unignore"]["changed"] is True
+    events = [event for event in bridge.bus.replay(0) if event["type"] == "groups"]
+    assert events[-1]["groups"][0]["ignored"] is False
+
+
+def test_api_groups_ignore_skips_groups_event_when_group_read_fails(
+    bridge, node, tmp_path, monkeypatch
+):
+    _learned_group(node, tmp_path)
+    before = len(
+        [event for event in bridge.bus.replay(0) if event["type"] == "groups"]
+    )
+
+    def _failing_load(path):
+        raise RuntimeError("group store down")
+
+    monkeypatch.setattr("tau.webapi.load_ignored_group_ids", _failing_load)
+    status, _, payload = _json(
+        bridge, "/api/groups/ignore", method="POST", body={"group": "weekend"}
+    )
+    assert status == 200
+    assert payload["ignored"] is True
+    # The ignore itself landed; only the broadcast is skipped, so no
+    # console replaces its sidebar with the [] fallback.
+    assert (
+        len([event for event in bridge.bus.replay(0) if event["type"] == "groups"])
+        == before
+    )
+
+
 def test_api_groups_unignore_orphan_publishes_groups_event(
     bridge, node, tmp_path
 ):
