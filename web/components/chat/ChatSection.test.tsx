@@ -15,6 +15,9 @@ let saved: MessageDraft[] = [];
 let calls: string[] = [];
 let reminders: Reminder[] = [];
 let reminderSeq = 0;
+/** Stored history a GET /api/messages?group=… answers with: the posts
+ *  the snapshot hides while the group is ignored. */
+let groupHistory: ReturnType<typeof makeMessage>[] = [];
 
 /** A deferred the next GET /api/reminders waits on: the test resolves it
  *  with a stale payload to prove an older response cannot overwrite
@@ -41,6 +44,7 @@ function stubFetch() {
   saved = [];
   reminders = [];
   reminderSeq = 0;
+  groupHistory = [];
   heldGet = null;
   nextJoin = null;
   vi.stubGlobal(
@@ -105,6 +109,8 @@ function stubFetch() {
         } else {
           payload = { drafts: saved, count: saved.length };
         }
+      } else if (url.includes("/api/messages?group=")) {
+        payload = { messages: groupHistory };
       } else if (url.includes("/api/messages/requests")) {
         payload = { requests: [], count: 0 };
       } else if (url.includes("/api/broadcasts")) {
@@ -611,5 +617,52 @@ describe("ChatSection join group", () => {
       ).toBeTruthy(),
     );
     expect(screen.queryByText(/“”/)).toBeNull();
+  });
+});
+
+describe("ChatSection ignored groups", () => {
+  const GROUP_ID = "g".repeat(32);
+
+  it("opening an ignored group fetches its history into the thread", async () => {
+    groupHistory = [
+      makeMessage({
+        id: 2,
+        group: GROUP_ID,
+        group_name: "crew",
+        peer: PEER_HASH,
+        peer_name: "Alice",
+        text: "crew history",
+      }),
+    ];
+    window.location.hash = `#chat?group=${GROUP_ID}`;
+    render(
+      <TauContext.Provider
+        value={fakeTau({
+          peers: [makePeer({ destination: PEER_HASH, name: "Alice" })],
+          // The snapshot hides ignored posts, so the thread starts empty.
+          messages: [],
+          groups: [
+            {
+              id: GROUP_ID,
+              name: "crew",
+              members: [],
+              created_at: 1700000000,
+              topic: "",
+              created_by_me: true,
+              can_leave: true,
+              ignored: true,
+            },
+          ],
+        })}
+      >
+        <ChatSection />
+      </TauContext.Provider>,
+    );
+    await waitFor(() =>
+      expect(calls).toContain(
+        `GET /api/messages?group=${GROUP_ID}&include_ignored=1&limit=200`,
+      ),
+    );
+    await waitFor(() => expect(screen.getByText("crew history")).toBeTruthy());
   });
 });

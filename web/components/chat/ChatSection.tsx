@@ -21,6 +21,7 @@ import {
   forwardMessage,
   getArchivedConversations,
   getDrafts,
+  getGroupMessages,
   getMutedConversations,
   getReminders,
   joinGroupViaLink,
@@ -216,6 +217,42 @@ export default function ChatSection() {
       .catch(() => undefined);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedKey]);
+
+  // History of the open ignored group, fetched explicitly: the
+  // snapshot's default listing hides ignored posts, so the thread would
+  // look empty without it. Kept apart from tau.messages so ignored
+  // posts never leak into the feed or the conversation list — only the
+  // open thread sees them. A slow response must not overwrite a newer
+  // selection, and a failed fetch leaves the thread empty, not broken.
+  const [ignoredHistory, setIgnoredHistory] = useState<ChatMessage[]>([]);
+  const ignoredHistorySeq = useRef(0);
+  useEffect(() => {
+    const seq = ++ignoredHistorySeq.current;
+    if (!selected || selected.kind !== "group" || !selected.ignored) {
+      setIgnoredHistory([]);
+      return;
+    }
+    void (async () => {
+      try {
+        const history = await getGroupMessages(selected.key);
+        if (seq === ignoredHistorySeq.current) setIgnoredHistory(history);
+      } catch {
+        // History is advisory; the thread still opens, empty.
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedKey]);
+
+  // The open thread sees the snapshot plus the ignored group's explicit
+  // history; the snapshot's copy wins on overlap (a group un-ignored
+  // while open lands in both). The list and feed keep tau.messages.
+  const threadMessages = useMemo(() => {
+    if (ignoredHistory.length === 0) return tau.messages;
+    const byId = new Map<number, ChatMessage>();
+    for (const message of ignoredHistory) byId.set(message.id, message);
+    for (const message of tau.messages) byId.set(message.id, message);
+    return [...byId.values()];
+  }, [tau.messages, ignoredHistory]);
 
   const refreshDrafts = useCallback(async () => {
     try {
@@ -864,7 +901,7 @@ export default function ChatSection() {
             <div className="min-h-0 flex-1">
               <ThreadView
                 conversation={selected}
-                messages={tau.messages}
+                messages={threadMessages}
                 typingName={typingName}
                 replyTo={replyTo}
                 onReplyToChange={setReplyTo}

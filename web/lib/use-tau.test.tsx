@@ -321,6 +321,13 @@ describe("mergeIgnoredGroups", () => {
     expect(merged).toEqual([{ id: group.id, name: "crew", openable: true }]);
   });
 
+  it("skips left entries the snapshot still knows (un-ignored elsewhere)", () => {
+    // The group is in the snapshot but no longer ignored; the cached
+    // left entry is stale, not an orphan, so it produces no row.
+    const merged = mergeIgnoredGroups([group], [{ id: group.id, name: "crew" }]);
+    expect(merged).toEqual([]);
+  });
+
   it("is empty when nothing is ignored", () => {
     expect(mergeIgnoredGroups([group], [])).toEqual([]);
   });
