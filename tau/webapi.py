@@ -11866,6 +11866,11 @@ class WebBridge:
         }
 
     def groups(self) -> List[Dict[str, Any]]:
+        described = self._read_groups()
+        return [] if described is None else described
+
+    def _read_groups(self) -> Optional[List[Dict[str, Any]]]:
+        """The described group list, or None when the store cannot be read."""
         try:
             ignored = load_ignored_group_ids(
                 getattr(self.node.config, "ignored_groups_path", None)
@@ -11879,7 +11884,7 @@ class WebBridge:
             return described
         except Exception:  # pragma: no cover - defensive
             log.debug("Could not read group store", exc_info=True)
-            return []
+            return None
 
     def _describe_group(
         self,
@@ -12290,6 +12295,12 @@ class WebBridge:
             if was_ignored:
                 ignored = ignored.with_removed(group_id)
                 save_ignored_groups(path, ignored)
+                # Publish the groups under the lock, so events reach
+                # consoles in the same order as the saved states (#784).
+                # This also makes every console re-read /api/groups/left,
+                # which clears an orphan row for a group whose record is
+                # gone.
+                self._publish_groups()
         if was_ignored:
             # Stored history returns on unignore, including its unread
             # posts: push the recomputed counts so every open console
@@ -12302,11 +12313,6 @@ class WebBridge:
             self._publish_unread(
                 counts, restored=[entry] if entry is not None else None
             )
-            # Push the groups too, so the snapshot's ignored flag
-            # never lags the ignore file (#784) — and every console
-            # re-reads /api/groups/left, which also clears an orphan
-            # row for a group whose record is gone.
-            self._publish_groups()
         return {
             "group": group_id,
             "name": name,
