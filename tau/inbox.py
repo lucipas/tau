@@ -2453,21 +2453,28 @@ class Inbox:
             return None
         return dict(matches[0])
 
-    def export_document(self, *, peer: Optional[str] = None) -> Dict[str, Any]:
+    def export_document(
+        self,
+        *,
+        peer: Optional[str] = None,
+        group: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Return a portable backup of the stored messages.
 
         Messages are in stored (oldest-first) order so an import replays
         them in order; ``peer`` restricts the export to one sender
-        destination hash.  The document is the same shape
-        :meth:`import_messages` accepts.  The snapshot is read through
-        the cross-process transaction, so messages another process
-        committed since this inbox last loaded are included instead of
-        silently omitted from the backup.
+        destination hash and ``group`` to one group id.  The document is
+        the same shape :meth:`import_messages` accepts.  The snapshot is
+        read through the cross-process transaction, so messages another
+        process committed since this inbox last loaded are included instead
+        of silently omitted from the backup.
         """
         with self.transaction():
             entries = [dict(item) for item in self._messages]
         if peer is not None:
             entries = [item for item in entries if item.get("destination") == peer]
+        if group is not None:
+            entries = [item for item in entries if item.get("group") == group]
         return {
             "format": INBOX_EXPORT_FORMAT,
             "version": INBOX_EXPORT_VERSION,

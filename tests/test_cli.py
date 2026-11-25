@@ -8410,6 +8410,121 @@ def test_messages_export_import_round_trip(tmp_path, capsys):
     assert "Imported 0 messages (2 already present, 0 skipped)" in capsys.readouterr().out
 
 
+def test_group_export_round_trip(tmp_path, capsys):
+    from tau.groups import GroupStore
+
+    data_dir = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()  # drain the --json output of `tau init`
+    own_hash = _id_destination(data_dir, capsys)
+    store = GroupStore(data_dir / "groups.json")
+    group = store.create("weekend", [own_hash, "cd" * 16], created_by=own_hash)
+    config = TauConfig.resolve(data_dir=data_dir, name="alice")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": own_hash,
+            "text": "first in the group",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "g-1",
+            "kind": "group",
+            "group": group["id"],
+        }
+    )
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": own_hash,
+            "text": "second in the group",
+            "sent_at": 11.0,
+            "received_at": 21.0,
+            "id": "g-2",
+            "kind": "group",
+            "group": group["id"],
+        }
+    )
+    # A DM must stay out of the group archive.
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": own_hash,
+            "text": "not in the group",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "d-1",
+        }
+    )
+    export_path = tmp_path / "weekend.json"
+
+    code = cli.main(
+        [
+            "group",
+            "export",
+            "--data-dir",
+            str(data_dir),
+            "--output",
+            str(export_path),
+            "weekend",
+        ]
+    )
+    assert code == 0
+    assert "Exported 2 messages (group weekend)" in capsys.readouterr().out
+    document = json.loads(export_path.read_text(encoding="utf-8"))
+    assert document["format"] == "tau-messages-export"
+    assert document["group"] == "weekend"
+    assert document["group_id"] == group["id"]
+    assert [entry["id"] for entry in document["messages"]] == ["g-1", "g-2"]
+
+    # The stdout form carries the same document, and the existing
+    # `tau messages import` restores the group messages from it.
+    code = cli.main(["group", "export", "--data-dir", str(data_dir), "weekend"])
+    assert code == 0
+    assert json.loads(capsys.readouterr().out)["messages"][0]["id"] == "g-1"
+
+    target_dir = tmp_path / "other-node"
+    code = cli.main(
+        ["messages", "import", "--data-dir", str(target_dir), str(export_path)]
+    )
+    assert code == 0
+    assert "Imported 2 messages (0 already present, 0 skipped)" in (
+        capsys.readouterr().out
+    )
+
+    code = cli.main(["messages", "--data-dir", str(target_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    group_entries = [
+        item for item in payload["messages"] if item.get("group") == group["id"]
+    ]
+    assert [item["id"] for item in group_entries] == ["g-2", "g-1"]
+
+
+def test_group_export_rejects_unknown_group(tmp_path, capsys):
+    data_dir = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()  # drain the --json output of `tau init`
+
+    code = cli.main(["group", "export", "--data-dir", str(data_dir), "nowhere"])
+    assert code == 2
+    assert "unknown group" in capsys.readouterr().err
+
+
+def test_group_export_empty_group(tmp_path, capsys):
+    from tau.groups import GroupStore
+
+    data_dir = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()  # drain the --json output of `tau init`
+    own_hash = _id_destination(data_dir, capsys)
+    store = GroupStore(data_dir / "groups.json")
+    store.create("weekend", [own_hash, "cd" * 16], created_by=own_hash)
+
+    code = cli.main(["group", "export", "--data-dir", str(data_dir), "weekend"])
+    assert code == 0
+    document = json.loads(capsys.readouterr().out)
+    assert document["group"] == "weekend"
+    assert document["messages"] == []
+
+
 def test_messages_import_skips_retracted_group_messages(tmp_path, capsys):
     # Regression test (CodeRabbit Major on PR #322): a group message
     # retracted on the target node must not come back through an
