@@ -23676,6 +23676,11 @@ def _resolve_channel_reminder(
     app = ChannelApp(config, _tan_identity(config), name=config.name)
     conn = app.connect()
     try:
+        # A reminder fires by marking the message unread, which only
+        # works while joined: a cached message from a channel the node
+        # has left would be accepted here and silently dropped on fire.
+        if not is_channel_member(conn, name):
+            raise NodeError(f"not a member of #{name} — join it first")
         digest = resolve_message_digest(conn, name, message)
     except ChannelError as exc:
         raise NodeError(str(exc)) from exc

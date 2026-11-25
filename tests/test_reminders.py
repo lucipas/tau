@@ -456,6 +456,25 @@ def test_cli_add_channel_rejects_unknown_message(tmp_path, capsys):
     assert "unknown message" in capsys.readouterr().err
 
 
+def test_cli_add_channel_refuses_unjoined_channel(tmp_path, capsys):
+    # Leaving keeps the cached history, so without a membership check
+    # the add would succeed and the reminder would be dropped on fire.
+    data_dir, hashes, _author = _seed_channel_history(
+        tmp_path, texts=("agenda?",)
+    )
+    config = TauConfig.resolve(data_dir=data_dir, name="owner")
+    owner = load_identity(config.identity_path)
+    app = ChannelApp(config, owner, name="owner", gossip=False)
+    assert app.leave("general")
+    assert (
+        _remind_main(
+            data_dir, "add", "--channel", "general", hashes[0], "--in", "1h"
+        )
+        == cli._EXIT_ERROR
+    )
+    assert "not a member of #general" in capsys.readouterr().err
+
+
 def test_cli_add_channel_refuses_own_message(tmp_path, capsys):
     data_dir, hashes, _author = _seed_channel_history(
         tmp_path, texts=("my note",), own=True
