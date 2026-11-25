@@ -58,11 +58,11 @@ import NewGroupPanel from "./NewGroupPanel";
 import OutboxPanel from "./OutboxPanel";
 import RemindersPanel from "./RemindersPanel";
 import ThreadView from "./ThreadView";
+import type { MessageAction } from "./MessageBubble";
+import type { ComposerSendOptions } from "./Composer";
 
 // Upper bound on one ignored-thread history fetch; see startFetch.
 const IGNORED_HISTORY_TIMEOUT_MS = 15_000;
-import type { MessageAction } from "./MessageBubble";
-import type { ComposerSendOptions } from "./Composer";
 
 function extractKeys(value: unknown): string[] {
   if (Array.isArray(value)) {
@@ -311,6 +311,17 @@ export default function ChatSection() {
     startFetch(groupId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedKey, selectedIgnoredGroup, tau.messages, ignoredHistoryRetry]);
+
+  // Leaving the chat invalidates outstanding history work so a queued
+  // follow-up never fires a request after navigation unmounts the
+  // section. Mount-only: ordinary dependency changes must keep
+  // coalescing snapshot updates, not cancel them.
+  useEffect(() => {
+    return () => {
+      ignoredHistorySeq.current += 1;
+      ignoredHistoryPending.current = false;
+    };
+  }, []);
 
   // The open thread sees the snapshot plus the ignored group's explicit
   // history; the snapshot's copy wins on overlap (a group un-ignored
