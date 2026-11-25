@@ -853,6 +853,130 @@ def test_old_database_gains_a_location_column(identities, tmp_path):
         conn.close()
 
 
+# -- contact cards -----------------------------------------------------------
+
+
+def test_contact_card_is_part_of_the_signed_body(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    card = {"name": "carol", "destination_hash": "cc" * 16}
+    message = create_message(
+        conn, alice, "general", "meet carol", name="alice", now=1000,
+        contact=card,
+    )
+
+    assert message["contact"] == card
+    assert verify_message(message)["hash"] == message["hash"]
+    assert "contact" not in create_message(
+        conn, alice, "general", "plain", name="alice", now=1001
+    )
+
+    # A relay cannot strip the card: the contact is covered by the
+    # hash, so a card-less copy fails verification.
+    with pytest.raises(ChannelError):
+        verify_message({k: v for k, v in message.items() if k != "contact"})
+    # ...and neither can it move the card onto another message.
+    other = create_message(conn, alice, "general", "other", name="alice", now=1002)
+    with pytest.raises(ChannelError):
+        verify_message(dict(other, contact=card))
+
+
+def test_contact_card_round_trips_through_the_store(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    card = {"name": "carol", "destination_hash": "cc" * 16}
+    message = create_message(
+        conn, alice, "general", "meet carol", name="alice", now=1000,
+        contact=card,
+    )
+
+    stored = get_message(conn, message["hash"])
+    assert stored is not None
+    assert stored["contact"] == card
+    assert channel_history(conn, "general")[0]["contact"] == card
+
+    # Re-storing the same message returns the parsed card, not the
+    # raw JSON string the row stores.
+    again, is_new = store_message(conn, message)
+    assert is_new is False
+    assert again["contact"] == card
+
+
+def test_contact_card_requires_a_valid_card(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+
+    for bad in (
+        {"name": "carol"},
+        {"destination_hash": "cc" * 16},
+        {"name": "carol", "destination_hash": "not-a-hash"},
+        {"name": "carol", "destination_hash": "cc" * 15},
+        {"name": "", "destination_hash": "cc" * 16},
+        "carol",
+    ):
+        with pytest.raises(ChannelError):
+            create_message(
+                conn, alice, "general", "x", name="alice", now=1000,
+                contact=bad,
+            )
+
+
+def test_contact_card_refused_on_reply_and_poll(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    card = {"name": "carol", "destination_hash": "cc" * 16}
+    parent = create_message(
+        conn, alice, "general", "meet carol", name="alice", now=1000
+    )
+
+    with pytest.raises(ChannelError, match="top-level"):
+        create_message(
+            conn, alice, "general", "see her", name="alice", now=1001,
+            reply_to=parent["hash"], contact=card,
+        )
+    with pytest.raises(ChannelError, match="top-level"):
+        create_message(
+            conn, alice, "general", "pick one", name="alice", now=1002,
+            poll_options=["a", "b"], contact=card,
+        )
+
+
+def test_old_database_gains_a_contact_column(identities, tmp_path):
+    import sqlite3
+
+    alice, _ = identities
+    path = tmp_path / "channels.sqlite3"
+    conn = sqlite3.connect(str(path))
+    conn.execute(
+        "CREATE TABLE messages ("
+        "v INTEGER NOT NULL DEFAULT 1, hash TEXT PRIMARY KEY, "
+        "channel TEXT NOT NULL, author TEXT NOT NULL, key TEXT NOT NULL, "
+        "name TEXT NOT NULL DEFAULT '', text TEXT NOT NULL, "
+        "created_at REAL NOT NULL, received_at REAL NOT NULL, sig TEXT NOT NULL)"
+    )
+    conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    conn.execute(
+        "CREATE TABLE memberships (channel TEXT PRIMARY KEY, joined_at REAL NOT NULL)"
+    )
+    conn.commit()
+    conn.close()
+
+    conn = init_db(path)
+    try:
+        columns = [
+            row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()
+        ]
+        assert "contact" in columns
+        card = {"name": "carol", "destination_hash": "cc" * 16}
+        message = create_message(
+            conn, alice, "general", "meet carol", name="alice", now=1000,
+            contact=card,
+        )
+        assert get_message(conn, message["hash"])["contact"] == card
+    finally:
+        conn.close()
+
+
 def test_feed_serves_replies_with_their_parent_digest(identities, tmp_path):
     alice, bob = identities
     app = _make_app(identities, tmp_path)

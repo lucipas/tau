@@ -584,6 +584,10 @@ def test_parser_send_contact():
         ["group", "send", "weekend", "meet carol", "--contact", "carol"]
     )
     assert args.contact == "carol"
+    args = parser.parse_args(
+        ["channel", "send", "general", "hi", "--contact", "carol"]
+    )
+    assert args.contact == "carol"
 
 
 def _seed_contact_peer(data_dir, name="carol", hash_hex="cc" * 16):
@@ -737,6 +741,124 @@ def test_group_send_contact_reaches_node(tmp_path, capsys, monkeypatch):
         "name": "carol",
         "destination_hash": "cc" * 16,
     }
+
+
+def test_channel_send_contact_reaches_store(tmp_path, capsys, monkeypatch):
+    from tau.channels import channel_history, init_db
+
+    _init_node(tmp_path, "node", "alice")
+    assert _run_channel(tmp_path, "join", "general") == 0
+    capsys.readouterr()
+    _seed_contact_peer(tmp_path / "node")
+    code = _run_channel(
+        tmp_path,
+        "send",
+        "general",
+        "meet carol",
+        "--no-publish",
+        "--contact",
+        "carol",
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "sent to #general" in out
+    assert "Shared contact: carol" in out
+
+    conn = init_db(tmp_path / "node" / "channels.sqlite3")
+    try:
+        message = channel_history(conn, "general")[0]
+    finally:
+        conn.close()
+    assert message["contact"] == {
+        "name": "carol",
+        "destination_hash": "cc" * 16,
+    }
+    assert message["text"] == "meet carol"
+
+    # A bare card takes the card line as its text.  stdin is not a
+    # TTY under pytest, so stand in a TTY for the default-text branch.
+    import io
+    import sys
+
+    class _TtyStdin(io.StringIO):
+        def isatty(self):
+            return True
+
+    monkeypatch.setattr(sys, "stdin", _TtyStdin())
+    code = _run_channel(
+        tmp_path, "send", "general", "--no-publish", "--contact", "carol"
+    )
+    assert code == 0
+    capsys.readouterr()  # drain the bare-card human lines before --json
+    conn = init_db(tmp_path / "node" / "channels.sqlite3")
+    try:
+        bare = channel_history(conn, "general")[0]
+    finally:
+        conn.close()
+    assert bare["text"] == "👤 Shared contact: carol (cccccccc…)"
+    assert bare["contact"] == {"name": "carol", "destination_hash": "cc" * 16}
+
+    # The card rides in --json output too.
+    code = cli.main(
+        [
+            "channel",
+            "--data-dir",
+            str(tmp_path / "node"),
+            "--json",
+            "send",
+            "general",
+            "meet carol",
+            "--no-publish",
+            "--contact",
+            "carol",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["message"]["contact"] == {
+        "name": "carol",
+        "destination_hash": "cc" * 16,
+    }
+
+    # A card cannot ride on a reply or a scheduled message.
+    code = _run_channel(
+        tmp_path,
+        "send",
+        "general",
+        "see her",
+        "--no-publish",
+        "--contact",
+        "carol",
+        "--reply-to",
+        message["hash"][:12],
+    )
+    assert code == 2
+    assert "top-level" in capsys.readouterr().err
+    code = _run_channel(
+        tmp_path,
+        "send",
+        "general",
+        "later",
+        "--contact",
+        "carol",
+        "--delay",
+        "5m",
+    )
+    assert code == 2
+    assert "--delay" in capsys.readouterr().err
+
+    # An unknown peer fails before anything is stored.
+    code = _run_channel(
+        tmp_path,
+        "send",
+        "general",
+        "never",
+        "--no-publish",
+        "--contact",
+        "nobody",
+    )
+    assert code == 1
+    assert "unknown peer" in capsys.readouterr().err
 
 
 def test_send_location_reaches_node_and_defaults_text(

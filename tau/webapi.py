@@ -261,7 +261,7 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/channels/pins  pinned messages for a channel (``?channel=<name>``)
     POST /api/channels/join  join a channel (``{"channel": "<name>"}``)
     POST /api/channels/leave leave a channel (``{"channel": "<name>"}``)
-    POST /api/channels/send  send a message to a joined channel (``{"channel", "text", "reply_to"?, "expires_in"?, "location"?}``; ``expires_in`` seconds, at most 30d; ``location`` is ``{"lat", "lon", "name"?}`` and is refused on a reply)
+    POST /api/channels/send  send a message to a joined channel (``{"channel", "text", "reply_to"?, "expires_in"?, "location"?, "contact"?}``; ``expires_in`` seconds, at most 30d; ``location`` is ``{"lat", "lon", "name"?}`` and is refused on a reply; ``contact`` is ``{"name", "destination_hash"}`` and is refused on a reply)
     POST /api/channels/schedule  schedule a channel message — or a poll, with ``"poll_options"`` — for later
     GET  /api/channels/scheduled  queued channel messages and polls, soonest first
     POST /api/channels/cancel-scheduled  cancel a queued channel message or poll
@@ -5009,6 +5009,7 @@ class WebBridge:
         reply_to: Optional[str] = None,
         expires_in: Optional[float] = None,
         location: Optional[Dict[str, Any]] = None,
+        contact: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Send *text* to a joined channel, gossiping it to peers.
 
@@ -5022,6 +5023,10 @@ class WebBridge:
         ``location`` pins a place on a top-level message
         (``{"lat": .., "lon": .., "name": ..}``); it is refused on a
         reply, exactly like the CLI's ``--location``.
+
+        ``contact`` shares a peer's card on a top-level message
+        (``{"name": .., "destination_hash": <32 hex>}``); it is
+        refused on a reply, exactly like the CLI's ``--contact``.
         """
         app = self._channel_app()
         if app is None:
@@ -5038,6 +5043,7 @@ class WebBridge:
             reply_to=reply_to,
             expires_at=expires_at,
             location=location,
+            contact=contact,
         )
 
     def channel_edit(
@@ -17613,6 +17619,33 @@ class _WebHandler(BaseHTTPRequestHandler):
                             400,
                         )
                         return
+                contact = body.get("contact")
+                if contact is not None:
+                    if not isinstance(contact, dict):
+                        self._send_json(
+                            {
+                                "error": {
+                                    "message": "field 'contact' must be an object "
+                                    "with a name and a destination hash"
+                                }
+                            },
+                            head_only,
+                            400,
+                        )
+                        return
+                    if clean_contact(contact) is None:
+                        self._send_json(
+                            {
+                                "error": {
+                                    "message": "field 'contact' must be a card "
+                                    "with a name and a 32-character hex "
+                                    "destination hash"
+                                }
+                            },
+                            head_only,
+                            400,
+                        )
+                        return
                 try:
                     message = self.bridge.channel_send(
                         channel,
@@ -17624,6 +17657,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                             else None
                         ),
                         location=location,
+                        contact=contact,
                     )
                 except (ValueError, ProtocolError) as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
