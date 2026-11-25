@@ -16,7 +16,8 @@
 //                       is built from the same stored history /api/messages
 //                       returns, exactly as the old console did.)
 //   usePeerActions()  — ping / info / verify / safety-number / block /
-//                       forget / alias / note / archive / mute / pin actions.
+//                       forget / alias / note / archive / mute / pin /
+//                       ignore-group actions.
 //
 // Live protocol (tau/webapi.py _serve_websocket): the first /ws frame is
 // `{ "type": "snapshot", "snapshot": {...} }`; later frames are bus events:
@@ -41,10 +42,12 @@ import {
   getBroadcasts,
   getDmRequests,
   getHeldMail,
+  getLeftGroups,
   getOutbox,
   getPeerInfo,
   getSafetyNumber,
   getStatus,
+  ignoreGroup,
   markRead,
   markUnread,
   pingPeer,
@@ -57,6 +60,7 @@ import {
   setPinnedConversation,
   unarchiveConversation,
   unblockPeer,
+  unignoreGroup,
   updateBeaconPosition,
   verifyPeer,
   wsUrl,
@@ -310,6 +314,8 @@ export interface Conversation {
   unread: number;
   muted: boolean;
   archived: boolean;
+  /** True when the group is ignored (local display preference). */
+  ignored: boolean;
   pinned: boolean;
 }
 
@@ -330,6 +336,7 @@ export function buildConversations(
     mutedGroups?: Set<string>;
     archived?: Set<string>;
     includeArchived?: boolean;
+    includeIgnored?: boolean;
   } = {},
 ): Conversation[] {
   const byPeer = new Map<string, Peer>();
@@ -357,6 +364,7 @@ export function buildConversations(
         unread: unread?.per_group[groupId] ?? 0,
         muted: opts.mutedGroups?.has(groupId) ?? false,
         archived: false,
+        ignored: group?.ignored ?? false,
         pinned: group?.pinned ?? false,
       });
     } else {
@@ -371,6 +379,7 @@ export function buildConversations(
         unread: unread?.per_peer[hash] ?? 0,
         muted: opts.mutedPeers?.has(hash) ?? false,
         archived: opts.archived?.has(hash) ?? false,
+        ignored: false,
         pinned: peer?.pinned ?? false,
       });
     }
@@ -387,13 +396,19 @@ export function buildConversations(
         unread: unread?.per_group[group.id] ?? 0,
         muted: opts.mutedGroups?.has(group.id) ?? false,
         archived: false,
+        ignored: group.ignored ?? false,
         pinned: group.pinned ?? false,
       });
     }
   }
-  const filtered = opts.includeArchived
-    ? out
-    : out.filter((c) => !c.archived);
+  // Ignored groups stay out of the main list (they live in the Ignored
+  // section instead), like archived DMs — unless the caller is building
+  // the list for a thread that is already open, which must still resolve.
+  const filtered = out.filter(
+    (c) =>
+      (opts.includeArchived || !c.archived) &&
+      (opts.includeIgnored || !c.ignored),
+  );
   // Pinned conversations stay at the top; recency orders the rest.
   filtered.sort(
     (a, b) =>
@@ -403,11 +418,55 @@ export function buildConversations(
   return filtered;
 }
 
+/** An ignored group for the conversation list's Ignored section. */
+export interface IgnoredGroup {
+  id: string;
+  name: string;
+  /** False when the group record is gone (an orphaned ignored id): the
+   *  row can only be un-ignored, never opened as a thread. */
+  openable: boolean;
+}
+
+/**
+ * Merge the snapshot's ignored groups with the orphaned ignored ids
+ * from /api/groups/left. Pure — unit-tested in use-tau.test.tsx. The
+ * snapshot carries the name for every group whose record still exists;
+ * an id the snapshot does not know is an orphan whose record was
+ * deleted (or whose backup restored the ignore list without
+ * groups.json), shown by id prefix so it still has a way out.
+ */
+export function mergeIgnoredGroups(
+  groups: Group[],
+  leftIgnored: { id: string; name: string }[],
+): IgnoredGroup[] {
+  const merged = new Map<string, IgnoredGroup>();
+  for (const group of groups) {
+    if (group.ignored) {
+      merged.set(group.id, { id: group.id, name: group.name, openable: true });
+    }
+  }
+  for (const entry of leftIgnored) {
+    if (!merged.has(entry.id)) {
+      merged.set(entry.id, {
+        id: entry.id,
+        name: entry.name || entry.id.slice(0, 8),
+        openable: false,
+      });
+    }
+  }
+  return [...merged.values()].sort((a, b) =>
+    (a.name || a.id).localeCompare(b.name || b.id),
+  );
+}
+
 export interface UseConversationsResult {
   conversations: Conversation[];
   archived: Conversation[];
+  /** Ignored groups, from the snapshot plus orphaned ids. */
+  ignoredGroups: IgnoredGroup[];
   dmRequests: DmRequest[];
   refreshRequests: () => Promise<void>;
+  refreshIgnoredGroups: () => Promise<void>;
 }
 
 /** Conversation list + held DM requests, derived from the live snapshot. */
@@ -430,6 +489,26 @@ export function useConversations(
   useEffect(() => {
     void refreshRequests();
   }, [refreshRequests]);
+  // Orphaned ignored ids (record gone) come only from /api/groups/left;
+  // the snapshot covers every ignored group whose record still exists.
+  const [leftIgnored, setLeftIgnored] = useState<{ id: string; name: string }[]>([]);
+  const ignoredSeq = useRef(0);
+  const refreshIgnoredGroups = useCallback(async () => {
+    const seq = ++ignoredSeq.current;
+    try {
+      const left = await getLeftGroups();
+      // A stale response must not overwrite a newer one.
+      if (seq === ignoredSeq.current) setLeftIgnored(left.ignored ?? []);
+    } catch {
+      // Ignored groups are advisory; a failed poll must not break the list.
+    }
+  }, []);
+  // Re-read the orphan list whenever the snapshot's groups change, so
+  // ignore/leave/un-ignore from elsewhere (PeerPanel, CLI, another tab)
+  // is reflected without a reload.
+  useEffect(() => {
+    void refreshIgnoredGroups();
+  }, [refreshIgnoredGroups, tau.groups]);
 
   const conversations = useMemo(
     () =>
@@ -450,7 +529,11 @@ export function useConversations(
       }).filter((c) => c.archived),
     [tau.messages, tau.peers, tau.groups, tau.unread, opts.mutedPeers, opts.mutedGroups, opts.archived],
   );
-  return { conversations, archived, dmRequests, refreshRequests };
+  const ignoredGroups = useMemo(
+    () => mergeIgnoredGroups(tau.groups, leftIgnored),
+    [tau.groups, leftIgnored],
+  );
+  return { conversations, archived, ignoredGroups, dmRequests, refreshRequests, refreshIgnoredGroups };
 }
 
 // ------------------------------------------------------------------ outbox
@@ -788,6 +871,8 @@ export interface PeerActions {
   setNote: (destination: string, note: string) => Promise<Peer>;
   archive: (target: string) => Promise<unknown>;
   unarchive: (target: string) => Promise<unknown>;
+  ignoreGroup: (group: string) => Promise<unknown>;
+  unignoreGroup: (group: string) => Promise<unknown>;
   mute: (target: { peer: string } | { group: string }, muted?: boolean) => Promise<unknown>;
   pin: (target: { peer: string } | { group: string }, pinned?: boolean) => Promise<unknown>;
   markRead: (
@@ -811,6 +896,8 @@ export function usePeerActions(): PeerActions {
       setNote: (destination, note) => setPeerNote(destination, note),
       archive: (target) => archiveConversation(target),
       unarchive: (target) => unarchiveConversation(target),
+      ignoreGroup: (group) => ignoreGroup(group),
+      unignoreGroup: (group) => unignoreGroup(group),
       mute: (target, muted) => setMuted(target, muted),
       pin: (target, pinned) => setPinnedConversation(target, pinned),
       markRead: (target = {}) => markRead(target),

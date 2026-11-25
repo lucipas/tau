@@ -151,7 +151,7 @@ export default function ChatSection() {
   const [joinResult, setJoinResult] = useState<string | null>(null);
   const [showNewGroup, setShowNewGroup] = useState(false);
 
-  const { conversations, archived: archivedConvs, dmRequests, refreshRequests } = useConversations(
+  const { conversations, archived: archivedConvs, ignoredGroups, dmRequests, refreshRequests, refreshIgnoredGroups } = useConversations(
     tau,
     { mutedPeers, mutedGroups, archived },
   );
@@ -182,6 +182,7 @@ export default function ChatSection() {
           mutedGroups,
           archived,
           includeArchived: true,
+          includeIgnored: true,
         }).find((c) => c.kind === "dm" && c.key === selectedPeer) ?? null
       );
     }
@@ -192,6 +193,7 @@ export default function ChatSection() {
           mutedGroups,
           archived,
           includeArchived: true,
+          includeIgnored: true,
         }).find((c) => c.kind === "group" && c.key === selectedGroup) ?? null
       );
     }
@@ -204,6 +206,9 @@ export default function ChatSection() {
     if (!selected) return;
     setReplyTo(null);
     setEditing(null);
+    // An ignored group keeps its read cursor frozen so its unread posts
+    // come back when it is un-ignored.
+    if (selected.ignored) return;
     const target = selected.kind === "group" ? { group: selected.key } : { peer: selected.key };
     void actions
       .markRead(target)
@@ -802,9 +807,16 @@ export default function ChatSection() {
             <ConversationList
               conversations={conversations}
               archived={archivedConvs}
+              ignoredGroups={ignoredGroups}
               dmRequests={dmRequests}
               selectedKey={selectedKey}
               onSelect={handleSelect}
+              onSelectIgnoredGroup={(group) => navigate("chat", { group: group.id })}
+              onUnignoreGroup={(group) => {
+                void run("Un-ignore failed", () => actions.unignoreGroup(group.id)).then(() =>
+                  void refreshIgnoredGroups(),
+                );
+              }}
               onAcceptRequest={(req) => {
                 void run("Accept failed", () => acceptDmRequest(req.id)).then(() => void refreshRequests());
               }}

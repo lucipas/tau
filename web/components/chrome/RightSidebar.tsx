@@ -56,6 +56,7 @@ export default function RightSidebar({ className = "" }: { className?: string })
     (selectedPeer || selectedGroup)
       ? buildConversations(tau.messages, tau.peers, tau.groups, tau.unread, {
           includeArchived: true,
+          includeIgnored: true,
         }).find((c) =>
           selectedPeer
             ? c.kind === "dm" && c.key === selectedPeer

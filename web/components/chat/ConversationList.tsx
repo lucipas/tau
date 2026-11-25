@@ -1,12 +1,13 @@
 // ConversationList.tsx — DM + group list with unread badges, last-message
-// preview, muted handling, archived section, and the DM requests entry.
+// preview, muted handling, archived section, ignored-groups section, and
+// the DM requests entry.
 
 "use client";
 
 import { useState } from "react";
 import { formatRelative } from "@/lib/format";
 import { useNow } from "@/lib/use-now";
-import type { Conversation } from "@/lib/use-tau";
+import type { Conversation, IgnoredGroup } from "@/lib/use-tau";
 import type { DmRequest } from "@/lib/types";
 import Avatar from "../chrome/Avatar";
 import UnreadChip from "../chrome/UnreadChip";
@@ -14,9 +15,12 @@ import UnreadChip from "../chrome/UnreadChip";
 export interface ConversationListProps {
   conversations: Conversation[];
   archived: Conversation[];
+  ignoredGroups: IgnoredGroup[];
   dmRequests: DmRequest[];
   selectedKey?: string | null;
   onSelect: (conversation: Conversation) => void;
+  onSelectIgnoredGroup?: (group: IgnoredGroup) => void;
+  onUnignoreGroup?: (group: IgnoredGroup) => void;
   onAcceptRequest?: (request: DmRequest) => void;
   onDeclineRequest?: (request: DmRequest) => void;
   /** True when this conversation kind is muted for the row (already on the
@@ -27,9 +31,12 @@ export interface ConversationListProps {
 export default function ConversationList({
   conversations,
   archived,
+  ignoredGroups,
   dmRequests,
   selectedKey,
   onSelect,
+  onSelectIgnoredGroup,
+  onUnignoreGroup,
   onAcceptRequest,
   onDeclineRequest,
   now: nowProp,
@@ -37,6 +44,7 @@ export default function ConversationList({
   const liveNow = useNow();
   const now = nowProp ?? liveNow;
   const [showArchived, setShowArchived] = useState(false);
+  const [showIgnored, setShowIgnored] = useState(false);
 
   return (
     <div className="flex h-full flex-col" aria-label="Conversations">
@@ -144,6 +152,52 @@ export default function ConversationList({
           );
         })}
       </ul>
+
+      {ignoredGroups.length > 0 && (
+        <section aria-label="Ignored groups" className="border-t border-zinc-800">
+          <button
+            type="button"
+            aria-expanded={showIgnored}
+            onClick={() => setShowIgnored((v) => !v)}
+            className="flex w-full items-center justify-between px-3 py-2 text-xs font-bold uppercase tracking-wide text-zinc-500 hover:text-zinc-300"
+          >
+            <span>Ignored groups ({ignoredGroups.length})</span>
+            <span aria-hidden="true">{showIgnored ? "▾" : "▸"}</span>
+          </button>
+          {showIgnored && (
+            <ul className="max-h-64 overflow-y-auto">
+              {ignoredGroups.map((group) => (
+                <li key={`ignored:${group.id}`}>
+                  <div className="flex w-full items-center gap-3 px-3 py-2 text-left text-sm text-zinc-400">
+                    <Avatar name={group.name} seed={group.id} size="sm" />
+                    {group.openable ? (
+                      <button
+                        type="button"
+                        onClick={() => onSelectIgnoredGroup?.(group)}
+                        className="min-w-0 flex-1 truncate text-left hover:text-zinc-200"
+                      >
+                        {group.name}
+                      </button>
+                    ) : (
+                      <span className="min-w-0 flex-1 truncate" title={group.id}>
+                        {group.name}
+                      </span>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => onUnignoreGroup?.(group)}
+                      aria-label={`Un-ignore ${group.name}`}
+                      className="shrink-0 rounded-full border border-zinc-700 px-2.5 py-1 text-xs text-zinc-300 hover:bg-zinc-800"
+                    >
+                      Un-ignore
+                    </button>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+      )}
 
       {archived.length > 0 && (
         <section aria-label="Archived conversations" className="border-t border-zinc-800">

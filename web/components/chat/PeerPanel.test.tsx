@@ -25,6 +25,7 @@ function conv(peer: Peer): Conversation {
     unread: 0,
     muted: false,
     archived: false,
+    ignored: false,
     pinned: false,
   };
 }
@@ -58,6 +59,7 @@ function groupConv(overrides: Partial<Group> = {}): Conversation {
     unread: 0,
     muted: false,
     archived: false,
+    ignored: false,
     pinned: false,
   };
 }
@@ -526,5 +528,92 @@ describe("PeerPanel group members", () => {
     );
     expect(window.location.hash).toBe("");
     expect(screen.getByText("bob")).toBeTruthy();
+  });
+});
+
+describe("PeerPanel group ignore", () => {
+  // Same body-recording fetch stub as the group-members block: the
+  // ignore call's body ({ group }) is what proves the right group.
+  function mockFetchBodies(
+    handler: (url: string, method: string, body: unknown) => unknown,
+  ) {
+    const calls: { method: string; url: string; body: unknown }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        const method = init?.method ?? "GET";
+        let body: unknown = null;
+        if (init?.body) {
+          try {
+            body = JSON.parse(String(init.body));
+          } catch {
+            body = null;
+          }
+        }
+        calls.push({ method, url, body });
+        const payload = await handler(url, method, body);
+        return {
+          ok: true,
+          status: 200,
+          text: async () => JSON.stringify(payload ?? {}),
+        } as Response;
+      }),
+    );
+    return { calls };
+  }
+
+  it("ignores the group after a confirm step, posting the group id", async () => {
+    const { calls } = mockFetchBodies((url) => {
+      if (url.includes("/api/groups/invite")) {
+        return { mode: "open", generation: 0, link: null };
+      }
+      return { ok: true };
+    });
+    renderPanel(groupConv());
+    await waitFor(() => expect(screen.getByText("Members")).toBeTruthy());
+    expect(screen.queryByText("Un-ignore group")).toBeNull();
+    fireEvent.click(screen.getByText("Ignore group"));
+    fireEvent.click(screen.getByText("Confirm ignore group?"));
+    await waitFor(() =>
+      expect(
+        calls.some(
+          (c) =>
+            c.method === "POST" &&
+            c.url.includes("/api/groups/ignore") &&
+            JSON.stringify(c.body) === JSON.stringify({ group: GROUP_ID }),
+        ),
+      ).toBe(true),
+    );
+  });
+
+  it("offers Un-ignore instead of Ignore for an already-ignored group", async () => {
+    const { calls } = mockFetchBodies((url) => {
+      if (url.includes("/api/groups/invite")) {
+        return { mode: "open", generation: 0, link: null };
+      }
+      return { ok: true };
+    });
+    renderPanel(groupConv({ ignored: true }));
+    await waitFor(() => expect(screen.getByText("Members")).toBeTruthy());
+    expect(screen.queryByText("Ignore group")).toBeNull();
+    fireEvent.click(screen.getByText("Un-ignore group"));
+    await waitFor(() =>
+      expect(
+        calls.some(
+          (c) =>
+            c.method === "POST" &&
+            c.url.includes("/api/groups/unignore") &&
+            JSON.stringify(c.body) === JSON.stringify({ group: GROUP_ID }),
+        ),
+      ).toBe(true),
+    );
+  });
+
+  it("shows no ignore controls for a DM", async () => {
+    mockFetch(() => ({ ok: true }));
+    renderDmPanel(makePeer({ destination: PEER_HASH }));
+    await waitFor(() => expect(screen.getByText("Public profile")).toBeTruthy());
+    expect(screen.queryByText("Ignore group")).toBeNull();
+    expect(screen.queryByText("Un-ignore group")).toBeNull();
   });
 });
