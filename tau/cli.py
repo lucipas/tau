@@ -1059,19 +1059,27 @@ def build_parser() -> argparse.ArgumentParser:
     remind = subparsers.add_parser(
         "remind",
         parents=[common],
-        help="snooze a stored DM or group message and be re-pinged later",
+        help="snooze a stored DM, group or channel message and be re-pinged later",
     )
     remind_sub = remind.add_subparsers(dest="remind_command", metavar="REMIND_COMMAND")
 
     remind_add = remind_sub.add_parser(
         "add",
         parents=[common],
-        help="remind yourself about a stored DM or group message later",
+        help="remind yourself about a stored DM, group or channel message later",
     )
     remind_add.add_argument(
         "message",
         metavar="MSG",
-        help="message id or unique prefix (as shown by `tau messages`)",
+        help="message id or unique prefix (as shown by `tau messages`); "
+        "a channel message hash or prefix with --channel",
+    )
+    remind_add.add_argument(
+        "--channel",
+        metavar="NAME",
+        default=None,
+        help="channel name: remind on a stored message in this channel "
+        "instead of a DM or group message",
     )
     remind_add_time = remind_add.add_mutually_exclusive_group(required=True)
     remind_add_time.add_argument(
@@ -23592,22 +23600,34 @@ def cmd_draft_send(args: argparse.Namespace) -> int:
 
 
 def _reminder_sender_blocked(
-    inbox: Inbox, reminder: Dict[str, Any], blocked: Any
+    inbox: Inbox,
+    reminder: Dict[str, Any],
+    blocked: Any,
+    channels: Any = None,
 ) -> bool:
     """Whether the reminded message's sender is blocked now (fail closed).
 
     A DM reminder's target is the sender.  A group reminder names the
-    group, so the sender is read from the stored message; when that
-    message is gone its sender is unknown, and the reminder is hidden.
+    group, so the sender is read from the stored message; a channel
+    reminder names the channel, so the sender is the stored channel
+    message's author.  When that message is gone its sender is
+    unknown, and the reminder is hidden.
     """
-    if reminder["kind"] != "group":
-        return reminder["target"] in blocked
-    entry = inbox.find(
-        str(reminder["message_id"]), group=str(reminder["target"])
-    )
-    if entry is None:
-        return True
-    return entry.get("destination") in blocked
+    if reminder["kind"] == "group":
+        entry = inbox.find(
+            str(reminder["message_id"]), group=str(reminder["target"])
+        )
+        if entry is None:
+            return True
+        return entry.get("destination") in blocked
+    if reminder["kind"] == "channel":
+        if channels is None:
+            return True
+        entry = channels.get_visible_message(str(reminder["message_id"]))
+        if entry is None or entry.get("channel") != reminder["target"]:
+            return True
+        return entry.get("author") in blocked
+    return reminder["target"] in blocked
 
 
 def _describe_reminder(
@@ -23617,6 +23637,8 @@ def _describe_reminder(
     if reminder["kind"] == "group":
         group = GroupStore(config.groups_path).get(str(reminder["target"]))
         name = str(group["name"]) if group is not None else short_hash(reminder["target"])
+    elif reminder["kind"] == "channel":
+        name = f"#{reminder['target']}"
     else:
         peer = PeerRegistry(config.peers_path).get(str(reminder["target"]))
         name = peer.display_name if peer is not None else short_hash(reminder["target"])
@@ -23633,8 +23655,53 @@ def _describe_reminder(
     }
 
 
+def _resolve_channel_reminder(
+    config: TauConfig, channel: str, message: str
+) -> Dict[str, Any]:
+    """Resolve a channel message into the inbox-record shape ``cmd_remind_add`` uses.
+
+    The message is resolved by hash or unique prefix within the
+    channel, then read as history shows it — an expired or retracted
+    message is gone, so it cannot be snoozed.  The record carries the
+    channel's ``author`` as ``destination`` and the author's announced
+    name as ``from``, so the shared refusal, block-list and
+    sender-label code below applies unchanged; ``direction`` is
+    ``out`` for the node's own messages, which the shared sent check
+    refuses (an own message never lights the channel badge).
+    """
+    try:
+        name = clean_channel_name(channel)
+    except ChannelError as exc:
+        raise NodeError(str(exc)) from exc
+    app = ChannelApp(config, _tan_identity(config), name=config.name)
+    conn = app.connect()
+    try:
+        # A reminder fires by marking the message unread, which only
+        # works while joined: a cached message from a channel the node
+        # has left would be accepted here and silently dropped on fire.
+        if not is_channel_member(conn, name):
+            raise NodeError(f"not a member of #{name} — join it first")
+        digest = resolve_message_digest(conn, name, message)
+    except ChannelError as exc:
+        raise NodeError(str(exc)) from exc
+    finally:
+        conn.close()
+    stored = app.get_visible_message(digest)
+    if stored is None:
+        raise NodeError(f"unknown message in #{name}: {message!r}")
+    return {
+        "text": stored.get("text"),
+        "kind": "channel",
+        "channel": name,
+        "destination": stored.get("author"),
+        "direction": "out" if stored.get("author") == app.author else "in",
+        "from": stored.get("name"),
+        "id": stored.get("hash"),
+    }
+
+
 def cmd_remind_add(args: argparse.Namespace) -> int:
-    """Snooze a stored DM or group message: be re-pinged about it later.
+    """Snooze a stored DM, group or channel message: be re-pinged about it later.
 
     Local-only: the reminder is a snapshot of the message's text and
     sender, stored in the data dir and fired by the serving node's
@@ -23644,13 +23711,22 @@ def cmd_remind_add(args: argparse.Namespace) -> int:
     subject of a reminder either.
     """
     config = _make_config(args)
-    inbox = Inbox(config.inbox_path)
     registry = PeerRegistry(config.peers_path)
-    try:
-        record = inbox.resolve(args.message)
-    except ValueError as exc:
-        raise NodeError(str(exc)) from exc
+    channel_name = getattr(args, "channel", None)
+    if channel_name is not None:
+        record = _resolve_channel_reminder(config, channel_name, args.message)
+    else:
+        inbox = Inbox(config.inbox_path)
+        try:
+            record = inbox.resolve(args.message)
+        except ValueError as exc:
+            raise NodeError(str(exc)) from exc
     if not record.get("text"):
+        if record.get("kind") == "channel":
+            raise NodeError(
+                "cannot remind on a message with no text "
+                "(poll votes and closes carry none)"
+            )
         raise NodeError("cannot remind on a file message: it has no text")
     if record.get("kind") == "note":
         raise NodeError("cannot remind on a private note: remind on a DM or group message")
@@ -23666,6 +23742,8 @@ def cmd_remind_add(args: argparse.Namespace) -> int:
             raise NodeError("cannot remind on a message from a blocked peer")
     if record.get("kind") == "group":
         kind, target = "group", str(record.get("group") or "")
+    elif record.get("kind") == "channel":
+        kind, target = "channel", str(record.get("channel") or "")
     else:
         kind, target = "peer", str(record.get("destination") or "")
     if record.get("direction") == "out":
@@ -23731,11 +23809,21 @@ def cmd_remind_list(args: argparse.Namespace) -> int:
     # message itself; an unreadable block-list hides everything.
     blocked = load_blocked_set(config.blocklist_path)
     inbox = Inbox(config.inbox_path)
+    pending = ReminderStore(config.reminders_path).list_reminders()
+    channels = None
+    if any(reminder["kind"] == "channel" for reminder in pending):
+        # Only channel reminders need the channel store (to vet the
+        # sender); without an identity there is no store, so those
+        # reminders stay hidden — fail closed — while the rest list.
+        try:
+            channels = ChannelApp(config, _tan_identity(config), name=config.name)
+        except (NodeError, IdentityError):
+            channels = None
     reminders = [
         _describe_reminder(reminder, config)
-        for reminder in ReminderStore(config.reminders_path).list_reminders()
+        for reminder in pending
         if blocked is not None
-        and not _reminder_sender_blocked(inbox, reminder, blocked)
+        and not _reminder_sender_blocked(inbox, reminder, blocked, channels)
     ]
     if _json_mode(args):
         _emit({"reminders": reminders, "count": len(reminders)}, True)

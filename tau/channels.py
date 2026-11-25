@@ -2832,6 +2832,124 @@ def mark_channel_read(
     }
 
 
+def mark_channel_unread(
+    conn: sqlite3.Connection,
+    channel: str,
+    message_hash: str,
+    *,
+    exclude_authors: Optional[Sequence[str]] = None,
+) -> Dict[str, Any]:
+    """Move *channel*'s read cursor back to just before one message.
+
+    The reminder firing pass uses this: a snoozed message is re-opened
+    at the message itself, so the owner re-reads from there and the
+    badge lights again.  Requires membership, like
+    :func:`mark_channel_read` — a channel the node has left has no
+    badge to light — and the message must still be visible (an
+    expired or retracted message is gone).  The cursor only ever moves
+    backward: when it already sits at or before the message, it is
+    left alone, so firing a reminder never marks unread messages read.
+    With no cursor, a message received since joining is already
+    unread and nothing moves; an older cached one gets a cursor just
+    before it, so it always counts as unread.  Returns the cursor plus
+    how many messages are unread now.
+    """
+    name = clean_channel_name(channel)
+    row = conn.execute(
+        "SELECT channel, joined_at FROM memberships WHERE channel = ?",
+        (name,),
+    ).fetchone()
+    if row is None:
+        raise ChannelError(f"not a member of #{name} — join it first")
+    visible = get_visible_message(conn, message_hash)
+    if visible is None or visible.get("channel") != name:
+        raise ChannelError(f"unknown message in #{name}")
+    # The message just before the target in history order; the cursor
+    # moves to it, or is deleted when the target is the oldest stored.
+    previous = conn.execute(
+        "SELECT hash, created_at FROM messages WHERE channel = ? "
+        "AND (created_at < ? OR (created_at = ? AND hash < ?)) "
+        "ORDER BY created_at DESC, hash DESC LIMIT 1",
+        (name, visible["created_at"], visible["created_at"], visible["hash"]),
+    ).fetchone()
+    cursor = conn.execute(
+        "SELECT last_read_hash, last_read_at FROM read_cursors WHERE channel = ?",
+        (name,),
+    ).fetchone()
+    received = conn.execute(
+        "SELECT received_at FROM messages WHERE channel = ? AND hash = ?",
+        (name, visible["hash"]),
+    ).fetchone()
+    # Where the cursor must sit so the target counts as unread.  An
+    # absent cursor only counts messages received after joining, so a
+    # target cached from before the join needs an explicit cursor.
+    # The oldest stored message gets a sentinel (empty hash) at its own
+    # timestamp — every stored message then sorts after it — but only
+    # when one is actually needed: with no cursor and a target
+    # received since joining, the message is already unread, and
+    # writing a cursor would switch counting to creation time and
+    # hide a late gossip post created before it.  The sentinel stays
+    # for a previously-read message (a cursor exists and sits at or
+    # after the target) or a pre-join cached one.
+    move_to: Optional[Tuple[str, float]] = None
+    if previous is None:
+        if cursor is None and (
+            received is not None and received["received_at"] > row["joined_at"]
+        ):
+            # Already unread with no cursor: nothing moves.
+            move_to = None
+        elif cursor is not None and (
+            cursor["last_read_at"] < visible["created_at"]
+            or (
+                cursor["last_read_at"] == visible["created_at"]
+                and cursor["last_read_hash"] < visible["hash"]
+            )
+        ):
+            # Cursor already sits before the target: it is unread.
+            move_to = None
+        else:
+            move_to = ("", visible["created_at"])
+    elif cursor is None:
+        if received is None or received["received_at"] <= row["joined_at"]:
+            move_to = (previous["hash"], previous["created_at"])
+    elif (
+        cursor["last_read_at"] < previous["created_at"]
+        or (
+            cursor["last_read_at"] == previous["created_at"]
+            and cursor["last_read_hash"] <= previous["hash"]
+        )
+    ):
+        # Already at or before the predecessor: the target is unread.
+        move_to = None
+    else:
+        move_to = (previous["hash"], previous["created_at"])
+    if move_to is not None:
+        with conn:
+            conn.execute(
+                "INSERT INTO read_cursors(channel, last_read_hash, last_read_at) "
+                "VALUES(?, ?, ?) "
+                "ON CONFLICT(channel) DO UPDATE SET "
+                "last_read_hash = excluded.last_read_hash, "
+                "last_read_at = excluded.last_read_at",
+                (name, move_to[0], move_to[1]),
+            )
+        new_hash, new_at = move_to
+    elif cursor is not None:
+        new_hash, new_at = cursor["last_read_hash"], cursor["last_read_at"]
+    else:
+        # No cursor and the target counts already: nothing moves.
+        new_hash, new_at = None, None
+    unread = channel_unread_counts(conn, exclude_authors=exclude_authors).get(
+        name, 0
+    )
+    return {
+        "channel": name,
+        "hash": new_hash,
+        "created_at": new_at,
+        "unread": unread,
+    }
+
+
 def channel_unread_counts(
     conn: sqlite3.Connection,
     *,
@@ -3097,6 +3215,21 @@ class ChannelApp:
         finally:
             conn.close()
 
+    def mark_unread(self, channel: str, message_hash: str) -> Dict[str, Any]:
+        """Move *channel*'s read cursor back to just before one message.
+
+        The reminder firing pass re-opens a snoozed message this way.
+        Raises :class:`ChannelError` when the node is not a member of
+        the channel or the message is no longer visible.
+        """
+        conn = self.connect()
+        try:
+            return mark_channel_unread(
+                conn, channel, message_hash, exclude_authors=self._unread_excluded()
+            )
+        finally:
+            conn.close()
+
     def unread_counts(self) -> Dict[str, int]:
         """Unread message counts per joined channel.
 
@@ -3166,6 +3299,20 @@ class ChannelApp:
         conn = self.connect()
         try:
             return get_message(conn, message_hash)
+        finally:
+            conn.close()
+
+    def get_visible_message(self, message_hash: str) -> Optional[Dict[str, Any]]:
+        """Return a stored message as channel history shows it, or ``None``.
+
+        An expired or retracted message is gone; a live one carries
+        its latest author-matching edit.  The reminder paths use this
+        so they never snooze or fire on a message history no longer
+        shows.
+        """
+        conn = self.connect()
+        try:
+            return get_visible_message(conn, message_hash)
         finally:
             conn.close()
 

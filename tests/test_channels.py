@@ -34,6 +34,7 @@ from tau.channels import (
     list_memberships,
     list_pins,
     mark_channel_read,
+    mark_channel_unread,
     pin_message,
     reactions_for_messages,
     search_channel_messages,
@@ -2091,6 +2092,98 @@ def test_late_message_before_cursor_does_not_relight(identities, tmp_path):
     # A gossip straggler created before the cursor but received after it.
     store_message(conn, _store_from(identities, source, bob, "general", "late", 1001), now=5000)
     assert channel_unread_counts(conn) == {}
+
+
+def test_mark_unread_moves_cursor_back_to_before_the_message(identities, tmp_path):
+    _, bob = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    source = init_db(tmp_path / "source.sqlite3")
+    _join_at(conn, "general", 1000)
+    one = _store_from(identities, source, bob, "general", "one", 1001)
+    two = _store_from(identities, source, bob, "general", "two", 1002)
+    store_message(conn, one, now=1001)
+    store_message(conn, two, now=1002)
+    mark_channel_read(conn, "general")
+    assert channel_unread_counts(conn) == {}
+
+    marked = mark_channel_unread(conn, "general", two["hash"])
+    assert marked["hash"] == one["hash"]
+    assert marked["created_at"] == 1001
+    assert marked["unread"] == 1
+    assert channel_unread_counts(conn) == {"general": 1}
+
+    # Re-opening at the oldest message sets a sentinel cursor just
+    # before it: the whole channel reads unread again, and the
+    # pre-join rule is kept — deleting the cursor would drop it, so a
+    # reminder fired on a pre-join cached message would not relight.
+    marked = mark_channel_unread(conn, "general", one["hash"])
+    assert marked["hash"] == ""
+    assert marked["created_at"] == 1001
+    assert marked["unread"] == 2
+    assert channel_unread_counts(conn) == {"general": 2}
+
+
+def test_mark_unread_oldest_without_cursor_leaves_late_posts_unread(
+    identities, tmp_path
+):
+    _, bob = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    source = init_db(tmp_path / "source.sqlite3")
+    _join_at(conn, "general", 1000)
+    one = _store_from(identities, source, bob, "general", "one", 1001)
+    two = _store_from(identities, source, bob, "general", "two", 1002)
+    store_message(conn, one, now=1001)
+    store_message(conn, two, now=1002)
+    # No mark_channel_read: there is no cursor yet, so both messages
+    # are already unread — and nothing may write one, or a late gossip
+    # post created before them would stop counting.
+    marked = mark_channel_unread(conn, "general", one["hash"])
+    assert marked["hash"] is None
+    assert marked["created_at"] is None
+    assert marked["unread"] == 2
+    assert channel_unread_counts(conn) == {"general": 2}
+
+    # A gossip straggler created before the oldest message but
+    # received after joining still counts.
+    store_message(
+        conn,
+        _store_from(identities, source, bob, "general", "late", 1000),
+        now=5000,
+    )
+    assert channel_unread_counts(conn) == {"general": 3}
+
+
+def test_mark_unread_never_moves_the_cursor_forward(identities, tmp_path):
+    _, bob = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    source = init_db(tmp_path / "source.sqlite3")
+    _join_at(conn, "general", 1000)
+    one = _store_from(identities, source, bob, "general", "one", 1001)
+    two = _store_from(identities, source, bob, "general", "two", 1002)
+    store_message(conn, one, now=1001)
+    store_message(conn, two, now=1002)
+    mark_channel_read(conn, "general")
+    mark_channel_unread(conn, "general", two["hash"])
+    assert channel_unread_counts(conn) == {"general": 1}
+
+    # The cursor already sits before the newest message: asking again
+    # leaves it alone instead of moving it forward past the message.
+    marked = mark_channel_unread(conn, "general", two["hash"])
+    assert marked["hash"] == one["hash"]
+    assert marked["unread"] == 1
+    assert channel_unread_counts(conn) == {"general": 1}
+
+
+def test_mark_unread_requires_membership_and_a_visible_message(identities, tmp_path):
+    _, bob = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    source = init_db(tmp_path / "source.sqlite3")
+    message = _store_from(identities, source, bob, "general", "one", 1001)
+    with pytest.raises(ChannelError, match="not a member"):
+        mark_channel_unread(conn, "general", message["hash"])
+    _join_at(conn, "general", 1000)
+    with pytest.raises(ChannelError, match="unknown message"):
+        mark_channel_unread(conn, "general", message["hash"])
 
 
 def test_leave_drops_cursor_so_rejoin_starts_fresh(identities, tmp_path):

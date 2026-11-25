@@ -10890,6 +10890,8 @@ class WebBridge:
             if group_names is None:
                 group_names = self._group_names()
             name = group_names.get(target)
+        elif reminder["kind"] == "channel":
+            name = f"#{target}"
         else:
             peer = self.node.registry.get(target)
             name = peer.display_name if peer is not None else None
@@ -10913,19 +10915,31 @@ class WebBridge:
         Mirrors the CLI: a DM reminder's target is the sender, while a
         group reminder names the group, so the sender is read from the
         stored message — and when that message is gone its sender is
-        unknown, so the reminder stays hidden.
+        unknown, so the reminder stays hidden.  A channel reminder
+        names the channel, so the sender is the stored channel
+        message's author; without a channel store the sender is
+        unknown too.
         """
-        if reminder["kind"] != "group":
-            return reminder["target"] in blocked
-        inbox = getattr(self.node, "inbox", None)
-        if inbox is None:
-            return True
-        entry = inbox.find(
-            str(reminder["message_id"]), group=str(reminder["target"])
-        )
-        if entry is None:
-            return True
-        return entry.get("destination") in blocked
+        if reminder["kind"] == "group":
+            inbox = getattr(self.node, "inbox", None)
+            if inbox is None:
+                return True
+            entry = inbox.find(
+                str(reminder["message_id"]), group=str(reminder["target"])
+            )
+            if entry is None:
+                return True
+            return entry.get("destination") in blocked
+        if reminder["kind"] == "channel":
+            try:
+                app = self._local_channel_app()
+            except WebBridgeError:
+                return True
+            entry = app.get_visible_message(str(reminder["message_id"]))
+            if entry is None or entry.get("channel") != reminder["target"]:
+                return True
+            return entry.get("author") in blocked
+        return reminder["target"] in blocked
 
     def list_reminders(self) -> Dict[str, Any]:
         """Pending message reminders, soonest first, with display names.
@@ -10965,26 +10979,38 @@ class WebBridge:
     def _reminder_source_live(
         self, reminder: Dict[str, Any], inbox: Any, now: float
     ) -> bool:
-        """Whether the message a reminder came from is still in the inbox.
+        """Whether the message a reminder came from is still stored.
 
         A disappearing message that expired or was removed takes its
         reminder with it, so its text is not shown.  The lookup holds
         the inbox's cross-process transaction, so a message deleted by
         another process is seen as gone instead of lingering in the
-        serving node's cached copy.  With no inbox the source cannot
-        be confirmed, so the reminder stays hidden.
+        serving node's cached copy.  A channel reminder is looked up
+        in the channel store instead, as history shows it, so an
+        expired or retracted channel message hides its reminder the
+        same way.  With no inbox the source cannot be confirmed, so
+        the reminder stays hidden.
         """
         if inbox is None:
             return False
         message_id = str(reminder["message_id"])
         target = str(reminder["target"])
-        with _inbox_transaction(inbox):
-            if reminder["kind"] == "group":
-                entry = inbox.find(message_id, group=target)
-            else:
-                entry = inbox.find(message_id, peer=target)
-        if entry is None:
-            return False
+        if reminder["kind"] == "channel":
+            try:
+                app = self._local_channel_app()
+            except WebBridgeError:
+                return False
+            entry = app.get_visible_message(message_id)
+            if entry is None or entry.get("channel") != target:
+                return False
+        else:
+            with _inbox_transaction(inbox):
+                if reminder["kind"] == "group":
+                    entry = inbox.find(message_id, group=target)
+                else:
+                    entry = inbox.find(message_id, peer=target)
+            if entry is None:
+                return False
         expires_at = entry.get("expires_at")
         if expires_at is None:
             return True

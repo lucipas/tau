@@ -4,15 +4,17 @@ and the mail-loop firing pass."""
 from __future__ import annotations
 
 import json
+import time
 
 import pytest
 import RNS
 
 from tau import cli
 from tau.blocklist import BlockList, save_blocklist
+from tau.channels import ChannelApp, create_message
 from tau.config import TauConfig
 from tau.groups import GroupStore
-from tau.identity import destination_hash
+from tau.identity import destination_hash, load_identity, save_identity
 from tau.inbox import Inbox
 from tau.peers import PeerRegistry
 from tau.reminders import (
@@ -50,6 +52,39 @@ def _seed_group(tmp_path, name="crew"):
     store = GroupStore(config.groups_path)
     group = store.create(name, [ALICE_HASH, BOB_HASH], created_by=ALICE_HASH)
     return data_dir, str(group["id"])
+
+
+def _seed_channel_history(tmp_path, *, texts=("first", "second"), own=False):
+    """A data dir with stored channel messages in #general.
+
+    Returns (data_dir, [message hashes], author hash).  The owner
+    identity is saved to the data dir so the CLI can build its
+    channel app; the messages are authored by a second identity (or
+    the owner, with ``own=True``) and posted after joining, so they
+    count toward the channel's unread badge.
+    """
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="owner")
+    owner = RNS.Identity()
+    save_identity(owner, config.identity_path)
+    author = owner if own else RNS.Identity()
+    app = ChannelApp(config, owner, name="owner", gossip=False)
+    app.join("general")
+    hashes = []
+    conn = app.connect()
+    try:
+        # Distinct seconds, in order: the history order is
+        # (created_at, hash), and the tests rely on the first message
+        # preceding the second.
+        base = time.time()
+        for index, text in enumerate(texts):
+            message = create_message(
+                conn, author, "general", text, name="bob", now=base + index
+            )
+            hashes.append(message["hash"])
+    finally:
+        conn.close()
+    return data_dir, hashes, destination_hash(author).hex()
 
 
 def _remind_main(data_dir, *argv):
@@ -122,7 +157,7 @@ def test_store_add_validates(tmp_path):
     with pytest.raises(ReminderError):
         store.add(
             message_id="msg-1",
-            kind="channel",
+            kind="carrier-pigeon",
             target=ALICE_HASH,
             text="nope",
             sender="alice",
@@ -194,6 +229,36 @@ def test_store_cap(tmp_path):
             due_at=3000.0,
             now=1000.0,
         )
+
+
+def test_store_channel_kind(tmp_path):
+    store = ReminderStore(tmp_path / "reminders.json")
+    reminder = store.add(
+        message_id="ab" * 32,
+        kind="channel",
+        target="  general ",
+        text="agenda?",
+        sender="bob",
+        due_at=1500.0,
+        now=1000.0,
+    )
+    assert reminder["kind"] == "channel"
+    assert reminder["target"] == "general"
+    # A channel target is validated like every other channel name.
+    with pytest.raises(ReminderError, match="destination hash or a channel name"):
+        store.add(
+            message_id="ab" * 32,
+            kind="channel",
+            target="has space",
+            text="agenda?",
+            sender="bob",
+            due_at=1500.0,
+            now=1000.0,
+        )
+    # Reloading keeps the channel reminder.
+    assert ReminderStore(tmp_path / "reminders.json").list_reminders()[0][
+        "kind"
+    ] == "channel"
 
 
 def test_store_cancel_by_prefix_and_ambiguity(tmp_path):
@@ -339,6 +404,120 @@ def test_cli_add_group_message(tmp_path, capsys):
     )
     assert _remind_main(data_dir, "add", "grp-1", "--in", "30m") == 0
     assert "reminder set for crew in 30m" in capsys.readouterr().out
+
+
+def test_cli_add_channel_message(tmp_path, capsys):
+    data_dir, hashes, _author = _seed_channel_history(
+        tmp_path, texts=("agenda for friday?",)
+    )
+    assert (
+        _remind_main(
+            data_dir, "add", "--channel", "general", hashes[0], "--in", "1h"
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "reminder set for #general in 1h" in out
+    assert "agenda for friday?" in out
+    assert _remind_main(data_dir, "list") == 0
+    out = capsys.readouterr().out
+    assert "#general" in out and "agenda for friday?" in out
+    assert "from bob" in out and "in 1h" in out
+    reminder_id = out.split("[")[1].split("]")[0]
+    assert _remind_main(data_dir, "cancel", reminder_id) == 0
+    assert "cancelled reminder for #general" in capsys.readouterr().out
+    assert _remind_main(data_dir, "list") == 0
+    assert "No reminders yet" in capsys.readouterr().out
+
+
+def test_cli_add_channel_message_by_prefix(tmp_path, capsys):
+    data_dir, hashes, _author = _seed_channel_history(
+        tmp_path, texts=("agenda?",)
+    )
+    assert (
+        _remind_main(
+            data_dir, "add", "--channel", "general", hashes[0][:8], "--in", "30m"
+        )
+        == 0
+    )
+    assert "reminder set for #general in 30m" in capsys.readouterr().out
+
+
+def test_cli_add_channel_rejects_unknown_message(tmp_path, capsys):
+    data_dir, _hashes, _author = _seed_channel_history(
+        tmp_path, texts=("agenda?",)
+    )
+    assert (
+        _remind_main(
+            data_dir, "add", "--channel", "general", "ff" * 32, "--in", "1h"
+        )
+        == cli._EXIT_ERROR
+    )
+    assert "unknown message" in capsys.readouterr().err
+
+
+def test_cli_add_channel_refuses_unjoined_channel(tmp_path, capsys):
+    # Leaving keeps the cached history, so without a membership check
+    # the add would succeed and the reminder would be dropped on fire.
+    data_dir, hashes, _author = _seed_channel_history(
+        tmp_path, texts=("agenda?",)
+    )
+    config = TauConfig.resolve(data_dir=data_dir, name="owner")
+    owner = load_identity(config.identity_path)
+    app = ChannelApp(config, owner, name="owner", gossip=False)
+    assert app.leave("general")
+    assert (
+        _remind_main(
+            data_dir, "add", "--channel", "general", hashes[0], "--in", "1h"
+        )
+        == cli._EXIT_ERROR
+    )
+    assert "not a member of #general" in capsys.readouterr().err
+
+
+def test_cli_add_channel_refuses_own_message(tmp_path, capsys):
+    data_dir, hashes, _author = _seed_channel_history(
+        tmp_path, texts=("my note",), own=True
+    )
+    assert (
+        _remind_main(
+            data_dir, "add", "--channel", "general", hashes[0], "--in", "1h"
+        )
+        == cli._EXIT_ERROR
+    )
+    assert "cannot remind on a message you sent" in capsys.readouterr().err
+
+
+def test_cli_add_channel_refuses_blocked_author(tmp_path, capsys):
+    data_dir, hashes, author_hash = _seed_channel_history(
+        tmp_path, texts=("agenda?",)
+    )
+    config = TauConfig.resolve(data_dir=data_dir, name="owner")
+    save_blocklist(config.blocklist_path, BlockList(blocked=frozenset({author_hash})))
+    assert (
+        _remind_main(
+            data_dir, "add", "--channel", "general", hashes[0], "--in", "1h"
+        )
+        == cli._EXIT_ERROR
+    )
+    assert "blocked peer" in capsys.readouterr().err
+
+
+def test_list_hides_channel_reminder_for_blocked_sender(tmp_path, capsys):
+    data_dir, hashes, author_hash = _seed_channel_history(
+        tmp_path, texts=("agenda?",)
+    )
+    assert (
+        _remind_main(
+            data_dir, "add", "--channel", "general", hashes[0], "--in", "1h"
+        )
+        == 0
+    )
+    capsys.readouterr()
+    config = TauConfig.resolve(data_dir=data_dir, name="owner")
+    save_blocklist(config.blocklist_path, BlockList(blocked=frozenset({author_hash})))
+    assert _remind_main(data_dir, "list") == 0
+    assert "No reminders yet" in capsys.readouterr().out
 
 
 def test_cli_add_rejects_unknown_message_and_bad_time(tmp_path, capsys):
@@ -678,4 +857,150 @@ def test_fire_group_reminder(tmp_path):
     result = fire_due_reminders(config.reminders_path, inbox, now=2000.0)
     assert len(result["fired"]) == 1
     assert inbox.unread_counts()["total"] == 1
+    assert len(ReminderStore(config.reminders_path)) == 0
+
+
+def _channel_app_for(data_dir):
+    """The channel app over a seeded data dir, for the firing tests."""
+    config = TauConfig.resolve(data_dir=data_dir, name="owner")
+    owner = load_identity(config.identity_path)
+    assert owner is not None
+    return config, ChannelApp(config, owner, name="owner", gossip=False)
+
+
+def test_fire_channel_reminder(tmp_path, caplog):
+    data_dir, hashes, _author = _seed_channel_history(tmp_path)
+    config, app = _channel_app_for(data_dir)
+    store = ReminderStore(config.reminders_path)
+    store.add(
+        message_id=hashes[1],
+        kind="channel",
+        target="general",
+        text="second",
+        sender="bob",
+        due_at=1500.0,
+        now=1000.0,
+    )
+    inbox = Inbox(config.inbox_path)
+    # The channel starts read; firing must light it again at the
+    # reminded message.
+    app.mark_read("general")
+    assert app.unread_counts() == {}
+    with caplog.at_level("INFO", logger="tau.reminders"):
+        result = fire_due_reminders(
+            config.reminders_path, inbox, now=2000.0, channels=app
+        )
+    assert len(result["fired"]) == 1
+    assert result["fired"][0]["text"] == "second"
+    assert result["dropped"] == []
+    assert app.unread_counts() == {"general": 1}
+    assert "Reminder from bob:" in caplog.text
+    assert "second" in caplog.text
+    assert len(ReminderStore(config.reminders_path)) == 0
+
+
+def test_fire_channel_reminder_stays_due_without_channels(tmp_path):
+    # The node is not serving channels, so there is no channel store
+    # to verify or re-open the message with: the reminder stays due
+    # for a later pass instead of being dropped.
+    data_dir, hashes, _author = _seed_channel_history(
+        tmp_path, texts=("only",)
+    )
+    config = TauConfig.resolve(data_dir=data_dir, name="owner")
+    store = ReminderStore(config.reminders_path)
+    store.add(
+        message_id=hashes[0],
+        kind="channel",
+        target="general",
+        text="only",
+        sender="bob",
+        due_at=1500.0,
+        now=1000.0,
+    )
+    inbox = Inbox(config.inbox_path)
+    result = fire_due_reminders(config.reminders_path, inbox, now=2000.0)
+    assert result["fired"] == []
+    assert result["dropped"] == []
+    assert len(ReminderStore(config.reminders_path)) == 1
+
+
+def test_fire_channel_reminder_drops_when_left(tmp_path):
+    data_dir, hashes, _author = _seed_channel_history(
+        tmp_path, texts=("only",)
+    )
+    config, app = _channel_app_for(data_dir)
+    store = ReminderStore(config.reminders_path)
+    store.add(
+        message_id=hashes[0],
+        kind="channel",
+        target="general",
+        text="only",
+        sender="bob",
+        due_at=1500.0,
+        now=1000.0,
+    )
+    # Leaving keeps the cached message but drops the badge to light.
+    app.leave("general")
+    inbox = Inbox(config.inbox_path)
+    result = fire_due_reminders(
+        config.reminders_path, inbox, now=2000.0, channels=app
+    )
+    assert result["fired"] == []
+    assert len(result["dropped"]) == 1
+    assert len(ReminderStore(config.reminders_path)) == 0
+
+
+def test_fire_channel_reminder_drops_blocked_sender(tmp_path):
+    data_dir, hashes, author_hash = _seed_channel_history(
+        tmp_path, texts=("only",)
+    )
+    config, app = _channel_app_for(data_dir)
+    store = ReminderStore(config.reminders_path)
+    store.add(
+        message_id=hashes[0],
+        kind="channel",
+        target="general",
+        text="only",
+        sender="bob",
+        due_at=1500.0,
+        now=1000.0,
+    )
+    save_blocklist(
+        config.blocklist_path, BlockList(blocked=frozenset({author_hash}))
+    )
+    inbox = Inbox(config.inbox_path)
+    result = fire_due_reminders(
+        config.reminders_path,
+        inbox,
+        now=2000.0,
+        blocklist_path=config.blocklist_path,
+        channels=app,
+    )
+    assert result["fired"] == []
+    assert len(result["dropped"]) == 1
+    assert len(ReminderStore(config.reminders_path)) == 0
+
+
+def test_fire_channel_reminder_drops_deleted_message(tmp_path):
+    data_dir, hashes, _author = _seed_channel_history(
+        tmp_path, texts=("only",)
+    )
+    config, app = _channel_app_for(data_dir)
+    store = ReminderStore(config.reminders_path)
+    store.add(
+        message_id=hashes[0],
+        kind="channel",
+        target="general",
+        text="only",
+        sender="bob",
+        due_at=1500.0,
+        now=1000.0,
+    )
+    app.delete_message(hashes[0])
+    inbox = Inbox(config.inbox_path)
+    result = fire_due_reminders(
+        config.reminders_path, inbox, now=2000.0, channels=app
+    )
+    assert result["fired"] == []
+    assert len(result["dropped"]) == 1
     assert len(ReminderStore(config.reminders_path)) == 0

@@ -5580,6 +5580,7 @@ class TauNode:
                 self.config.reminders_path,
                 self.inbox,
                 blocklist_path=self.config.blocklist_path,
+                channels=getattr(self, "channel_app", None),
             )
         except Exception:  # pragma: no cover - defensive; helper logs
             log.debug("Reminder firing failed", exc_info=True)
