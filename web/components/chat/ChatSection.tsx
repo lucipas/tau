@@ -226,9 +226,12 @@ export default function ChatSection() {
   // selection, and a failed fetch leaves the thread empty, not broken.
   const [ignoredHistory, setIgnoredHistory] = useState<ChatMessage[]>([]);
   const ignoredHistorySeq = useRef(0);
+  // Ignoring or un-ignoring the open group keeps its key, so the
+  // ignored flag must be a dependency too.
+  const selectedIgnoredGroup = selected?.kind === "group" && !!selected.ignored;
   useEffect(() => {
     const seq = ++ignoredHistorySeq.current;
-    if (!selected || selected.kind !== "group" || !selected.ignored) {
+    if (!selected || !selectedIgnoredGroup) {
       setIgnoredHistory([]);
       return;
     }
@@ -241,7 +244,7 @@ export default function ChatSection() {
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedKey]);
+  }, [selectedKey, selectedIgnoredGroup]);
 
   // The open thread sees the snapshot plus the ignored group's explicit
   // history; the snapshot's copy wins on overlap (a group un-ignored
