@@ -28,6 +28,13 @@ is the same one an immediate send would have made.  Queue files
 written before pins could be scheduled carry no ``location`` and
 load with no pin, exactly as before.
 
+A shared contact card queues the same way (``tau channel send
+--contact <peer> --delay 5m``): the queued entry carries the card
+and the publish pass attaches it when the message goes out, so the
+published message is the same one an immediate send would have
+made.  Queue files written before cards could be scheduled carry
+no ``contact`` and load with no card, exactly as before.
+
 Entries are validated on load the way the other small JSON stores
 are: a malformed file raises rather than silently dropping queued
 messages, and the mail-loop publisher treats a corrupt queue as
@@ -46,7 +53,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
-from .protocol import ProtocolError, clean_location, normalize_message
+from .protocol import ProtocolError, clean_contact, clean_location, normalize_message
 from .util import atomic_write_json, ensure_dir
 
 log = logging.getLogger(__name__)
@@ -218,6 +225,20 @@ def _clean_location(value: Any) -> Optional[Dict[str, Any]]:
     return cleaned
 
 
+def _clean_contact(value: Any) -> Optional[Dict[str, Any]]:
+    # None stays None (no card); a present value must clean to a
+    # card, or the entry is malformed.  A scheduled message must not
+    # silently drop a card the user asked for — the publish pass
+    # would then send a message that reads differently from the one
+    # that was scheduled.
+    if value is None:
+        return None
+    cleaned = clean_contact(value)
+    if cleaned is None:
+        raise ScheduledChannelError("scheduled channel message contact is invalid")
+    return cleaned
+
+
 @dataclass(frozen=True)
 class ScheduledChannelMessage:
     """One queued channel message, waiting for its publish time."""
@@ -256,6 +277,11 @@ class ScheduledChannelMessage:
     # an optional ``"name"``.  Defaults to None so queue files written
     # before pins could be scheduled load unchanged.
     location: Optional[Dict[str, Any]] = None
+    # A shared contact card on a top-level message, like an immediate
+    # ``tau channel send --contact``: ``{"name": ..,
+    # "destination_hash": <32 hex>}``.  Defaults to None so queue
+    # files written before cards could be scheduled load unchanged.
+    contact: Optional[Dict[str, Any]] = None
 
     def __post_init__(self) -> None:
         # A frozen dataclass still builds through __init__: validate
@@ -276,6 +302,7 @@ class ScheduledChannelMessage:
         object.__setattr__(self, "kind", _clean_kind(self.kind))
         object.__setattr__(self, "options", _clean_options(self.options))
         object.__setattr__(self, "location", _clean_location(self.location))
+        object.__setattr__(self, "contact", _clean_contact(self.contact))
         if self.kind == "poll":
             # A poll is a top-level entry: its options are fixed at
             # schedule time.
@@ -284,6 +311,10 @@ class ScheduledChannelMessage:
             if self.location is not None:
                 raise ScheduledChannelError(
                     "a scheduled poll cannot carry a location"
+                )
+            if self.contact is not None:
+                raise ScheduledChannelError(
+                    "a scheduled poll cannot carry a contact card"
                 )
         elif self.options:
             raise ScheduledChannelError(
@@ -307,6 +338,7 @@ class ScheduledChannelMessage:
             "kind": self.kind,
             "options": list(self.options),
             "location": self.location,
+            "contact": self.contact,
         }
 
     @classmethod
@@ -329,6 +361,7 @@ class ScheduledChannelMessage:
             kind=_clean_kind(data.get("kind", "message")),
             options=_clean_options(data.get("options")),
             location=_clean_location(data.get("location")),
+            contact=_clean_contact(data.get("contact")),
         )
 
 
@@ -481,6 +514,7 @@ def _preflight_envelope(
     created_at: float,
     name: Optional[str] = None,
     location: Optional[Dict[str, Any]] = None,
+    contact: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Measure *text* against the wire budget with the envelope the
     publish pass measures.
@@ -504,6 +538,9 @@ def _preflight_envelope(
     A location pin rides in the measured envelope too, at its real
     shape, so a message that only fits without its pin is refused
     here rather than failing every publish attempt.
+
+    A contact card rides in the measured envelope too, at its real
+    shape, for the same reason.
     """
     # Lazy import: this module stays importable without Reticulum,
     # which ``tau.backup`` relies on.
@@ -531,6 +568,8 @@ def _preflight_envelope(
     }
     if location is not None:
         envelope["location"] = location
+    if contact is not None:
+        envelope["contact"] = contact
     try:
         _check_wire_size(envelope)
     except ChannelError as exc:
@@ -550,6 +589,7 @@ def schedule_channel_message(
     kind: str = "message",
     options: Optional[Sequence[str]] = None,
     location: Optional[Dict[str, Any]] = None,
+    contact: Optional[Dict[str, Any]] = None,
     disappearing_path: Optional[Union[str, Path]] = None,
 ) -> ScheduledChannelMessage:
     """Queue a channel message for *publish_at*; returns the stored entry.
@@ -582,6 +622,11 @@ def schedule_channel_message(
     immediate ``tau channel send --location``: it is validated here,
     rides in the measured envelope, and the publish pass attaches it
     when the message goes out.  A poll cannot carry one.
+
+    A *contact* shares a peer's card on the queued message, like an
+    immediate ``tau channel send --contact``: it is validated here,
+    rides in the measured envelope, and the publish pass attaches it
+    when the message goes out.  A poll cannot carry one.
     """
     clean_channel = _clean_channel(channel)
     clean_text = _clean_text(text)
@@ -611,6 +656,9 @@ def schedule_channel_message(
     clean_location_value = _clean_location(location)
     if clean_kind == "poll" and clean_location_value is not None:
         raise ScheduledChannelError("a scheduled poll cannot carry a location")
+    clean_contact_value = _clean_contact(contact)
+    if clean_kind == "poll" and clean_contact_value is not None:
+        raise ScheduledChannelError("a scheduled poll cannot carry a contact card")
     envelope = {
         # Placeholder author/key at their real lengths (destination
         # hash 32 hex, RNS public key 128 hex): a shorter placeholder
@@ -637,6 +685,8 @@ def schedule_channel_message(
         envelope["poll_options"] = list(clean_options)
     if clean_location_value is not None:
         envelope["location"] = clean_location_value
+    if clean_contact_value is not None:
+        envelope["contact"] = clean_contact_value
     try:
         _check_wire_size(envelope)
     except ChannelError as exc:
@@ -652,6 +702,7 @@ def schedule_channel_message(
         kind=clean_kind,
         options=clean_options,
         location=clean_location_value,
+        contact=clean_contact_value,
     )
     with scheduled_channel_messages_lock(path):
         queue = load_scheduled_channel_messages(path)
@@ -773,7 +824,8 @@ def edit_scheduled_channel_message(
         # be published.  A time-only edit re-checks the stored text
         # against the full normalized shape too.  The entry's pin rides
         # in the measurement: a time-only edit must not bless a message
-        # that only fits without it.
+        # that only fits without it.  The entry's card rides in the
+        # measurement too, for the same reason.
         _preflight_envelope(
             channel=message.channel,
             text=clean_text if clean_text is not None else message.text,
@@ -784,6 +836,7 @@ def edit_scheduled_channel_message(
             ),
             name=name,
             location=message.location,
+            contact=message.contact,
         )
         edited = replace(
             message,
@@ -925,6 +978,7 @@ def publish_due_scheduled_channel_messages(
                                 else None
                             ),
                             location=message.location,
+                            contact=message.contact,
                         )
                         # Persist the signed message's identity before
                         # sending, so a retry after a crash re-sends it

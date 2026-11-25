@@ -940,6 +940,8 @@ export interface ScheduledChannelMessage {
   options?: string[];
   /** Static location pin on a queued message, if any. */
   location?: LocationPin;
+  /** Shared contact card on a queued message, if any. */
+  contact?: { name: string; destination_hash: string };
   [key: string]: unknown;
 }
 

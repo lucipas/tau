@@ -37,6 +37,7 @@ beforeEach(() => {
             next_attempt_at: 0,
             paused_at: 0,
             location: { lat: 34.05, lon: -83.88, name: "Rock Springs Park" },
+            contact: { name: "carol", destination_hash: "c".repeat(32) },
           },
           {
             id: "cd34ef56ab78ab12",
@@ -429,6 +430,9 @@ describe("ChannelsSection", () => {
     // The queued pin renders like a published one — one link in the
     // scheduled row, plus the one already in history.
     expect(screen.getAllByText("📍 Rock Springs Park").length).toBe(2);
+    // The queued card renders like a published one — only the
+    // scheduled row carries one in this fixture.
+    expect(await screen.findByText("👤 carol")).toBeTruthy();
     // One Cancel per scheduled entry (message + poll).
     const cancelButtons = screen.getAllByRole("button", { name: "Cancel" });
     expect(cancelButtons.length).toBe(2);

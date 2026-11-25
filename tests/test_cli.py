@@ -820,7 +820,7 @@ def test_channel_send_contact_reaches_store(tmp_path, capsys, monkeypatch):
         "destination_hash": "cc" * 16,
     }
 
-    # A card cannot ride on a reply or a scheduled message.
+    # A card cannot ride on a reply.
     code = _run_channel(
         tmp_path,
         "send",
@@ -834,18 +834,6 @@ def test_channel_send_contact_reaches_store(tmp_path, capsys, monkeypatch):
     )
     assert code == 2
     assert "top-level" in capsys.readouterr().err
-    code = _run_channel(
-        tmp_path,
-        "send",
-        "general",
-        "later",
-        "--contact",
-        "carol",
-        "--delay",
-        "5m",
-    )
-    assert code == 2
-    assert "--delay" in capsys.readouterr().err
 
     # An unknown peer fails before anything is stored.
     code = _run_channel(
@@ -15611,6 +15599,35 @@ def test_channel_send_delay_with_location_schedules_and_lists(tmp_path, capsys):
         "  https://www.openstreetmap.org/?mlat=34.05&mlon=-83.88"
         "#map=15/34.05/-83.88" in out.splitlines()
     )
+
+
+def test_channel_send_delay_with_contact_schedules_and_lists(tmp_path, capsys):
+    _init_node(tmp_path, "node", "alice")
+    assert _run_channel(tmp_path, "join", "general") == 0
+    capsys.readouterr()
+    _seed_contact_peer(tmp_path / "node")
+
+    code = _run_channel(
+        tmp_path,
+        "send",
+        "general",
+        "meet carol",
+        "--contact",
+        "carol",
+        "--delay",
+        "5m",
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "scheduled" in out
+    assert "publishes in 5m" in out
+
+    code = _run_channel(tmp_path, "scheduled")
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "#general" in out
+    assert "meet carol" in out
+    assert "Shared contact: carol" in out
 
 
 def test_channel_send_delay_rejects_bad_combinations(tmp_path, capsys):

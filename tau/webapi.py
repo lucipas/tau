@@ -5197,6 +5197,7 @@ class WebBridge:
         self, channel: str, text: str, *, send_in: float,
         poll_options: Optional[List[str]] = None,
         location: Optional[Dict[str, Any]] = None,
+        contact: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Queue a channel message for later, like ``tau channel send --delay``.
 
@@ -5209,7 +5210,9 @@ class WebBridge:
         With *poll_options* the entry is a poll instead: the text is
         its question and the options ride alongside it.  A *location*
         pins a place on the queued message, like an immediate send;
-        a poll cannot carry one.
+        a poll cannot carry one.  A *contact* shares a peer's card on
+        the queued message, like an immediate send; a poll cannot
+        carry one either.
         """
         from .channels import clean_channel_name, is_member
         from .scheduled_channel import schedule_channel_message, schedule_channel_poll
@@ -5226,6 +5229,8 @@ class WebBridge:
         if poll_options is not None:
             if location is not None:
                 raise ValueError("a scheduled poll cannot carry a location")
+            if contact is not None:
+                raise ValueError("a scheduled poll cannot carry a contact card")
             entry = schedule_channel_poll(
                 config.scheduled_channel_messages_path,
                 channel=name,
@@ -5243,6 +5248,7 @@ class WebBridge:
             publish_at=time.time() + float(send_in),
             name=getattr(self.node, "name", None),
             location=location,
+            contact=contact,
             disappearing_path=config.disappearing_path,
         )
         return entry.to_dict()
@@ -17761,6 +17767,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                         channel, text, send_in=float(send_in),
                         poll_options=poll_options,
                         location=body.get("location"),
+                        contact=body.get("contact"),
                     )
                 except (ValueError, ProtocolError) as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
