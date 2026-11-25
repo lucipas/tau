@@ -360,6 +360,21 @@ class ReminderStore:
                 raise
         return dict(removed)
 
+    def reinstate(self, reminder: Dict[str, Any]) -> None:
+        """Put back a reminder that :meth:`cancel` claimed but could not fire.
+
+        Used when the side effect of firing fails after the claim, so
+        the reminder stays due and is retried on a later pass.
+        """
+        with self._transaction():
+            snapshot = self._snapshot()
+            self._reminders[reminder["id"]] = dict(reminder)
+            try:
+                self._save()
+            except OSError:
+                self._restore(snapshot)
+                raise
+
     def list_reminders(self) -> List[Dict[str, Any]]:
         """All reminders, soonest first.
 
@@ -483,6 +498,7 @@ def fire_due_reminders(
     fired: List[Dict[str, Any]] = []
     dropped: List[Dict[str, Any]] = []
     for reminder in store.due(moment):
+        claimed = False
         try:
             blocked: Any = frozenset()
             if blocklist_path is not None:
@@ -504,6 +520,15 @@ def fire_due_reminders(
                     outcome = "dropped"
                 else:
                     if reminder["kind"] == "channel":
+                        # Claim before moving the read cursor: a cancel
+                        # that lands first wins, and a claimed reminder
+                        # cannot be cancelled out from under the move.
+                        try:
+                            store.cancel(reminder["id"])
+                        except ReminderError:
+                            # Cancelled or claimed by another pass.
+                            continue
+                        claimed = True
                         try:
                             counts = channels.mark_unread(
                                 reminder["target"], reminder["message_id"]
@@ -525,19 +550,29 @@ def fire_due_reminders(
                         outcome = "fire" if counts is not None else "dropped"
         except Exception:  # pragma: no cover - defensive; keep firing
             log.warning("Reminder %s failed to fire", reminder["id"], exc_info=True)
+            if claimed:
+                try:
+                    store.reinstate(reminder)
+                except Exception:
+                    log.warning(
+                        "Reminder %s could not be restored after a failed fire",
+                        reminder["id"],
+                        exc_info=True,
+                    )
             continue
-        try:
-            store.cancel(reminder["id"])
-        except ReminderError:
-            # Already cancelled or claimed by another pass: not ours to show.
-            continue
-        except Exception:
-            log.warning(
-                "Reminder %s could not be consumed; it will be retried",
-                reminder["id"],
-                exc_info=True,
-            )
-            continue
+        if not claimed:
+            try:
+                store.cancel(reminder["id"])
+            except ReminderError:
+                # Already cancelled or claimed by another pass: not ours to show.
+                continue
+            except Exception:
+                log.warning(
+                    "Reminder %s could not be consumed; it will be retried",
+                    reminder["id"],
+                    exc_info=True,
+                )
+                continue
         if outcome == "dropped":
             dropped.append(reminder)
             continue
