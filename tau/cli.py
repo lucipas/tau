@@ -18878,6 +18878,13 @@ def cmd_messages_import(args: argparse.Namespace) -> int:
             is_group_retracted=mailbox.is_group_retracted,
             pending_group_edit=mailbox.pending_group_edit,
         )
+    # A group export carries verifiable rename-lineage evidence
+    # (see #801): restore the predecessor link on the destination
+    # so the imported older messages join the group's history
+    # instead of sitting under an id no scoped read resolves.
+    lineage_recorded = _restore_imported_group_lineage(document, config)
+    if lineage_recorded:
+        result["group_lineage_recorded"] = lineage_recorded
     if _json_mode(args):
         _emit(result, True)
     else:
@@ -18886,6 +18893,8 @@ def cmd_messages_import(args: argparse.Namespace) -> int:
             f"({result['present']} already present, "
             f"{result['skipped']} skipped)"
         )
+        if lineage_recorded:
+            print(f"Recorded {lineage_recorded} group lineage entries")
         for error in result["errors"]:
             ref = error["id"] if error["id"] else "?"
             print(f"  skipped {ref}: {error['error']}")
@@ -20773,6 +20782,16 @@ def cmd_group_export(args: argparse.Namespace) -> int:
     document = inbox.export_document(group=store.lineage(group["id"]))
     document["group"] = group["name"]
     document["group_id"] = group["id"]
+    lineage = _group_lineage_evidence(store, group)
+    if lineage:
+        # Verifiable rename evidence, so a destination that knows
+        # the current group but never saw the rename can restore
+        # the predecessor link on import (see #801): per
+        # predecessor, the (name, roster) its id re-derives from,
+        # or the roster attestation for a secret group.  Nothing
+        # here is trusted on import until the derivation (or
+        # attestation) re-checks it.
+        document["group_lineage"] = lineage
     count = len(document["messages"])
     text = json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True)
     if getattr(args, "output", None):
@@ -20781,6 +20800,65 @@ def cmd_group_export(args: argparse.Namespace) -> int:
     else:
         print(text)
     return _EXIT_OK
+
+
+def _group_lineage_evidence(
+    store: "GroupStore", group: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    """Verifiable rename-lineage evidence for a group export.
+
+    One entry per rename predecessor in the group's verified
+    lineage: the predecessor's id plus the (name, roster) the
+    importer needs to re-derive it from the known creator — or,
+    for a secret group, the creator-signed roster attestation
+    that binds them.  A predecessor whose record is gone (its
+    retired copy evicted) carries no name or roster to attest
+    with and is left out: the destination keeps today's
+    behaviour for it.
+    """
+    evidence: List[Dict[str, Any]] = []
+    creator = group.get("creator") or ""
+    for pred_id in store.lineage(group["id"])[1:]:
+        record = store.get(pred_id) or store.get_retired(pred_id)
+        if record is None or (record.get("creator") or "") != creator:
+            continue
+        entry: Dict[str, Any] = {
+            "id": pred_id,
+            "name": record["name"],
+            "members": list(record["members"]),
+        }
+        if record.get("roster_attestation"):
+            entry["roster_attestation"] = record["roster_attestation"]
+        evidence.append(entry)
+    return evidence
+
+
+def _restore_imported_group_lineage(document: Any, config: Any) -> int:
+    """Record rename-lineage evidence carried by a group export.
+
+    Returns the number of predecessor entries recorded, or 0 when
+    the document carries none or its group is unknown here.  Only
+    evidence that re-derives from the known group's creator (or
+    verifies as a roster attestation) is recorded — see
+    :meth:`tau.groups.GroupStore.record_imported_lineage`.  A
+    failed group-store write warns instead of failing the import:
+    the messages are already in, and a re-import retries the
+    lineage.
+    """
+    if not isinstance(document, dict):
+        return 0
+    entries = document.get("group_lineage")
+    group_id = document.get("group_id")
+    if not isinstance(entries, list) or not entries:
+        return 0
+    if not isinstance(group_id, str):
+        return 0
+    store = GroupStore(config.groups_path)
+    try:
+        return store.record_imported_lineage(group_id, entries)
+    except OSError as exc:
+        print(f"warning: could not record group lineage: {exc}", file=sys.stderr)
+        return 0
 
 
 def cmd_group_show(args: argparse.Namespace) -> int:

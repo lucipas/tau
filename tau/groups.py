@@ -1899,6 +1899,118 @@ class GroupStore:
                 ids.append(pred["id"] if pred is not None else str(pred_id).lower())
             return ids
 
+    def record_imported_lineage(self, group_id: str, entries: Any) -> int:
+        """Record rename-lineage evidence restored from a group export.
+
+        ``entries`` is the ``group_lineage`` section of an export
+        document: one ``{"id", "name", "members"}`` entry per rename
+        predecessor, plus ``"roster_attestation"`` for a secret
+        group's predecessor.  An entry is recorded only when it
+        verifies against the known group: the predecessor id must
+        re-derive from this group's creator, the entry's name and
+        roster — or, for a secret group, its carried attestation
+        must verify and bind them.  An unsigned claim in an export
+        file is never trusted blindly: a creator cannot borrow
+        another group's history by naming its id, and a forged or
+        mistyped entry is skipped without failing the rest.
+
+        A verified predecessor is recorded only as creator
+        evidence (``_lineage_creators``) — and only when this
+        group's own record already names it in ``renamed_from``.
+        The link itself must already be in this node's record,
+        put there by a local rename or a creator-authorized
+        message, never by the file: the derivation (or
+        attestation) only proves this creator once had such a
+        group, not that they renamed it into this one, so a
+        crafted export must not be able to join two independent
+        groups of one creator.  The file supplies the missing
+        verification for a link the destination already holds —
+        the usual shape of the gap, where a successor learned
+        from the creator's message names a predecessor nothing on
+        disk can verify.  A destination whose record names no
+        predecessor at all still does not heal from an import:
+        that needs a creator-signed rename link, which the export
+        format does not carry yet.  Message ids are never
+        rewritten, so the retract guard — keyed by the original
+        group id — is untouched.
+
+        Returns the number of entries verified and recorded.
+        Unknown groups, groups with no creator on record, and
+        malformed entries record nothing.  Re-importing the same
+        file is a no-op: recording an already-recorded entry
+        changes nothing and still counts it.
+        """
+        if not isinstance(entries, list):
+            return 0
+        with self._transaction():
+            group = self._groups.get(str(group_id).lower())
+            if group is None:
+                return 0
+            creator = group.get("creator") or ""
+            if not creator:
+                return 0
+            named = {
+                str(item).lower() for item in (group.get("renamed_from") or [])
+            }
+            recorded = 0
+            changed = False
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                pred_id = entry.get("id")
+                name = entry.get("name")
+                members = entry.get("members")
+                if (
+                    not isinstance(pred_id, str)
+                    or len(pred_id) != 32
+                    or not isinstance(name, str)
+                    or not isinstance(members, list)
+                ):
+                    continue
+                try:
+                    pred_id = pred_id.lower()
+                    bytes.fromhex(pred_id)
+                    members = _clean_member_list(members)
+                except (ValueError, ProtocolError):
+                    continue
+                if pred_id == group["id"]:
+                    continue
+                if pred_id not in named:
+                    # The destination's record never named this id
+                    # as a predecessor: the file alone cannot create
+                    # the link (see the docstring above).
+                    continue
+                attestation = entry.get("roster_attestation")
+                if attestation is not None:
+                    verified = verify_roster_attestation(attestation)
+                    if verified is None or not roster_attestation_matches(
+                        verified,
+                        group_id=pred_id,
+                        name=name,
+                        creator=creator,
+                        members=members,
+                    ):
+                        continue
+                else:
+                    try:
+                        expected = derive_group_id(creator, name, members)
+                    except (ProtocolError, ValueError):
+                        continue
+                    if expected != pred_id:
+                        continue
+                if self._lineage_creators.get(pred_id) != creator:
+                    self._lineage_creators[pred_id] = creator
+                    changed = True
+                recorded += 1
+            if changed:
+                snapshot = self._snapshot()
+                try:
+                    self._save()
+                except OSError:
+                    self._restore(snapshot)
+                    raise
+            return recorded
+
     def successor(self, group_id: str) -> Optional[Dict[str, Any]]:
         """The live group continuing *group_id*, or ``None``.
 

@@ -23992,6 +23992,54 @@ def test_messages_import_skips_a_retracted_message(bridge, node, tmp_path):
         bridge2.stop()
 
 
+def test_messages_import_reports_failed_lineage_restore(
+    bridge, node, monkeypatch
+):
+    # Regression test (Qodo Warning on PR #802): a group-store write
+    # failure during the lineage restore must not hide behind the
+    # successful message import — the console gets an explicit
+    # warning to retry.
+    def _boom(group_id, entries):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(node.groups, "record_imported_lineage", _boom)
+    crew_id = node.groups.find("crew")["id"]
+    document = {
+        "format": "tau-messages-export",
+        "version": 1,
+        "messages": [
+            {
+                "from": "alice",
+                "destination": PEER_HASH,
+                "text": "crew hello",
+                "sent_at": 10.0,
+                "received_at": 20.0,
+                "id": "m-1",
+                "kind": "group",
+                "group": crew_id,
+            }
+        ],
+        "group_id": crew_id,
+        "group_lineage": [
+            {
+                "id": "aa" * 16,
+                "name": "old-crew",
+                "members": [PEER_HASH, BOB_HASH],
+            }
+        ],
+    }
+    result = bridge.messages_import(document)
+    assert result["imported"] == 1
+    assert result["skipped"] == 0
+    # The console key follows the Fixer's already-pushed
+    # `group_lineage_error` (same report, different name).
+    assert result["group_lineage_error"] == (
+        "messages were imported, but group lineage could not "
+        "be recorded; retry the import to restore it"
+    )
+    assert "group_lineage_recorded" not in result
+
+
 # -- received-file downloads -------------------------------------------------
 
 SENDER_HASH = "ab" * 16

@@ -5548,6 +5548,34 @@ class WebBridge:
                 )
         else:
             result = inbox.import_messages(document, inserted=inserted)
+        # A group export carries verifiable rename-lineage evidence
+        # (see #801): restore the predecessor link on this node so
+        # the imported older messages join the group's history, the
+        # same restore the CLI import performs.  A failed group
+        # write leaves the messages in place; a re-import retries
+        # the lineage.
+        groups = getattr(self.node, "groups", None)
+        if groups is not None and isinstance(document, dict):
+            entries = document.get("group_lineage")
+            group_id = document.get("group_id")
+            if (
+                isinstance(entries, list)
+                and entries
+                and isinstance(group_id, str)
+            ):
+                try:
+                    recorded = groups.record_imported_lineage(
+                        group_id, entries
+                    )
+                except OSError:
+                    log.exception("could not record imported group lineage")
+                    recorded = 0
+                    result["group_lineage_error"] = (
+                        "messages were imported, but group lineage could not "
+                        "be recorded; retry the import to restore it"
+                    )
+                if recorded:
+                    result["group_lineage_recorded"] = recorded
         # An invalid entry's id comes from untrusted JSON and may hold
         # a lone surrogate, which the UTF-8 response encoder cannot
         # write. Replace unencodable characters so the counts still
