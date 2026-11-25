@@ -1681,7 +1681,9 @@ def test_cli_channel_send_with_location(tmp_path, capsys, monkeypatch):
     assert bare["text"] == "📍 34.05, -83.88"
     assert bare["location"] == {"lat": 34.05, "lon": -83.88}
 
-    # A pin cannot ride on a reply or a scheduled message.
+    # A pin cannot ride on a reply — but it can ride on a scheduled
+    # message: the pin queues with the entry and the publish pass
+    # attaches it when the message goes out.
     assert (
         main(
             [
@@ -1716,9 +1718,16 @@ def test_cli_channel_send_with_location(tmp_path, capsys, monkeypatch):
                 "later",
             ]
         )
-        == 2
+        == 0
     )
-    assert "--delay" in capsys.readouterr().err
+    out = capsys.readouterr().out
+    assert "scheduled" in out
+    assert (
+        main(["channel", "scheduled", "--data-dir", str(data_dir)]) == 0
+    )
+    out = capsys.readouterr().out
+    assert "later" in out
+    assert "📍 Location — 34.05, -83.88" in out
 
     # An unparseable pin fails before anything is stored.
     assert (

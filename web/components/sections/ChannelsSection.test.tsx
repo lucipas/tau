@@ -36,6 +36,7 @@ beforeEach(() => {
             attempts: 0,
             next_attempt_at: 0,
             paused_at: 0,
+            location: { lat: 34.05, lon: -83.88, name: "Rock Springs Park" },
           },
           {
             id: "cd34ef56ab78ab12",
@@ -218,9 +219,13 @@ describe("ChannelsSection", () => {
   it("renders a location pin with an open-in-maps link", async () => {
     render(<ChannelsSection />);
     fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
-    const link = await screen.findByRole("link", { name: /Rock Springs Park/ });
-    expect(link.getAttribute("href")).toContain("openstreetmap.org");
-    expect(link.getAttribute("href")).toContain("mlat=34.05");
+    // The pin renders twice: once on the scheduled entry, once in history.
+    const links = await screen.findAllByRole("link", { name: /Rock Springs Park/ });
+    expect(links.length).toBe(2);
+    for (const link of links) {
+      expect(link.getAttribute("href")).toContain("openstreetmap.org");
+      expect(link.getAttribute("href")).toContain("mlat=34.05");
+    }
   });
 
   it("shows a pinned place's map link even when it left history", async () => {
@@ -369,6 +374,9 @@ describe("ChannelsSection", () => {
     render(<ChannelsSection />);
     fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
     expect(await screen.findByText("morning hello")).toBeTruthy();
+    // The queued pin renders like a published one — one link in the
+    // scheduled row, plus the one already in history.
+    expect(screen.getAllByText("📍 Rock Springs Park").length).toBe(2);
     // One Cancel per scheduled entry (message + poll).
     const cancelButtons = screen.getAllByRole("button", { name: "Cancel" });
     expect(cancelButtons.length).toBe(2);

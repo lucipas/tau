@@ -15452,6 +15452,35 @@ def test_channel_send_delay_json_round_trip(tmp_path, capsys):
     assert payload["scheduled"][0]["channel"] == "general"
 
 
+def test_channel_send_delay_with_location_schedules_and_lists(tmp_path, capsys):
+    _init_node(tmp_path, "node", "alice")
+    assert _run_channel(tmp_path, "join", "general") == 0
+    capsys.readouterr()
+
+    code = _run_channel(
+        tmp_path,
+        "send",
+        "general",
+        "meet here",
+        "--location",
+        "34.05,-83.88 Rock Springs Park",
+        "--delay",
+        "5m",
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "scheduled" in out
+    assert "publishes in 5m" in out
+
+    code = _run_channel(tmp_path, "scheduled")
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "#general" in out
+    assert "meet here" in out
+    assert "📍 Rock Springs Park — 34.05, -83.88" in out
+    assert "openstreetmap.org" in out
+
+
 def test_channel_send_delay_rejects_bad_combinations(tmp_path, capsys):
     _init_node(tmp_path, "node", "alice")
     assert _run_channel(tmp_path, "join", "general") == 0
