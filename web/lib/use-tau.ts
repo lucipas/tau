@@ -188,6 +188,10 @@ export function useTau(): UseTauResult {
   // groups event must not replace the flags that event set with its
   // older response.
   const groupsSeq = useRef(0);
+  // The newest group list a groups event carried, tracked synchronously:
+  // refresh() reads this instead of the snapshot ref, which only catches
+  // up on the next render and could still hold pre-event flags.
+  const liveGroups = useRef<Group[] | null>(null);
 
   snapshotRef.current = snapshot;
 
@@ -199,6 +203,7 @@ export function useTau(): UseTauResult {
     }
     if (event.type === "groups") {
       groupsSeq.current += 1;
+      liveGroups.current = (event as { groups: Group[] }).groups;
     }
     if (!current) return;
     // Functional update: several live events can land in one batch, and
@@ -940,12 +945,6 @@ export function usePeerActions(): PeerActions {
       mute: (target, muted) => setMuted(target, muted),
       pin: (target, pinned) => setPinnedConversation(target, pinned),
       markRead: (target = {}) => markRead(target),
-      markUnread: (target, all) => markUnread(target, all),
-    }),
-    [],
-  );
-}
- markRead(target),
       markUnread: (target, all) => markUnread(target, all),
     }),
     [],
