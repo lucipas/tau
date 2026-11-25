@@ -618,6 +618,10 @@ def _valid_file_record(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     forwarded_from = clean_forwarded_from_or_none(raw.get("forwarded_from"))
     if forwarded_from is not None:
         record["forwarded_from"] = forwarded_from
+    if raw.get("voice") is True:
+        # Only the literal True counts: a hand-edited record carrying
+        # any other value must not gain a marker it never had.
+        record["voice"] = True
     if raw.get("pinned"):
         record["pinned"] = True
     return record

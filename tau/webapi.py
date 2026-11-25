@@ -82,10 +82,12 @@ script) can read what arrives from the mesh and send messages back:
                            download a file received from ``<sender>``
                            (sender destination hash, sanitised file name)
     POST /api/send-file    send a file ``{"to": "...", "name": "...", "data": "<base64>"}``
-                           (optional ``"timeout"`` seconds, default 300)
+                           (optional ``"timeout"`` seconds, default 300;
+                           optional ``"voice": true`` marks a voice note)
     POST /api/groups/send-file send a file to a group ``{"group": "<id | prefix | name>",
                            "name": "...", "data": "<base64>"}`` (optional ``"timeout"``
-                           seconds, default 300; one outbound entry per member)
+                           seconds, default 300; optional ``"voice": true``;
+                           one outbound entry per member)
     POST /api/react        react ``{"target": "<wire id>", "reaction": "👍"}``
                            or retract ``{"target": "<wire id>", "clear": true}``
     POST /api/typing       typing ``{"peer": "<hash>", "state": "start"|"stop"}``
@@ -975,6 +977,10 @@ def _clean_stored_file(value: Any) -> Optional[Dict[str, Any]]:
     forwarded_from = clean_forwarded_from_or_none(value.get("forwarded_from"))
     if forwarded_from is not None:
         cleaned["forwarded_from"] = forwarded_from
+    if value.get("voice") is True:
+        # Only the literal True counts: a hand-edited history file
+        # carrying any other value must not gain a marker it never had.
+        cleaned["voice"] = True
     return cleaned
 
 
@@ -7324,6 +7330,7 @@ class WebBridge:
         *,
         timeout: float = 300.0,
         forwarded_from: Optional[Dict[str, Any]] = None,
+        voice: bool = False,
     ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
         """Send a file to a peer from the console.
 
@@ -7365,7 +7372,11 @@ class WebBridge:
             staged = Path(staging) / clean_name
             staged.write_bytes(data)
             response = self.node.send_file(
-                peer, staged, timeout=timeout, forwarded_from=forwarded_from
+                peer,
+                staged,
+                timeout=timeout,
+                forwarded_from=forwarded_from,
+                voice=voice,
             )
         wire_id = response.get("id") if isinstance(response.get("id"), str) else None
         shown_from = clean_forwarded_from_or_none(forwarded_from)
@@ -7376,6 +7387,10 @@ class WebBridge:
         }
         if shown_from is not None:
             file_meta["forwarded_from"] = shown_from
+        if voice is True:
+            # The sender's own feed entry carries the marker too, so
+            # the note renders as a player on both sides.
+            file_meta["voice"] = True
         with self._send_lock:
             message = self._append_message(
                 direction="out",
@@ -7408,6 +7423,7 @@ class WebBridge:
         group: Optional[str] = None,
         group_name: Optional[str] = None,
         forwarded_from: Optional[Dict[str, Any]] = None,
+        voice: bool = False,
     ) -> List[Dict[str, Any]]:
         """Record one outbound feed entry per file fan-out leg.
 
@@ -7447,6 +7463,10 @@ class WebBridge:
             }
             if shown_from is not None:
                 file_meta["forwarded_from"] = shown_from
+            if voice is True:
+                # The sender's own feed entries carry the marker too,
+                # so the note renders as a player on both sides.
+                file_meta["voice"] = True
             with self._send_lock:
                 message = self._append_message(
                     direction="out",
@@ -7479,6 +7499,7 @@ class WebBridge:
         *,
         timeout: float = 300.0,
         forwarded_from: Optional[Dict[str, Any]] = None,
+        voice: bool = False,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """Send a file to every member of a group from the console.
 
@@ -7533,6 +7554,7 @@ class WebBridge:
                 staged,
                 timeout=timeout,
                 forwarded_from=forwarded_from,
+                voice=voice,
             )
         messages = self._record_file_legs(
             response=response,
@@ -7543,6 +7565,7 @@ class WebBridge:
             group=group_record["id"],
             group_name=group_record.get("name") or "",
             forwarded_from=forwarded_from,
+            voice=voice,
         )
         return messages, response
 
@@ -7553,6 +7576,7 @@ class WebBridge:
         data: bytes,
         *,
         timeout: float = 300.0,
+        voice: bool = False,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """Send a file to every member of a broadcast list from the console.
 
@@ -7605,7 +7629,7 @@ class WebBridge:
             staged = Path(staging) / clean_name
             staged.write_bytes(data)
             response = self.node.send_broadcast_file(
-                broadcast_record, staged, timeout=timeout
+                broadcast_record, staged, timeout=timeout, voice=voice
             )
         messages = self._record_file_legs(
             response=response,
@@ -7613,6 +7637,7 @@ class WebBridge:
             data=data,
             digest=digest,
             sent_at=sent_at,
+            voice=voice,
         )
         return messages, response
 
@@ -8872,6 +8897,9 @@ class WebBridge:
         if not isinstance(peer_hash, str) or not peer_hash:
             raise ValueError("cannot forward a file: the sender is unknown")
         data = self._forward_file_bytes(entry, file_meta, peer_hash, name)
+        # A forwarded voice note keeps its marker, like it keeps its
+        # attribution: the entry's file metadata carries both.
+        voice = file_meta.get("voice") is True
         if group is not None:
             try:
                 file_messages, file_response = self.send_group_file(
@@ -8882,6 +8910,7 @@ class WebBridge:
                     if file_timeout is not None
                     else timeout,
                     forwarded_from=forwarded_from,
+                    voice=voice,
                 )
             except (NodeError, ValueError, OSError) as exc:
                 return {
@@ -8900,6 +8929,7 @@ class WebBridge:
                 data,
                 timeout=file_timeout if file_timeout is not None else timeout,
                 forwarded_from=forwarded_from,
+                voice=voice,
             )
         except (NodeError, ValueError, OSError) as exc:
             return {
@@ -18381,6 +18411,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                 name,
                 raw,
                 timeout=timeout,
+                voice=body.get("voice") is True,
             )
         except (ValueError, ProtocolError) as exc:
             self._send_json({"error": {"message": str(exc)}}, head_only, 400)
@@ -18440,6 +18471,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                 name,
                 raw,
                 timeout=timeout,
+                voice=body.get("voice") is True,
             )
         except ValueError as exc:
             # GroupStore.find raises ValueError for both an unknown
@@ -18505,6 +18537,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                 name,
                 raw,
                 timeout=timeout,
+                voice=body.get("voice") is True,
             )
         except ValueError as exc:
             # BroadcastStore.find raises ValueError for an unknown

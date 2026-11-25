@@ -691,6 +691,46 @@ def test_file_record_drops_malformed_forwarded_from(tmp_path):
     assert "forwarded_from" not in inbox.list_messages()[0]
 
 
+def test_file_record_keeps_voice(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(
+        {
+            "kind": "file",
+            "from": "alice",
+            "destination": "aa" * 16,
+            "name": "voice-note-1.webm",
+            "size": 12,
+            "sha256": "ab" * 32,
+            "path": "voice-note-1.webm",
+            "sent_at": 2.0,
+            "received_at": 2.0,
+            "id": "f1",
+            "voice": True,
+        }
+    )
+    assert inbox.list_messages()[0]["voice"] is True
+
+
+def test_file_record_drops_non_bool_voice(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(
+        {
+            "kind": "file",
+            "from": "alice",
+            "destination": "aa" * 16,
+            "name": "voice-note-1.webm",
+            "size": 12,
+            "sha256": "ab" * 32,
+            "path": "voice-note-1.webm",
+            "sent_at": 2.0,
+            "received_at": 2.0,
+            "id": "f1",
+            "voice": "yes",
+        }
+    )
+    assert "voice" not in inbox.list_messages()[0]
+
+
 def test_export_import_preserves_pin(tmp_path):
     source = Inbox(tmp_path / "source.json")
     source.append(_record(id="one", text="first"))

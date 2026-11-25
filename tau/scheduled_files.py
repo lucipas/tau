@@ -222,7 +222,13 @@ def _clean_file(value: Any) -> Dict[str, Any]:
         raise ScheduledFileError(
             "scheduled file name must be a safe bare file name"
         )
-    return {"sha256": sha256.lower(), "size": size, "name": name}
+    cleaned = {"sha256": sha256.lower(), "size": size, "name": name}
+    if value.get("voice") is True:
+        # Only the literal True counts, like the inbox record: a
+        # hand-edited queue entry carrying any other value must not
+        # gain a marker it never had.
+        cleaned["voice"] = True
+    return cleaned
 
 
 def _clean_timestamp(value: Any, label: str) -> float:

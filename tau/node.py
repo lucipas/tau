@@ -5655,6 +5655,7 @@ class TauNode:
                 timeout=entry.timeout,
                 discover_timeout=entry.discover_timeout,
                 only=list(entry.pending_members) or None,
+                voice=descriptor.get("voice") is True,
             )
             if not result.get("ok"):
                 delivered = tuple(
@@ -5704,6 +5705,7 @@ class TauNode:
                 timeout=entry.timeout,
                 discover_timeout=entry.discover_timeout,
                 only=list(entry.pending_members) or None,
+                voice=descriptor.get("voice") is True,
             )
             if not result.get("ok"):
                 delivered = tuple(
@@ -5733,6 +5735,7 @@ class TauNode:
             staged_path,
             timeout=entry.timeout,
             discover_timeout=entry.discover_timeout,
+            voice=descriptor.get("voice") is True,
         )
 
     def _exchange_sweep(self, *, max_peers: int) -> None:
@@ -12116,6 +12119,7 @@ class TauNode:
         limit_label: str,
         forwarded_from: Optional[Dict[str, Any]] = None,
         group_id: Optional[str] = None,
+        voice: bool = False,
     ) -> Tuple[List[Dict[str, Any]], bool]:
         """Fan already-read file bytes out to *members*, one transfer each.
 
@@ -12168,6 +12172,7 @@ class TauNode:
                     deadline=deadline,
                     forwarded_from=forwarded_from,
                     group=group_id,
+                    voice=voice,
                 )
                 results.append(
                     {
@@ -12203,6 +12208,7 @@ class TauNode:
         discover_timeout: Optional[float] = None,
         only: Optional[Sequence[str]] = None,
         forwarded_from: Optional[Dict[str, Any]] = None,
+        voice: bool = False,
     ) -> Dict[str, Any]:
         """Fan a file out to every member of a group except this node.
 
@@ -12250,6 +12256,7 @@ class TauNode:
             limit_label="group send",
             forwarded_from=forwarded_from,
             group_id=group["id"],
+            voice=voice,
         )
         return {
             "ok": all_ok,
@@ -12267,6 +12274,7 @@ class TauNode:
         timeout: float = _FILE_TRANSFER_TIMEOUT,
         discover_timeout: Optional[float] = None,
         only: Optional[Sequence[str]] = None,
+        voice: bool = False,
     ) -> Dict[str, Any]:
         """Fan a file out to every member of a broadcast list.
 
@@ -12309,6 +12317,7 @@ class TauNode:
             timeout=timeout,
             discover_timeout=discover_timeout,
             limit_label="broadcast send",
+            voice=voice,
         )
         return {
             "ok": all_ok,
@@ -12327,6 +12336,7 @@ class TauNode:
         progress_callback: Optional[Callable[[float], None]] = None,
         deadline: Optional[float] = None,
         forwarded_from: Optional[Dict[str, Any]] = None,
+        voice: bool = False,
     ) -> Dict[str, Any]:
         """Send a small file to a peer over an RNS Resource.
 
@@ -12342,6 +12352,9 @@ class TauNode:
         ``timeout`` in turn.  ``forwarded_from`` names the file's
         original sender when this transfer is a forward; it rides in
         the signed offer so the attribution travels with the file.
+        ``voice`` marks the file as a voice note; it rides in the
+        signed offer the same way, so the receiver stores it on the
+        file record.
         """
         data, name, digest = _read_file_payload(path)
         return self._send_file_bytes(
@@ -12354,6 +12367,7 @@ class TauNode:
             progress_callback=progress_callback,
             deadline=deadline,
             forwarded_from=forwarded_from,
+            voice=voice,
         )
 
     def _send_file_bytes(
@@ -12369,6 +12383,7 @@ class TauNode:
         deadline: Optional[float] = None,
         forwarded_from: Optional[Dict[str, Any]] = None,
         group: Optional[str] = None,
+        voice: bool = False,
     ) -> Dict[str, Any]:
         """Send already-read file bytes to a peer over an RNS Resource.
 
@@ -12403,6 +12418,7 @@ class TauNode:
             sha256=digest,
             forwarded_from=forwarded_from,
             group=group,
+            voice=voice,
         )
         link = self._open_link(peer, min(timeout, 30.0), deadline=deadline)
         try:
@@ -15097,6 +15113,11 @@ class TauNode:
             # attribution on the record so it renders wherever the
             # file does — and so a re-forward passes it on unchanged.
             record["forwarded_from"] = offer["forwarded_from"]
+        if offer.get("voice") is True:
+            # The offer marked the file as a voice note: keep the
+            # marker on the record so it renders as an audio player
+            # — and so a re-forward passes it on unchanged.
+            record["voice"] = True
         return record
 
     def _on_incoming_link(self, link: RNS.Link) -> None:

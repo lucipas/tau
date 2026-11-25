@@ -666,6 +666,8 @@ export async function sendMessage(
 
 export interface SendFileOptions {
   timeout?: number;
+  /** Mark the file as a voice note (renders as an audio player). */
+  voice?: boolean;
 }
 
 /** Send a file (<=10 MiB) as base64 data to a peer. */
@@ -675,7 +677,7 @@ export async function sendFile(
   data: string,
   opts: SendFileOptions = {},
 ): Promise<SendResult> {
-  return post("/api/send-file", { to, name, data, timeout: opts.timeout ?? 300 });
+  return post("/api/send-file", { to, name, data, timeout: opts.timeout ?? 300, voice: opts.voice ?? false });
 }
 
 export async function sendGroupFile(
@@ -684,7 +686,7 @@ export async function sendGroupFile(
   data: string,
   opts: SendFileOptions = {},
 ): Promise<unknown> {
-  return post("/api/groups/send-file", { group, name, data, timeout: opts.timeout ?? 300 });
+  return post("/api/groups/send-file", { group, name, data, timeout: opts.timeout ?? 300, voice: opts.voice ?? false });
 }
 
 /** Download URL for a file received from `sender` (destination hash). */

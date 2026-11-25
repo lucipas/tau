@@ -1,7 +1,8 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi, afterEach } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
 import Composer, {
   MAX_FILE_BYTES,
+  formatVoiceDuration,
   validateContact,
   validateFile,
   validateLocation,
@@ -282,5 +283,94 @@ describe("Composer", () => {
       />,
     );
     expect((screen.getByLabelText("Message") as HTMLTextAreaElement).value).toBe("my own words");
+  });
+});
+
+describe("formatVoiceDuration", () => {
+  it("formats elapsed seconds as m:ss", () => {
+    expect(formatVoiceDuration(0)).toBe("0:00");
+    expect(formatVoiceDuration(7)).toBe("0:07");
+    expect(formatVoiceDuration(65)).toBe("1:05");
+    expect(formatVoiceDuration(600)).toBe("10:00");
+  });
+});
+
+describe("voice recording", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  function installVoiceMocks() {
+    const stream = { getTracks: () => [] } as unknown as MediaStream;
+    const getUserMedia = vi.fn().mockResolvedValue(stream);
+    Object.defineProperty(navigator, "mediaDevices", {
+      value: { getUserMedia },
+      configurable: true,
+    });
+    class FakeRecorder {
+      static isTypeSupported = () => true;
+      ondataavailable: ((e: { data: Blob }) => void) | null = null;
+      onstop: (() => void) | null = null;
+      mimeType = "audio/webm;codecs=opus";
+      constructor(
+        public stream: MediaStream,
+        public opts?: { mimeType?: string },
+      ) {}
+      start() {
+        this.ondataavailable?.({ data: new Blob(["audio"], { type: "audio/webm" }) });
+      }
+      stop() {
+        this.onstop?.();
+      }
+    }
+    vi.stubGlobal("MediaRecorder", FakeRecorder);
+    return { getUserMedia };
+  }
+
+  it("hides the mic button when the browser cannot record", () => {
+    render(<Composer onSend={() => undefined} onSendFile={() => undefined} />);
+    expect(screen.queryByLabelText("Record a voice note")).toBeNull();
+  });
+
+  it("records and sends a voice note with the voice marker", async () => {
+    const { getUserMedia } = installVoiceMocks();
+    const onSendFile = vi.fn();
+    render(<Composer onSend={() => undefined} onSendFile={onSendFile} />);
+
+    fireEvent.click(screen.getByLabelText("Record a voice note"));
+    await vi.waitFor(() =>
+      expect(screen.getByLabelText("Stop recording")).toBeTruthy(),
+    );
+    expect(getUserMedia).toHaveBeenCalledWith({ audio: true });
+
+    fireEvent.click(screen.getByLabelText("Stop recording"));
+    await vi.waitFor(() => expect(screen.getByText(/Voice note:/)).toBeTruthy());
+
+    fireEvent.click(screen.getByText("Send"));
+    await vi.waitFor(() =>
+      expect(onSendFile).toHaveBeenCalledWith(
+        expect.objectContaining({ name: expect.stringMatching(/^voice-note-.*\.webm$/) }),
+        expect.objectContaining({ voice: true }),
+      ),
+    );
+  });
+
+  it("sends a picked file without the voice marker", async () => {
+    installVoiceMocks();
+    const onSendFile = vi.fn();
+    render(<Composer onSend={() => undefined} onSendFile={onSendFile} />);
+    const input = screen.getByLabelText("Attach a file") as HTMLInputElement;
+    fireEvent.change(input, {
+      target: { files: [new File(["hello"], "notes.txt")] },
+    });
+    expect(screen.getByText(/Attached:/)).toBeTruthy();
+    fireEvent.click(screen.getByText("Send"));
+    await vi.waitFor(() =>
+      expect(onSendFile).toHaveBeenCalledWith(
+        expect.objectContaining({ name: "notes.txt" }),
+        expect.objectContaining({ voice: false }),
+      ),
+    );
   });
 });

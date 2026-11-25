@@ -197,10 +197,39 @@ def test_parser_send_file_delay():
         ["send-file", "--to", "alice", "--delay", "5m", "notes.txt"]
     )
     assert args.delay == "5m"
+    assert args.voice is False
+    args = parser.parse_args(
+        ["send-file", "--to", "alice", "--voice", "notes.txt"]
+    )
+    assert args.voice is True
     args = parser.parse_args(["scheduled-files"])
     assert args.scheduled_files_command is None
     args = parser.parse_args(["scheduled-files", "cancel", "ab12cd34"])
     assert args.target == "ab12cd34"
+
+
+def test_send_file_voice_delay_queues_marker(tmp_path, capsys, monkeypatch):
+    import hashlib
+
+    from tau.config import TauConfig
+
+    source = _write_sample_file(tmp_path, name="note.webm", data=b"audio")
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    code = _run_send_file(
+        tmp_path,
+        monkeypatch,
+        ["--to", "alice", "--delay", "2h", "--voice", str(source)],
+    )
+    assert code == 0
+    config = TauConfig.resolve(data_dir=tmp_path / "node")
+    queue = json.loads(config.scheduled_files_path.read_text())
+    assert len(queue["files"]) == 1
+    assert queue["files"][0]["file"] == {
+        "sha256": digest,
+        "size": len(source.read_bytes()),
+        "name": "note.webm",
+        "voice": True,
+    }
 
 
 def test_send_file_delay_schedules_without_a_node(

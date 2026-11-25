@@ -135,6 +135,29 @@ def test_schedule_rejects_bad_descriptor(tmp_path):
     assert len(load_scheduled_files(path)) == 0
 
 
+def test_schedule_keeps_voice_marker_and_drops_non_bool(tmp_path):
+    path = tmp_path / "scheduled-files.json"
+    entry = schedule_file(
+        path,
+        target="alice",
+        kind="dm",
+        file={**FILE, "voice": True},
+        publish_at=2000.0,
+    )
+    assert entry.file["voice"] is True
+    assert load_scheduled_files(path).files[0].file["voice"] is True
+
+    path = tmp_path / "other.json"
+    entry = schedule_file(
+        path,
+        target="alice",
+        kind="dm",
+        file={**FILE, "voice": "yes"},
+        publish_at=2000.0,
+    )
+    assert "voice" not in entry.file
+
+
 def test_schedule_with_explicit_id_uses_it(tmp_path):
     path = tmp_path / "scheduled-files.json"
     entry = schedule_file(
@@ -484,7 +507,7 @@ def test_node_send_group_uses_entry_timeouts(tmp_path):
     TauNode._send_scheduled_file(
         node, entry, staged_dir / entry.id / "notes.txt"
     )
-    assert seen == {"timeout": 60.0, "discover_timeout": 5.0}
+    assert seen == {"timeout": 60.0, "discover_timeout": 5.0, "voice": False}
 
 
 def test_node_send_group_refuses_changed_roster(tmp_path):
@@ -595,6 +618,7 @@ def test_node_send_broadcast_uses_entry_timeouts_and_pending(tmp_path):
             "pending_members": ("b" * 32,),
             "timeout": 60.0,
             "discover_timeout": 5.0,
+            "file": {**FILE, "voice": True},
         }
     )
     TauNode._send_scheduled_file(
@@ -604,6 +628,7 @@ def test_node_send_broadcast_uses_entry_timeouts_and_pending(tmp_path):
         "timeout": 60.0,
         "discover_timeout": 5.0,
         "only": ["b" * 32],
+        "voice": True,
     }
 
 

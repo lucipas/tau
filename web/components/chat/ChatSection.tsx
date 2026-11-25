@@ -733,8 +733,8 @@ export default function ChatSection() {
       const data = await fileToBase64(file);
       await run("File send failed", () =>
         selected.kind === "group"
-          ? sendGroupFile(selected.key, file.name, data)
-          : sendFile(selected.key, file.name, data),
+          ? sendGroupFile(selected.key, file.name, data, { voice: opts.voice })
+          : sendFile(selected.key, file.name, data, { voice: opts.voice }),
       );
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps

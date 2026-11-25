@@ -59,6 +59,7 @@ def make_offer(
     transfer_id="a" * 32,
     forwarded_from=None,
     group=None,
+    voice=False,
 ):
     return build_file_offer(
         identity,
@@ -69,6 +70,7 @@ def make_offer(
         sha256=hashlib.sha256(data).hexdigest(),
         forwarded_from=forwarded_from,
         group=group,
+        voice=voice,
     )
 
 
@@ -317,6 +319,70 @@ def test_file_offer_roundtrip_carries_group():
         raw, remote_identity=identity, expected_recipient=RECIPIENT_HASH
     )
     assert parsed["group"] == "ab" * 16
+
+
+def test_file_offer_roundtrip_carries_voice():
+    identity = sender_identity()
+    raw = make_offer(identity, voice=True)
+    parsed = parse_file_offer(
+        raw, remote_identity=identity, expected_recipient=RECIPIENT_HASH
+    )
+    assert parsed["voice"] is True
+
+
+def test_file_offer_omits_voice_when_absent():
+    identity = sender_identity()
+    raw = make_offer(identity)
+    parsed = parse_file_offer(raw, remote_identity=identity)
+    assert "voice" not in parsed
+
+
+def test_file_offer_ignores_non_bool_voice():
+    identity = sender_identity()
+    parsed = parse_file_offer(
+        sign_offer(identity, voice="yes"), remote_identity=identity
+    )
+    assert "voice" not in parsed
+
+
+def test_file_offer_rejects_tampered_voice():
+    identity = sender_identity()
+    raw = bytearray(make_offer(identity, voice=True))
+    payload = json.loads(bytes(raw))
+    payload["voice"] = False
+    tampered = json.dumps(payload).encode()
+    with pytest.raises(ProtocolError, match="signature does not verify"):
+        parse_file_offer(tampered, remote_identity=identity)
+
+
+def test_save_received_file_keeps_voice(tmp_path):
+    node = make_node(tmp_path)
+    offer = {
+        "from": "aa" * 16,
+        "name": "voice-note-1.webm",
+        "sha256": hashlib.sha256(b"audio").hexdigest(),
+        "sent_at": 1.0,
+        "id": "c" * 32,
+        "voice": True,
+    }
+    record = node._save_received_file(offer, b"audio")
+    assert record is not None
+    assert record["voice"] is True
+    assert record["name"] == "voice-note-1.webm"
+
+
+def test_save_received_file_omits_voice_when_absent(tmp_path):
+    node = make_node(tmp_path)
+    offer = {
+        "from": "aa" * 16,
+        "name": "notes.txt",
+        "sha256": hashlib.sha256(b"hello").hexdigest(),
+        "sent_at": 1.0,
+        "id": "c" * 32,
+    }
+    record = node._save_received_file(offer, b"hello")
+    assert record is not None
+    assert "voice" not in record
 
 
 def test_file_offer_omits_group_when_absent():
