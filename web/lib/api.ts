@@ -620,9 +620,14 @@ export async function getMessages(limit = 200): Promise<ChatMessage[]> {
 /** Stored history of one group, including its posts while the group is
  *  ignored — the default listing hides those, so an open ignored
  *  thread fetches them explicitly instead of looking empty. */
-export async function getGroupMessages(groupId: string, limit = 200): Promise<ChatMessage[]> {
-  const data = await get<{ messages: ChatMessage[] }>(
+export async function getGroupMessages(
+  groupId: string,
+  limit = 200,
+  signal?: AbortSignal,
+): Promise<ChatMessage[]> {
+  const data = await request<{ messages: ChatMessage[] }>(
     `/api/messages${query({ group: groupId, include_ignored: 1, limit })}`,
+    { signal },
   );
   return data.messages;
 }

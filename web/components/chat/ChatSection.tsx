@@ -58,6 +58,9 @@ import NewGroupPanel from "./NewGroupPanel";
 import OutboxPanel from "./OutboxPanel";
 import RemindersPanel from "./RemindersPanel";
 import ThreadView from "./ThreadView";
+
+// Upper bound on one ignored-thread history fetch; see startFetch.
+const IGNORED_HISTORY_TIMEOUT_MS = 15_000;
 import type { MessageAction } from "./MessageBubble";
 import type { ComposerSendOptions } from "./Composer";
 
@@ -256,15 +259,22 @@ export default function ChatSection() {
     const startFetch = (id: string) => {
       const seq = ++ignoredHistorySeq.current;
       ignoredHistoryInFlight.current = true;
+      // Bound the request: a stalled GET would otherwise hold the
+      // in-flight flag forever and block every later refresh. Aborting
+      // settles it as a failure, so the finally below releases the flag
+      // and runs any queued follow-up.
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), IGNORED_HISTORY_TIMEOUT_MS);
       void (async () => {
         try {
-          const history = await getGroupMessages(id);
+          const history = await getGroupMessages(id, undefined, controller.signal);
           if (seq !== ignoredHistorySeq.current) return;
           setIgnoredHistory(history);
           setIgnoredHistoryError(false);
         } catch {
           if (seq === ignoredHistorySeq.current) setIgnoredHistoryError(true);
         } finally {
+          clearTimeout(timer);
           // Superseded by a selection change: the newer fetch owns the
           // in-flight flags now, so leave them alone.
           if (seq !== ignoredHistorySeq.current) return;
