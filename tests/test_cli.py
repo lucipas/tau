@@ -8641,12 +8641,20 @@ def test_group_export_import_restores_predecessor_visibility(tmp_path, capsys):
         }
     ]
 
-    # The destination knows the current group — same creator, name
-    # and roster, so the same derived id — but nothing of the rename.
+    # The destination knows the current group, learned from the
+    # creator's message: the record names the predecessor, but
+    # nothing on disk verifies it yet — the gap #801 closes.
     target_dir = _init_node(tmp_path, "other-node", "alice")
     capsys.readouterr()  # drain the --json output of `tau init`
     target_store = GroupStore(target_dir / "groups.json")
-    target_store.create("weekend-plans", [own_hash, member], created_by=own_hash)
+    assert target_store.record(
+        renamed["id"],
+        "weekend-plans",
+        [own_hash, member],
+        creator=own_hash,
+        sender=own_hash,
+        renamed_from=[group["id"]],
+    )
     assert target_store.lineage(renamed["id"]) == [renamed["id"]]
 
     code = cli.main(
@@ -8747,7 +8755,14 @@ def test_group_export_import_rejects_forged_lineage(tmp_path, capsys):
     target_dir = _init_node(tmp_path, "other-node", "alice")
     capsys.readouterr()  # drain the --json output of `tau init`
     target_store = GroupStore(target_dir / "groups.json")
-    target_store.create("weekend-plans", [own_hash, member], created_by=own_hash)
+    assert target_store.record(
+        renamed["id"],
+        "weekend-plans",
+        [own_hash, member],
+        creator=own_hash,
+        sender=own_hash,
+        renamed_from=[group["id"]],
+    )
 
     code = cli.main(
         ["messages", "import", "--data-dir", str(target_dir), str(export_path)]

@@ -1914,24 +1914,25 @@ class GroupStore:
         another group's history by naming its id, and a forged or
         mistyped entry is skipped without failing the rest.
 
-        A verified predecessor is recorded two ways, so
-        :meth:`lineage` finds it: its creator joins
-        ``_lineage_creators`` (the evidence that survives a retired
-        record's eviction) and its id joins the group's
-        ``renamed_from`` when it is not already named there.  The
-        second half is what makes the restore work on a destination
-        whose record of the current group never carried the
-        predecessor — the export was produced by ``tau group
-        export`` on a node that had already verified the rename
-        link, and the import is an explicit restore of that
-        backup; the derivation (or attestation) still binds the
-        id to this creator, so the entry can only attach a group
-        this creator really had.  The messages themselves are
-        imported regardless, so a hand-crafted entry can at most
-        mis-scope them under this group, never expose another
-        group's mail.  Message ids are never rewritten, so the
-        retract guard — keyed by the original group id — is
-        untouched.
+        A verified predecessor is recorded only as creator
+        evidence (``_lineage_creators``) — and only when this
+        group's own record already names it in ``renamed_from``.
+        The link itself must already be in this node's record,
+        put there by a local rename or a creator-authorized
+        message, never by the file: the derivation (or
+        attestation) only proves this creator once had such a
+        group, not that they renamed it into this one, so a
+        crafted export must not be able to join two independent
+        groups of one creator.  The file supplies the missing
+        verification for a link the destination already holds —
+        the usual shape of the gap, where a successor learned
+        from the creator's message names a predecessor nothing on
+        disk can verify.  A destination whose record names no
+        predecessor at all still does not heal from an import:
+        that needs a creator-signed rename link, which the export
+        format does not carry yet.  Message ids are never
+        rewritten, so the retract guard — keyed by the original
+        group id — is untouched.
 
         Returns the number of entries verified and recorded.
         Unknown groups, groups with no creator on record, and
@@ -1948,8 +1949,10 @@ class GroupStore:
             creator = group.get("creator") or ""
             if not creator:
                 return 0
+            named = {
+                str(item).lower() for item in (group.get("renamed_from") or [])
+            }
             recorded = 0
-            renamed_from = list(group.get("renamed_from") or [])
             changed = False
             for entry in entries:
                 if not isinstance(entry, dict):
@@ -1972,6 +1975,11 @@ class GroupStore:
                     continue
                 if pred_id == group["id"]:
                     continue
+                if pred_id not in named:
+                    # The destination's record never named this id
+                    # as a predecessor: the file alone cannot create
+                    # the link (see the docstring above).
+                    continue
                 attestation = entry.get("roster_attestation")
                 if attestation is not None:
                     verified = verify_roster_attestation(attestation)
@@ -1990,25 +1998,12 @@ class GroupStore:
                         continue
                     if expected != pred_id:
                         continue
-                if pred_id not in [
-                    str(item).lower() for item in renamed_from
-                ]:
-                    # A full lineage cannot take another predecessor:
-                    # it would be truncated away, so it is not recorded.
-                    if len(renamed_from) >= MAX_RENAME_LINEAGE:
-                        continue
-                    renamed_from.append(pred_id)
-                    changed = True
                 if self._lineage_creators.get(pred_id) != creator:
                     self._lineage_creators[pred_id] = creator
                     changed = True
                 recorded += 1
             if changed:
                 snapshot = self._snapshot()
-                self._groups[group["id"]] = {
-                    **group,
-                    "renamed_from": renamed_from,
-                }
                 try:
                     self._save()
                 except OSError:

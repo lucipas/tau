@@ -2895,10 +2895,19 @@ def test_group_store_record_imported_lineage(tmp_path):
     store = GroupStore(tmp_path / "groups.json")
     group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
     renamed = store.rename(group["id"], "road trip", created_by=OWN_HASH)
-    # The destination knows only the current group: the same record,
-    # with no predecessor evidence.
+    # The destination knows only the current group, learned from the
+    # creator's message: the record names the predecessor, but
+    # nothing on disk verifies it yet.
     target = GroupStore(tmp_path / "other-groups.json")
-    target.create("road trip", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    assert target.record(
+        renamed["id"],
+        "road trip",
+        [OWN_HASH, OTHER_HASH],
+        creator=OWN_HASH,
+        sender=OWN_HASH,
+        renamed_from=[group["id"]],
+    )
+    assert target.get(renamed["id"])["renamed_from"] == [group["id"]]
     assert target.lineage(renamed["id"]) == [renamed["id"]]
     # Unknown groups, a non-list section, malformed entries and a
     # too-short roster record nothing — and never raise.
@@ -2963,6 +2972,54 @@ def test_group_store_record_imported_lineage(tmp_path):
     assert legacy.record_imported_lineage(renamed["id"], [genuine]) == 0
 
 
+def test_group_store_record_imported_lineage_ignores_unnamed_predecessor(
+    tmp_path,
+):
+    # Qodo Critical on PR #802: a verified predecessor the
+    # destination's record never named must not join the lineage —
+    # the derivation proves the creator once had such a group, not
+    # that they renamed it into this one.
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    renamed = store.rename(group["id"], "road trip", created_by=OWN_HASH)
+    other = store.create("side", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    # The destination knows only the current group, with no rename
+    # claim at all.
+    target = GroupStore(tmp_path / "other-groups.json")
+    target.create("road trip", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    assert target.lineage(renamed["id"]) == [renamed["id"]]
+    # Neither the genuine predecessor nor an unrelated group of the
+    # same creator joins it: a crafted export cannot join two
+    # independent groups.
+    assert (
+        target.record_imported_lineage(
+            renamed["id"],
+            [
+                {
+                    "id": group["id"],
+                    "name": "weekend",
+                    "members": [OWN_HASH, OTHER_HASH],
+                }
+            ],
+        )
+        == 0
+    )
+    assert (
+        target.record_imported_lineage(
+            renamed["id"],
+            [
+                {
+                    "id": other["id"],
+                    "name": "side",
+                    "members": [OWN_HASH, OTHER_HASH],
+                }
+            ],
+        )
+        == 0
+    )
+    assert target.lineage(renamed["id"]) == [renamed["id"]]
+
+
 def test_group_store_record_imported_lineage_secret(tmp_path):
     # #801: a secret group's predecessor verifies by attestation,
     # not derivation — its id is opaque.
@@ -2974,7 +3031,8 @@ def test_group_store_record_imported_lineage_secret(tmp_path):
     )
     members = sorted([creator_hash, member_hash])
     # The destination learned only the current group, from the
-    # creator's message: same attestation, no predecessor evidence.
+    # creator's message: same attestation, the rename claim, but no
+    # predecessor evidence.
     target = GroupStore(tmp_path / "other-groups.json")
     assert target.record(
         renamed["id"],
@@ -2982,6 +3040,7 @@ def test_group_store_record_imported_lineage_secret(tmp_path):
         members,
         creator=creator_hash,
         sender=creator_hash,
+        renamed_from=[group["id"]],
         roster_attestation=renamed["roster_attestation"],
     )
     assert target.lineage(renamed["id"]) == [renamed["id"]]
@@ -3004,6 +3063,7 @@ def test_group_store_record_imported_lineage_secret(tmp_path):
         members,
         creator=creator_hash,
         sender=creator_hash,
+        renamed_from=[group["id"]],
         roster_attestation=renamed["roster_attestation"],
     )
     assert (
