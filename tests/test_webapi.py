@@ -7617,6 +7617,9 @@ def test_channel_send_with_contact_via_api(tmp_path):
     bridge = WebBridge(node, host="127.0.0.1", port=0)
     bridge.start()
     try:
+        # The bridge enforces the contact-sharing policy, like the DM
+        # and group sends: no block-list, no send.
+        node.blocklist = BlockList()
         card = {"name": "carol", "destination_hash": "cc" * 16}
         status, _, payload = _json(
             bridge,
@@ -7650,6 +7653,46 @@ def test_channel_send_with_contact_via_api(tmp_path):
             )
             assert status == 400, bad
             assert "error" in payload
+
+        # A blocked peer's card must not reach the channel, and
+        # neither may your own — the recipient already has your hash.
+        node.blocklist = BlockList(blocked=frozenset({"cc" * 16}))
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/send",
+            method="POST",
+            body={"channel": "general", "text": "meet carol", "contact": card},
+        )
+        assert status == 400
+        assert "blocked peer" in payload["error"]["message"]
+        node.blocklist = BlockList()
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/send",
+            method="POST",
+            body={
+                "channel": "general",
+                "text": "meet me",
+                "contact": {
+                    "name": "tester",
+                    "destination_hash": node.destination_hexhash,
+                },
+            },
+        )
+        assert status == 400
+        assert "cannot share your own contact" in payload["error"]["message"]
+
+        # An unreadable block-list fails closed, like the DM send.
+        node.blocklist = None
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/send",
+            method="POST",
+            body={"channel": "general", "text": "meet carol", "contact": card},
+        )
+        assert status == 400
+        assert "block-list could not be read" in payload["error"]["message"]
+        node.blocklist = BlockList()
 
         # A card cannot ride on a reply.
         status, _, payload = _json(
