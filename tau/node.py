@@ -12063,6 +12063,13 @@ class TauNode:
             raise NodeError(str(exc)) from exc
         own_hash = self.destination_hexhash
         members = [m for m in broadcast["members"] if m != own_hash]
+        if not members:
+            # A self-only list has no one to send to: fail the tick
+            # like a deleted list, so the update stays due instead
+            # of counting as sent (all([]) would say success).
+            raise NodeError(
+                f"broadcast list {broadcast['name']} has no members to send to"
+            )
         sent_at = time.time() if now is None else now
         results: List[Dict[str, Any]] = []
         for member in members:

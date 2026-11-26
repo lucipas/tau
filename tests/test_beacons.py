@@ -654,6 +654,17 @@ def test_node_broadcast_beacon_update_resolves_members_each_tick(
         node.send_beacon_update(beacon, now=NOW + 2 * BEACON_UPDATE_INTERVAL)
 
 
+def test_node_broadcast_beacon_update_self_only_list_fails_tick(tmp_path):
+    # A list containing only this node has no one to send to: the
+    # tick fails like a deleted list instead of counting as sent.
+    node, own_hash, peers = _make_broadcast_node(tmp_path, members=())
+    beacon = node.start_beacon("family", PIN, broadcast=True, now=NOW)
+    with pytest.raises(NodeError, match="has no members to send to"):
+        node.send_beacon_update(beacon, now=NOW)
+    assert beacon.updates_sent == 0
+    assert beacon.next_update_at == NOW + BEACON_UPDATE_INTERVAL
+
+
 def test_node_broadcast_beacon_update_failed_leg_keeps_going(
     tmp_path, monkeypatch
 ):
