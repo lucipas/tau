@@ -217,8 +217,8 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/tan/likes    who liked a Tan post (?target=<post hash>)
     GET  /api/tan/reposts  who reposted a Tan post (?target=<post hash>)
     GET  /api/tan/quotes   standing quotes of a Tan post (?target=<post hash>)
-    POST /api/tan/posts    publish a Tan post (optional "image" base64 data URL or {sha256, name} descriptor, optional "location" pin, optional "contact" card)
-    POST /api/tan/schedule schedule a Tan post, repost or quote — or a poll, with ``"poll_options"`` — for later (optional "image" base64 data URL or {sha256, name} descriptor, optional "location" pin, optional "contact" card)
+    POST /api/tan/posts    publish a Tan post (optional "image" base64 data URL or {sha256, name} descriptor — a descriptor only from a local client, optional "location" pin, optional "contact" card)
+    POST /api/tan/schedule schedule a Tan post, repost or quote — or a poll, with ``"poll_options"`` — for later (optional "image" base64 data URL or {sha256, name} descriptor — a descriptor only from a local client, optional "location" pin, optional "contact" card)
     GET  /api/tan/scheduled queued Tan posts, reposts, quotes and polls, soonest first
     POST /api/tan/cancel-scheduled cancel a queued Tan post
     POST /api/tan/edit-scheduled edit a queued Tan post's text/time
@@ -4015,6 +4015,7 @@ class WebBridge:
         image: Optional[Any] = None,
         location: Optional[Dict[str, Any]] = None,
         contact: Optional[Dict[str, Any]] = None,
+        allow_descriptor: bool = True,
     ) -> Dict[str, Any]:
         app = self._tan_app()
         if app is None:
@@ -4037,11 +4038,17 @@ class WebBridge:
             # descriptor re-attaches bytes already pinned in the
             # local media store — a draft image the console could
             # not fetch over a non-loopback address, kept by
-            # reference instead of dropped.
+            # reference instead of dropped.  A descriptor proves
+            # only that the caller read the digest (the drafts
+            # listing hands it to any remote client), so the route
+            # passes allow_descriptor=false for a non-local client:
+            # only the owner's own console may publish a draft-only
+            # image by reference.  Anyone else must send the bytes.
             from .tangents.tan import image_attachment_from_upload
 
             image_attachment = image_attachment_from_upload(
-                image, Path(self._tan_db_path()).parent
+                image, Path(self._tan_db_path()).parent,
+                allow_descriptor=allow_descriptor,
             )
         cleaned_location = (
             clean_location(location) if location is not None else None
@@ -4086,6 +4093,7 @@ class WebBridge:
         image: Optional[Any] = None,
         location: Optional[Dict[str, Any]] = None,
         contact: Optional[Dict[str, Any]] = None,
+        allow_descriptor: bool = True,
     ) -> Dict[str, Any]:
         """Queue a Tan post for later, like ``tau tan post --delay``.
 
@@ -4098,10 +4106,13 @@ class WebBridge:
         store at schedule time — and rides the queue entry until the
         publish pass attaches it; a ``{sha256, name}`` descriptor
         re-attaches bytes already pinned there instead (a draft image
-        the console could not fetch).  A *location* pin rides the queue
-        entry itself the same way, and the publish pass attaches it.
-        A *contact* card rides the queue entry itself the same way,
-        and the publish pass attaches it.
+        the console could not fetch).  As in :meth:`tan_post`, a
+        descriptor is only accepted from a local client (see
+        *allow_descriptor*): a digest read from the drafts listing
+        is no proof the caller may schedule those bytes.  A *location*
+        pin rides the queue entry itself the same way, and the publish
+        pass attaches it.  A *contact* card rides the queue entry
+        itself the same way, and the publish pass attaches it.
 
         With *kind* ``"repost"`` / ``"quote"`` the entry amplifies
         *target_post* instead: a repost carries no text, a quote
@@ -4199,7 +4210,8 @@ class WebBridge:
             from .tangents.tan import image_attachment_from_upload
 
             image_attachment = image_attachment_from_upload(
-                image, Path(self._tan_db_path()).parent
+                image, Path(self._tan_db_path()).parent,
+                allow_descriptor=allow_descriptor,
             )
         config = self.node.config
         if kind == "repost":
@@ -17017,6 +17029,15 @@ class _WebHandler(BaseHTTPRequestHandler):
                         image=image,
                         location=location,
                         contact=contact,
+                        # A descriptor names bytes the caller may
+                        # never have held — the drafts listing hands
+                        # digests to any remote client — so only a
+                        # local client may publish a draft-only
+                        # image by reference; anyone else must send
+                        # the bytes.  Saving a draft by descriptor
+                        # stays open to remote clients: the draft
+                        # itself never leaves the node.
+                        allow_descriptor=self._is_local_client(),
                     )
                 except (ValueError, ProtocolError) as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
@@ -17285,6 +17306,11 @@ class _WebHandler(BaseHTTPRequestHandler):
                         image=image,
                         location=location,
                         contact=contact,
+                        # Same bar as publishing: only a local
+                        # client may schedule a draft-only image by
+                        # descriptor; a remote client must send the
+                        # bytes.
+                        allow_descriptor=self._is_local_client(),
                     )
                 except (ValueError, ProtocolError) as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)

@@ -1645,7 +1645,7 @@ def image_attachment_from_descriptor(
 
 
 def image_attachment_from_upload(
-    value: Any, data_dir: Union[str, Path]
+    value: Any, data_dir: Union[str, Path], *, allow_descriptor: bool = True
 ) -> Dict[str, Any]:
     """Decode an image upload in either form the console sends.
 
@@ -1653,10 +1653,24 @@ def image_attachment_from_upload(
     draft image the console fetched); a ``{sha256, name}`` descriptor
     re-attaches bytes already pinned in the local media store (a draft
     image the console could not fetch).  Anything else is refused.
+
+    With *allow_descriptor* false, a descriptor is refused outright:
+    a digest proves only that the caller read it somewhere — the
+    drafts listing hands digests to any remote client — so it is no
+    proof the caller may publish those bytes.  Only a client the
+    bridge already treats as local may publish or schedule a
+    draft-only image by reference; anyone else must send the bytes.
+    Saving a draft keeps descriptors allowed (the draft stays local),
+    so only the publish and schedule paths pass false.
     """
     if isinstance(value, str):
         return image_attachment_from_data_url(value, data_dir)
     if isinstance(value, dict):
+        if not allow_descriptor:
+            raise PostError(
+                "a draft image descriptor can only be attached by a "
+                "local client; send the image bytes instead"
+            )
         return image_attachment_from_descriptor(value, data_dir)
     raise PostError("post image must be a base64 data URL or an object with a sha256")
 
