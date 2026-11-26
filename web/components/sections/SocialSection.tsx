@@ -88,6 +88,15 @@ export default function SocialSection() {
     name: string;
     size: number;
   } | null>(null);
+  /** Selection generation for draft loads: each load takes the next
+   *  number, and only the latest load may commit its draft, image,
+   *  thread, and notice — an earlier image fetch that finishes last
+   *  must not replace a newer selection. Leaving or consuming the
+   *  composer invalidates any load still in flight the same way. */
+  const draftLoadGeneration = useRef(0);
+  function invalidateDraftLoad() {
+    draftLoadGeneration.current += 1;
+  }
 
   const feed = useTanFeed({ mode: tab, tag: tagFilter ?? undefined, list: listFilter ?? undefined, pollMs: 30_000 });
   const lists = useTanLists();
@@ -114,6 +123,7 @@ export default function SocialSection() {
   }, [view]);
 
   function openThread(post: TanPost) {
+    invalidateDraftLoad();
     setLoadedDraft(null);
     setLoadedDraftImage(null);
     setThreadHash(post.hash);
@@ -121,6 +131,7 @@ export default function SocialSection() {
   }
 
   function openReply(post: TanPost) {
+    invalidateDraftLoad();
     setLoadedDraft(null);
     setLoadedDraftImage(null);
     setThreadHash(post.hash);
@@ -132,8 +143,12 @@ export default function SocialSection() {
    *  until the composer posts it, so leaving the thread loses nothing.
    *  A draft's image is fetched as a data URL first, so the composer
    *  can re-send it; when its bytes are no longer cached the image is
-   *  dropped and the notice says so, instead of silently losing it. */
+   *  dropped and the notice says so, instead of silently losing it.
+   *  The load claims a selection generation before the fetch and
+   *  commits only if it is still the latest — a slower earlier load
+   *  must not overwrite a newer selection. */
   async function loadDraft(draft: TanDraft) {
+    const generation = ++draftLoadGeneration.current;
     let image: { dataUrl: string; name: string; size: number } | null = null;
     if (draft.image) {
       const dataUrl = await fetchTanImageDataUrl(draft.image.sha256).catch(
@@ -147,6 +162,7 @@ export default function SocialSection() {
         };
       }
     }
+    if (generation !== draftLoadGeneration.current) return;
     setLoadedDraftImage(image);
     setLoadedDraft(draft);
     setReplyTo(null);
@@ -168,6 +184,7 @@ export default function SocialSection() {
   async function consumeLoadedDraft() {
     if (!loadedDraft) return;
     const id = loadedDraft.id;
+    invalidateDraftLoad();
     setLoadedDraft(null);
     setLoadedDraftImage(null);
     await lists.deleteDraft(id);
@@ -185,6 +202,7 @@ export default function SocialSection() {
     const saved = await lists.saveDraft(text, opts);
     if (loadedDraft && loadedDraft.id !== saved.id) {
       const old = loadedDraft;
+      invalidateDraftLoad();
       setLoadedDraft(null);
       setLoadedDraftImage(null);
       await lists.deleteDraft(old.id);
@@ -379,6 +397,7 @@ export default function SocialSection() {
             <button
               type="button"
               onClick={() => {
+                invalidateDraftLoad();
                 setThreadHash(null);
                 setReplyTo(null);
                 setLoadedDraft(null);
