@@ -617,10 +617,11 @@ def test_node_broadcast_beacon_update_fans_out_per_member(tmp_path, monkeypatch)
     assert result["ok"] is True
     assert result["broadcast"] == "family"
     assert result["sent_at"] == NOW
-    assert [leg["to"] for leg in result["results"]] == [
-        peers["alice"].hexhash,
-        peers["bob"].hexhash,
-    ]
+    # Legs follow the list's stored order, and the store keeps members
+    # sorted by hash — not the order they were added in.
+    assert [leg["to"] for leg in result["results"]] == sorted(
+        [peers["alice"].hexhash, peers["bob"].hexhash]
+    )
     assert all(leg["delivered"] for leg in result["results"])
     assert beacon.updates_sent == 1
     assert beacon.next_update_at == NOW + BEACON_UPDATE_INTERVAL
