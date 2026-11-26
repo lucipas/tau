@@ -15976,6 +15976,53 @@ def test_tan_drafts_via_api_carry_attachments(tmp_path):
         bridge.stop()
 
 
+def test_tan_draft_with_large_image_saves(tmp_path):
+    """A draft whose image data URL pushes the body past 32 KiB saves.
+
+    The save route carries a base64 image, so it gets the file body
+    cap like a post does — the ordinary 32 KiB cap would reject the
+    request before the draft handler ever runs.
+    """
+    import base64
+    import hashlib
+
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    node.blocklist = BlockList()
+    identity = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    conn.close()
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        png = b"\x89PNG\r\n\x1a\n" + b"\x00" * (40 * 1024)
+        data_url = (
+            "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+        )
+        assert len(json.dumps({"text": "big pic", "image": data_url})) > 32 * 1024
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/drafts",
+            method="POST",
+            body={"text": "big pic", "image": data_url},
+        )
+        assert status == 200, payload
+        assert payload["draft"]["image"]["sha256"] == hashlib.sha256(png).hexdigest()
+        # The pinned bytes are served back to the owner's console.
+        digest = hashlib.sha256(png).hexdigest()
+        status, _, body = _request(bridge, f"/api/tan/media/{digest}")
+        assert status == 200
+        assert body == png
+    finally:
+        bridge.stop()
+
+
 def test_tan_quote_via_api(tmp_path):
     import RNS
 
@@ -24749,6 +24796,57 @@ def test_tan_media_serves_cached_image(bridge, node, tmp_path):
     status, _, payload = _json(bridge, f"/api/tan/media/{'00' * 32}")
     assert status == 404
     assert "no such cached image" in payload["error"]["message"]
+
+
+def test_tan_media_draft_image_is_loopback_only(bridge, node, tmp_path):
+    """A draft's image is served to the owner's console, not to remotes.
+
+    The digest alone is not authorization: with the draft fallback
+    off — the default, which is what a non-loopback client gets —
+    the bytes are not served, while the owner's console (a loopback
+    client, and the explicit allow_draft call) still loads the draft
+    image back for the composer.  Once the same image is published,
+    it is public again: the gate only ever covers unpublished bytes.
+    """
+    import base64
+    import hashlib
+
+    from tau.tangents.tan import (
+        create_post,
+        image_attachment_from_data_url,
+        init_db,
+        save_draft,
+    )
+
+    _with_config(node, tmp_path)
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+    digest = hashlib.sha256(png).hexdigest()
+    data_url = "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+    conn = init_db(node.config.social_db_path)
+    try:
+        attachment = image_attachment_from_data_url(data_url, tmp_path)
+        save_draft(conn, "draft pic", image=attachment)
+    finally:
+        conn.close()
+    assert bridge.tan_media(digest) is None
+    found = bridge.tan_media(digest, allow_draft=True)
+    assert found is not None
+    assert found[0] == png
+    assert found[1] == "image/png"
+    status, _, body = _request(bridge, f"/api/tan/media/{digest}")
+    assert status == 200
+    assert body == png
+    identity = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        create_post(
+            conn, identity, "pic", name="alice", now=1000, image=attachment
+        )
+    finally:
+        conn.close()
+    found = bridge.tan_media(digest)
+    assert found is not None
+    assert found[0] == png
 
 
 def test_tan_media_fetch_accepts_and_validates(bridge, node, tmp_path):

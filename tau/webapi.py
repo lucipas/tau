@@ -13194,7 +13194,9 @@ class WebBridge:
             return None
         return data, name
 
-    def tan_media(self, sha256: str) -> Optional[Tuple[bytes, str, str]]:
+    def tan_media(
+        self, sha256: str, *, allow_draft: bool = False
+    ) -> Optional[Tuple[bytes, str, str]]:
         """Return ``(bytes, mime, name)`` for a cached Tan image, or ``None``.
 
         The mime and name come from the signed post carrying the
@@ -13202,9 +13204,12 @@ class WebBridge:
         author declared; a digest with no local post falls back to a
         generic name and ``application/octet-stream``.  The bytes are
         re-checked against the digest before serving.  A digest carried
-        only by a saved draft is served the same way, so the owner's
-        console can load the draft's image back for the composer — the
-        peer fetch path still refuses unpublished uploads.
+        only by a saved draft is served the same way, but only when
+        ``allow_draft`` is true: drafts are unpublished, so only the
+        owner's own console — a loopback client — may load a draft's
+        image back for the composer.  A remote client that learned the
+        digest from the drafts listing gets nothing for it; the peer
+        fetch path still refuses unpublished uploads.
         """
         from .tangents.tan import (
             find_draft_by_image,
@@ -13241,7 +13246,9 @@ class WebBridge:
             try:
                 post = find_post_by_image(conn, digest)
                 draft = (
-                    find_draft_by_image(conn, digest) if post is None else None
+                    find_draft_by_image(conn, digest)
+                    if post is None and allow_draft
+                    else None
                 )
             finally:
                 conn.close()
@@ -15302,12 +15309,14 @@ class _WebHandler(BaseHTTPRequestHandler):
             # or a whole signed chain, so each gets a larger body cap than
             # a chat message or a single action.  A quote may carry an
             # image too, immediate or scheduled, so both quote routes
-            # get the file cap as well.
+            # get the file cap as well.  A draft may carry a base64
+            # image too, so its save route gets the file cap as well.
             if path in (
                 "/api/send-file",
                 "/api/groups/send-file",
                 "/api/broadcasts/send-file",
                 "/api/tan/posts",
+                "/api/tan/drafts",
                 "/api/tan/quote",
                 "/api/tan/schedule",
             ):
@@ -18464,9 +18473,14 @@ class _WebHandler(BaseHTTPRequestHandler):
 
         The digest is the address: only a file this node actually
         holds under that digest is ever served, with the mime its
-        signed post declared; anything else is a 404.
+        signed post declared; anything else is a 404.  A digest
+        carried only by an unpublished draft is served to the owner's
+        own console — a loopback client — and to no one else.
         """
-        found = self.bridge.tan_media(sha256)
+        found = self.bridge.tan_media(
+            sha256,
+            allow_draft=_is_loopback_client(self.client_address[0]),
+        )
         if found is None:
             self._send_json(
                 {"error": {"message": "no such cached image"}}, head_only, 404
