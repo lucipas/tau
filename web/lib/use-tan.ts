@@ -79,6 +79,7 @@ import {
   unmuteTanTag,
   unpinTanPost,
   unsaveTanPost,
+  unvoteTanPoll,
   voteTanPoll,
 } from "./api";
 import type {
@@ -122,6 +123,7 @@ export interface UseTanFeedResult {
     opts?: { image?: { dataUrl: string } },
   ) => Promise<ScheduledTanPost>;
   vote: (target: string, option: number) => Promise<void>;
+  unvote: (target: string) => Promise<void>;
   share: (
     target: string,
     dest: { to: string } | { group: string } | { channel: string },
@@ -208,6 +210,7 @@ export function useTanFeed(opts: UseTanFeedOptions = {}): UseTanFeedResult {
       return scheduled;
     },
     vote: (target, option) => mutate(() => voteTanPoll(target, option)),
+    unvote: (target) => mutate(() => unvoteTanPoll(target)),
     share: (target, dest) => mutate(() => shareTanPost(target, dest)),
     save: (target) => mutate(() => saveTanPost(target)),
     unsave: (target) => mutate(() => unsaveTanPost(target)),

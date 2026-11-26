@@ -24,6 +24,7 @@ export type FeedActions = Pick<
   | "scheduleRepost"
   | "scheduleQuote"
   | "vote"
+  | "unvote"
   | "share"
   | "save"
   | "unsave"
@@ -107,6 +108,15 @@ function PollView({ post, actions }: { post: TanPost; actions: FeedActions }) {
         {total} vote{total === 1 ? "" : "s"}
         {closed ? " · poll closed" : voted !== null ? " · you voted" : ""}
       </p>
+      {voted !== null && !closed && (
+        <button
+          type="button"
+          onClick={() => void actions.unvote(post.hash)}
+          className="self-start rounded px-2 py-1 text-xs text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200"
+        >
+          Withdraw vote
+        </button>
+      )}
     </div>
   );
 }

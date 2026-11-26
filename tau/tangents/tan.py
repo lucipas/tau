@@ -222,15 +222,18 @@ KIND_EDIT = "edit"
 KIND_QUOTE = "quote"
 KIND_POLL = "poll"
 KIND_VOTE = "vote"
+KIND_UNVOTE = "unvote"
 KIND_CLOSE = "close"
 REACTION_KINDS = (KIND_LIKE, KIND_UNLIKE)
 # Reactions, deletes and reposts carry no text; replies, edits, quotes
 # and votes carry text but are still targeted entries, so their parent
 # link is signed like a reaction's.  A vote's text is the chosen
-# option's index — the choice is signed with the vote.
-TEXTLESS_KINDS = REACTION_KINDS + (KIND_DELETE, KIND_REPOST, KIND_CLOSE)
+# option's index — the choice is signed with the vote.  An unvote is a
+# textless targeted entry like an unlike: it withdraws the voter's
+# standing vote on the poll it targets.
+TEXTLESS_KINDS = REACTION_KINDS + (KIND_DELETE, KIND_REPOST, KIND_CLOSE, KIND_UNVOTE)
 # Targeted entries (reactions, deletes, replies, edits, quotes,
-# reposts and votes) point at another post.
+# reposts, votes and unvotes) point at another post.
 TARGETED_KINDS = TEXTLESS_KINDS + (KIND_REPLY, KIND_EDIT, KIND_QUOTE, KIND_VOTE)
 ENTRY_KINDS = (KIND_POST, KIND_POLL) + TARGETED_KINDS
 # Kinds that appear as timeline items: top-level posts, replies, reposts,
@@ -2706,6 +2709,77 @@ def create_vote(
     return record
 
 
+def create_unvote(
+    conn: sqlite3.Connection,
+    identity: RNS.Identity,
+    target: str,
+    *,
+    name: str = "anonymous",
+    now: Optional[float] = None,
+    previous: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Create, sign and store an unvote withdrawing a vote on *target*.
+
+    An unvote is a targeted entry like an unlike: ``kind`` is
+    ``"unvote"``, ``target`` is the poll's hash and it carries no text.
+    The unvote is appended to the voter's own chain, exactly like a
+    vote, and is gossipped and synced through the same paths.  Only a
+    cached, linked poll that has not expired or been deleted can be
+    unvoted on — the same guards as voting, so an unvote is cast on a
+    poll the voter has seen in full — and a closed poll refuses it,
+    the same as a late vote.  The tally is last-write-wins per voter
+    (see :func:`vote_states`): an unvote clears the voter's standing
+    vote, and voting again after it re-establishes one.  Unvoting
+    without a standing vote is a no-op in effect, like unliking a post
+    never liked, so no standing-vote check is made here.
+    """
+    target = _require_hex(target, HASH_HEX_LENGTH, "target")
+    timestamp = round(float(now if now is not None else time.time()), 3)
+    author = _author_from_identity(identity)
+    existing = _target_post_or_raise(conn, target, "poll has been deleted")
+    if existing is None:
+        raise TanError(f"unknown post: {target!r}")
+    if existing.get("kind", KIND_POST) != KIND_POLL:
+        raise TanError("only polls can be unvoted on")
+    if not existing.get("linked"):
+        raise TanError(
+            "poll has not linked yet; sync its chain before unvoting"
+        )
+    if _is_deleted(conn, existing):
+        raise TanError("poll has been deleted")
+    if is_expired(existing, now=timestamp):
+        raise TanError("poll has expired")
+    if is_poll_closed(conn, existing):
+        raise TanError("poll is closed")
+    # The head read and the append must be one atomic step: see
+    # _chain_write — two writers racing this window would fork the chain.
+    with _chain_write(conn):
+        prev = previous
+        if prev is None:
+            prev = head(conn, author) or ""
+        prev = prev.strip().lower()
+        if prev:
+            _require_hex(prev, HASH_HEX_LENGTH, "prev")
+
+        body = {
+            "v": TAN_VERSION,
+            "author": author,
+            "key": identity.get_public_key().hex(),
+            "name": sanitize_name(name),
+            "text": "",
+            "created_at": timestamp,
+            "prev": prev,
+            "kind": KIND_UNVOTE,
+            "target": target,
+        }
+        digest = hash(body, previous=prev)
+        mesg = dict(body)
+        mesg["hash"] = digest
+        mesg["sig"] = identity.sign(bytes.fromhex(digest)).hex()
+        record, _ = store_post(conn, mesg, now=timestamp)
+    return record
+
+
 def create_close_poll(
     conn: sqlite3.Connection,
     identity: RNS.Identity,
@@ -2858,7 +2932,9 @@ def vote_states(
 
     Only linked votes count; an orphaned vote starts counting as soon
     as its chain links up.  The latest vote per voter wins, so voting
-    again changes your vote.  A vote whose text is not a plain option
+    again changes your vote.  An unvote is the voter's latest word the
+    same way: it clears their standing vote, and voting again after it
+    re-establishes one.  A vote whose text is not a plain option
     index never reaches the store (see :func:`_normalize_post`), but a
     signed vote can still name an option the poll does not have: such
     a vote stays stored, yet it never replaces a valid standing vote,
@@ -2889,23 +2965,29 @@ def vote_states(
             option_counts[str(row["hash"])] = len(options)
     closed_at = _poll_close_cutoffs(conn, clean)
     rows = conn.execute(
-        "SELECT target, author, text, created_at, expires_at FROM posts "
-        f"WHERE kind = 'vote' AND linked = 1 AND target IN ({placeholders}) "
+        "SELECT target, author, kind, text, created_at, expires_at FROM posts "
+        f"WHERE kind IN ('vote', 'unvote') AND linked = 1 "
+        f"AND target IN ({placeholders}) "
         "ORDER BY target, author, seq ASC",
         clean,
     ).fetchall()
     for row in rows:
-        text = str(row["text"])
-        if not (text.isascii() and text.isdigit()):
-            continue
         if is_expired({"expires_at": row["expires_at"]}):
             # An expired vote no longer stands, and it does not
-            # supersede an earlier live vote by the same voter.
+            # supersede an earlier live vote by the same voter — and
+            # an expired unvote likewise does not withdraw one.
             continue
         cutoff = closed_at.get(str(row["target"]))
         if cutoff is not None and float(row["created_at"]) > cutoff:
             # Cast after the poll's author closed it: never counts,
             # and does not supersede the voter's pre-close vote.
+            continue
+        if str(row["kind"]) == KIND_UNVOTE:
+            # The voter's latest word withdraws their vote.
+            states[str(row["target"])].pop(str(row["author"]), None)
+            continue
+        text = str(row["text"])
+        if not (text.isascii() and text.isdigit()):
             continue
         index = int(text)
         option_count = option_counts.get(str(row["target"]))
@@ -9479,6 +9561,26 @@ class TanApp:
         try:
             record = create_vote(
                 conn, self.identity, target, option, name=self.name
+            )
+        finally:
+            conn.close()
+        if publish and self.node is not None:
+            self.publish(record, targets=targets, ttl=ttl)
+        return record
+
+    def unvote(
+        self,
+        target: str,
+        *,
+        publish: bool = False,
+        targets: Optional[Sequence[Any]] = None,
+        ttl: int = MAX_GOSSIP_TTL,
+    ) -> Dict[str, Any]:
+        """Withdraw a vote on a poll (see :func:`create_unvote`)."""
+        conn = self.connect()
+        try:
+            record = create_unvote(
+                conn, self.identity, target, name=self.name
             )
         finally:
             conn.close()

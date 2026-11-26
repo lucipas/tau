@@ -1414,6 +1414,11 @@ export async function voteTanPoll(target: string, option: number): Promise<unkno
   return post("/api/tan/vote", { target, option });
 }
 
+/** Withdraw your vote on a Tan poll. */
+export async function unvoteTanPoll(target: string): Promise<unknown> {
+  return post("/api/tan/unvote", { target });
+}
+
 export async function createTanPoll(
   question: string,
   options: string[],

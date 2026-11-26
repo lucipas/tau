@@ -80,6 +80,7 @@ import {
   stopBeacon,
   tanMediaUrl,
   unpinChannelMessage,
+  unvoteTanPoll,
   updateBeaconPosition,
   voteChannelPoll,
   voteDmPoll,
@@ -493,6 +494,13 @@ describe("POST endpoints", () => {
     await voteTanPoll("posthash", 2);
     expect(captured[0].url).toBe("/api/tan/vote");
     expect(bodyOf(0)).toEqual({ target: "posthash", option: 2 });
+  });
+
+  it("withdraws a Tan poll vote", async () => {
+    nextJson = { ok: true };
+    await unvoteTanPoll("posthash");
+    expect(captured[0].url).toBe("/api/tan/unvote");
+    expect(bodyOf(0)).toEqual({ target: "posthash" });
   });
 
   it("edits a scheduled Tan post's text and time", async () => {

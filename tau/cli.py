@@ -4362,6 +4362,30 @@ def build_parser() -> argparse.ArgumentParser:
     tan_vote.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
     tan_vote.set_defaults(func=cmd_tan_vote)
 
+    tan_unvote = tan_sub.add_parser(
+        "unvote",
+        parents=[common],
+        help="withdraw your vote on a poll (writes a signed unvote entry to your chain)",
+    )
+    tan_unvote.add_argument(
+        "target", metavar="POLL", help="poll hash or unique hash prefix"
+    )
+    tan_unvote.add_argument(
+        "--to",
+        action="append",
+        default=None,
+        metavar="NAME|HASH",
+        help="publish only to these peers (repeatable)",
+    )
+    tan_unvote.add_argument(
+        "--no-publish",
+        action="store_true",
+        help="store locally without contacting peers",
+    )
+    tan_unvote.add_argument("--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS")
+    tan_unvote.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
+    tan_unvote.set_defaults(func=cmd_tan_unvote)
+
     tan_close_poll = tan_sub.add_parser(
         "close-poll",
         parents=[common],
@@ -8759,6 +8783,79 @@ def cmd_tan_vote(args: argparse.Namespace) -> int:
         _emit({"vote": record, "published": published}, True)
     else:
         print(f"voted for {options[option]!r} on {short_hash(poll['hash'])}")
+        if published is None:
+            print("  stored locally (not published)")
+        else:
+            print(
+                f"  published to {published['delivered']}/{published['peers']} peer(s)"
+            )
+            for error in published["errors"]:
+                print(f"  failed {short_hash(error['peer'])}: {error['error']}")
+    return _EXIT_OK
+
+
+def cmd_tan_unvote(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+
+    conn = init_db(config.social_db_path)
+    try:
+        poll = resolve_post(conn, args.target)
+        if poll.get("kind") != KIND_POLL:
+            print(f"error: {args.target!r} is not a poll", file=sys.stderr)
+            return 2
+    finally:
+        conn.close()
+
+    if getattr(args, "no_publish", False):
+        app = TanApp(config, _tan_identity(config), name=config.name)
+        record = app.unvote(poll["hash"])
+        published = None
+    else:
+        node = TauNode(config, name=config.name)
+        try:
+            node.start(exclusive=True)
+        except InstanceAlreadyRunning:
+            # The serving node owns the data directory: withdraw the
+            # vote locally, then ask the running node to publish it,
+            # the same way publish-draft re-delivers a stored post.
+            from .local_publish import publish_running
+
+            app = TanApp(config, _tan_identity(config), name=config.name)
+            record = app.unvote(poll["hash"])
+            result = publish_running(
+                config.data_dir,
+                post_hash=record["hash"],
+                to=getattr(args, "to", None),
+                ttl=max(0, min(int(getattr(args, "ttl", MAX_GOSSIP_TTL)), MAX_GOSSIP_TTL)),
+                timeout=float(getattr(args, "timeout", 15.0)),
+            )
+            published = result["published"]
+        else:
+            try:
+                app = TanApp(
+                    config,
+                    node.identity,
+                    name=config.name,
+                    request_timeout=float(getattr(args, "timeout", 15.0)),
+                )
+                node.attach_app(app)
+                targets = None
+                if getattr(args, "to", None):
+                    targets = [node.resolve_peer(target) for target in args.to]
+                record = app.unvote(poll["hash"])
+                published = app.publish(
+                    record,
+                    targets=targets,
+                    ttl=max(0, min(int(getattr(args, "ttl", MAX_GOSSIP_TTL)), MAX_GOSSIP_TTL)),
+                )
+            finally:
+                node.stop()
+
+    if json_output:
+        _emit({"unvote": record, "published": published}, True)
+    else:
+        print(f"withdrew your vote on {short_hash(poll['hash'])}")
         if published is None:
             print("  stored locally (not published)")
         else:
