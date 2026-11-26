@@ -1242,9 +1242,7 @@ export interface PublishTanOptions {
   /** Image to attach: fresh bytes as a base64 data URL, or — for a
    *  draft image the console could not fetch — the descriptor of
    *  bytes already pinned in the node's media store, re-attached
-   *  server-side by digest. The descriptor carries the retained file
-   *  name: the server requires a safe name to rebuild the attachment.
-   */
+   *  server-side by digest. */
   image?: { dataUrl?: string; sha256?: string; name?: string };
   /** Place to attach (top-level posts only). */
   location?: LocationPin;
@@ -1253,10 +1251,8 @@ export interface PublishTanOptions {
 }
 
 /** Encode a Tan image option for the wire: fresh bytes ride as the
- *  data URL string, a kept descriptor rides as `{sha256, name}` so
- *  the server re-attaches the pinned bytes by digest — the name is
- *  required, not decorative: the decoder rebuilds the attachment
- *  from it. */
+ *  data URL string, a kept descriptor rides as `{sha256, name}` so the
+ *  server re-attaches the pinned bytes by digest (the name is required). */
 function tanImagePayload(
   image: PublishTanOptions["image"],
 ): string | { sha256: string; name: string } | undefined {
