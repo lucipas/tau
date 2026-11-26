@@ -724,6 +724,36 @@ def _is_loopback_client(client: str) -> bool:
         return False
 
 
+def _parse_trusted_proxies(
+    values: Optional[Collection[str]],
+) -> FrozenSet[Union[ipaddress.IPv4Address, ipaddress.IPv6Address]]:
+    """Normalize configured trusted-proxy addresses.
+
+    Each entry is an IP literal, or ``localhost`` for both loopback
+    addresses. Anything else raises :class:`WebBridgeError` naming the
+    value, so a typo fails at startup instead of silently trusting
+    nothing — or, worse, silently leaving the loopback gate open to a
+    proxy that was meant to be trusted.
+    """
+    proxies: Set[Union[ipaddress.IPv4Address, ipaddress.IPv6Address]] = set()
+    for value in values or ():
+        text = str(value).strip()
+        if not text:
+            raise WebBridgeError("a trusted proxy address must not be blank")
+        if text.lower() == "localhost":
+            proxies.add(ipaddress.ip_address("127.0.0.1"))
+            proxies.add(ipaddress.ip_address("::1"))
+            continue
+        try:
+            proxies.add(ipaddress.ip_address(text))
+        except ValueError:
+            raise WebBridgeError(
+                f"trusted proxy {text!r} is not an IP address "
+                "(use an IP literal, or 'localhost')"
+            ) from None
+    return frozenset(proxies)
+
+
 class EventBus:
     """Fan out events to server-sent-event subscribers with replay."""
 
@@ -1305,6 +1335,7 @@ class WebBridge:
         port: int = DEFAULT_WEB_PORT,
         web_dir: Optional[Path] = None,
         allow_remote: bool = False,
+        trusted_proxies: Optional[Collection[str]] = None,
     ) -> None:
         if not allow_remote and not is_loopback_host(host):
             raise WebBridgeError(
@@ -1316,6 +1347,14 @@ class WebBridge:
         self.port = int(port)
         self.web_dir = Path(web_dir).expanduser().resolve() if web_dir else None
         self.allow_remote = bool(allow_remote)
+        # Reverse proxies that forward to this bridge: only their
+        # X-Forwarded-For is honoured (see
+        # _WebHandler._is_local_client), and only when the proxy is
+        # listed here. Without this, every visitor through a loopback
+        # proxy looks like a loopback client to the owner-only gates
+        # (#821), so a proxy address is trusted only when the operator
+        # names it.
+        self.trusted_proxies = _parse_trusted_proxies(trusted_proxies)
 
         # The bridge owns the console message log, so it observes queued
         # deliveries itself; chain any delivery callback the node already
@@ -13307,10 +13346,11 @@ class WebBridge:
         re-checked against the digest before serving.  A digest carried
         only by a saved draft is served the same way, but only when
         ``allow_draft`` is true: drafts are unpublished, so only the
-        owner's own console — a loopback client — may load a draft's
-        image back for the composer.  A remote client that learned the
-        digest from the drafts listing gets nothing for it; the peer
-        fetch path still refuses unpublished uploads.
+        owner's own console — a local client, resolved through a
+        trusted proxy's X-Forwarded-For when one is configured — may
+        load a draft's image back for the composer.  A remote client
+        that learned the digest from the drafts listing gets nothing
+        for it; the peer fetch path still refuses unpublished uploads.
         """
         from .tangents.tan import (
             find_draft_by_image,
@@ -14357,6 +14397,50 @@ class _WebHandler(BaseHTTPRequestHandler):
     def bridge(self) -> WebBridge:
         return self.server.bridge
 
+    def _is_local_client(self) -> bool:
+        """True when the request comes from the owner's own console.
+
+        The socket peer is the client — unless it is a configured
+        trusted proxy that sent an ``X-Forwarded-For`` header, in
+        which case the real client is the last address of the last
+        field, in wire order: the hop the proxy appended, since a
+        visitor can prepend anything to the left of it — including a
+        whole spoofed first field when the proxy appends a second one
+        instead of extending the first. A present-but-empty header
+        fails closed, and an untrusted peer's forwarding header is
+        ignored entirely, so a spoofed header buys nothing.
+
+        A trusted peer with no forwarding header is the owner's own
+        console connecting directly: a correctly configured proxy
+        always sends the header, and a loopback peer with none is
+        indistinguishable from the owner, so it stays local. (That is
+        also why the flag's docs require the proxy to send the header:
+        a proxy that strips it leaves its visitors looking like the
+        owner.) Without a trusted proxy configured, a loopback reverse
+        proxy still looks like a loopback client — that is the hole
+        #821 closes only once the operator names the proxy with
+        ``--http-trusted-proxy``.
+        """
+        peer = self.client_address[0]
+        try:
+            peer_ip = ipaddress.ip_address(peer)
+        except ValueError:
+            return False
+        if peer_ip in self.bridge.trusted_proxies:
+            fields = self.headers.get_all("X-Forwarded-For") or []
+            if not fields:
+                return _is_loopback_client(peer)
+            values = [
+                part.strip()
+                for field in fields
+                for part in field.split(",")
+                if part.strip()
+            ]
+            if not values:
+                return False
+            return _is_loopback_client(values[-1])
+        return _is_loopback_client(peer)
+
     def log_message(self, fmt: str, *args: Any) -> None:  # noqa: A003
         log.debug("web %s - %s", self.address_string(), fmt % args)
 
@@ -14426,18 +14510,14 @@ class _WebHandler(BaseHTTPRequestHandler):
             if path == "/api/status":
                 self._send_json(
                     self.bridge.snapshot(
-                        include_notes=_is_loopback_client(
-                            self.client_address[0]
-                        )
+                        include_notes=self._is_local_client()
                     ),
                     head_only,
                 )
                 return
             if path == "/api/peers":
                 peers = self.bridge.peers(
-                    include_notes=_is_loopback_client(
-                        self.client_address[0]
-                    )
+                    include_notes=self._is_local_client()
                 )
                 self._send_json({"peers": peers, "count": len(peers)}, head_only)
                 return
@@ -14458,7 +14538,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                 # alone cannot redeem a bundle — but the offers and the
                 # pairing itself are owner-only state, so this stays
                 # loopback-only like the bundle download.
-                if not _is_loopback_client(self.client_address[0]):
+                if not self._is_local_client():
                     self._send_error(
                         HTTPStatus.FORBIDDEN,
                         "linked devices are only available from localhost",
@@ -14615,7 +14695,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                 # The full map names every locally configured conversation,
                 # including peers absent from the registry, so it goes
                 # only to the local machine, like the messages export.
-                if not _is_loopback_client(self.client_address[0]):
+                if not self._is_local_client():
                     self._send_json(
                         {
                             "error": {
@@ -14639,7 +14719,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                 # client gets only the conversations its console lists.
                 # Mutes stay settable from any client, so the console
                 # can always show and undo them.
-                visible_only = not _is_loopback_client(self.client_address[0])
+                visible_only = not self._is_local_client()
                 try:
                     result = self.bridge.muted_conversations(
                         visible_only=visible_only
@@ -14668,7 +14748,7 @@ class _WebHandler(BaseHTTPRequestHandler):
             if path == "/api/messages/export":
                 # The full inbox backup goes only to the local machine,
                 # even when the bridge is bound to a remote interface.
-                if not _is_loopback_client(self.client_address[0]):
+                if not self._is_local_client():
                     self._send_json(
                         {
                             "error": {
@@ -14761,7 +14841,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                 # The archive holds the node identity and peers.json —
                 # which now stores private peer notes — so it goes only
                 # to the local machine, like the messages export.
-                if not _is_loopback_client(self.client_address[0]):
+                if not self._is_local_client():
                     self._send_error(
                         HTTPStatus.FORBIDDEN,
                         "backup downloads are only available from localhost",
@@ -14790,7 +14870,7 @@ class _WebHandler(BaseHTTPRequestHandler):
             if path.startswith("/api/devices/bundle/"):
                 # A pairing bundle holds the private identity: it goes
                 # only to the local machine, like the backup archive.
-                if not _is_loopback_client(self.client_address[0]):
+                if not self._is_local_client():
                     self._send_error(
                         HTTPStatus.FORBIDDEN,
                         "pairing bundles are only available from localhost",
@@ -15373,9 +15453,7 @@ class _WebHandler(BaseHTTPRequestHandler):
             # Bulk imports write many entries with no per-request quota, so
             # they are accepted only from the local machine, even when the
             # bridge is bound to a remote interface.
-            if path == "/api/messages/import" and not _is_loopback_client(
-                self.client_address[0]
-            ):
+            if path == "/api/messages/import" and not self._is_local_client():
                 self._send_json(
                     {
                         "error": {
@@ -15386,9 +15464,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                     403,
                 )
                 return
-            if path == "/api/tan/import" and not _is_loopback_client(
-                self.client_address[0]
-            ):
+            if path == "/api/tan/import" and not self._is_local_client():
                 self._send_json(
                     {"error": {"message": "tan import is only accepted from localhost"}},
                     head_only,
@@ -15396,7 +15472,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                 )
                 return
             if path == "/api/bundle/import":
-                if not _is_loopback_client(self.client_address[0]):
+                if not self._is_local_client():
                     self._send_json(
                         {"error": {"message": "bundle import is only accepted from localhost"}},
                         head_only,
@@ -15893,7 +15969,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                 # Minting a bundle hands out the private identity, so
                 # only the local machine may do it — like the backup
                 # and private-note endpoints.
-                if not _is_loopback_client(self.client_address[0]):
+                if not self._is_local_client():
                     self._send_json(
                         {
                             "error": {
@@ -15949,7 +16025,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                 self._send_json({"ok": True, **result}, head_only)
                 return
             if path == "/api/devices/revoke":
-                if not _is_loopback_client(self.client_address[0]):
+                if not self._is_local_client():
                     self._send_json(
                         {
                             "error": {
@@ -16684,7 +16760,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                 # The result names the archive, node and destination —
                 # and the archive holds the node identity — so it goes
                 # only to the local machine, like the backup download.
-                if not _is_loopback_client(self.client_address[0]):
+                if not self._is_local_client():
                     self._send_json(
                         {
                             "error": {
@@ -16765,7 +16841,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                 # opened without authentication, so only the local
                 # machine may write them — like the backup/export
                 # endpoints, which are loopback-only for the same reason.
-                if not _is_loopback_client(self.client_address[0]):
+                if not self._is_local_client():
                     self._send_json(
                         {
                             "error": {
@@ -18576,11 +18652,13 @@ class _WebHandler(BaseHTTPRequestHandler):
         holds under that digest is ever served, with the mime its
         signed post declared; anything else is a 404.  A digest
         carried only by an unpublished draft is served to the owner's
-        own console — a loopback client — and to no one else.
+        own console — a local client, resolved through a trusted
+        proxy's X-Forwarded-For when one is configured — and to no
+        one else.
         """
         found = self.bridge.tan_media(
             sha256,
-            allow_draft=_is_loopback_client(self.client_address[0]),
+            allow_draft=self._is_local_client(),
         )
         if found is None:
             self._send_json(
@@ -20045,9 +20123,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                     # live stream gets a snapshot without them, like the
                     # GET /api/status listing.
                     "snapshot": self.bridge.snapshot(
-                        include_notes=_is_loopback_client(
-                            self.client_address[0]
-                        )
+                        include_notes=self._is_local_client()
                     ),
                 }
             ):
@@ -20112,9 +20188,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                     # Notes are owner-only: see the WebSocket snapshot
                     # above — a remote console gets none here either.
                     "snapshot": self.bridge.snapshot(
-                        include_notes=_is_loopback_client(
-                            self.client_address[0]
-                        )
+                        include_notes=self._is_local_client()
                     )
                 },
             )

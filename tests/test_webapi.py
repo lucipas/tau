@@ -1070,6 +1070,34 @@ def bridge(node, tmp_path):
         bridge.stop()
 
 
+@pytest.fixture()
+def proxied_bridge(node, tmp_path):
+    """A bridge behind a loopback reverse proxy that is trusted.
+
+    The test client always connects from 127.0.0.1, exactly like a
+    reverse proxy forwarding to the bridge over loopback — so the
+    socket peer is loopback and only the trusted proxy's
+    X-Forwarded-For decides whether the request is local.
+    """
+    web_dir = tmp_path / "proxied-out"
+    web_dir.mkdir()
+    (web_dir / "index.html").write_text("<html>tau console</html>", encoding="utf-8")
+    (web_dir / "assets").mkdir()
+    (web_dir / "assets" / "app.js").write_text("console.log('tau')", encoding="utf-8")
+    bridge = WebBridge(
+        node,
+        host="127.0.0.1",
+        port=0,
+        web_dir=web_dir,
+        trusted_proxies=["127.0.0.1"],
+    )
+    bridge.start()
+    try:
+        yield bridge
+    finally:
+        bridge.stop()
+
+
 def _request(bridge, path, *, method="GET", body=None, raw=None, headers=None):
     url = f"http://127.0.0.1:{bridge.port}{path}"
     data = None
@@ -1086,6 +1114,25 @@ def _request(bridge, path, *, method="GET", body=None, raw=None, headers=None):
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     with opener.open(request, timeout=5) as response:
         return response.status, dict(response.headers), response.read()
+
+
+def _request_headers(bridge, path, header_pairs):
+    """One GET with repeated headers, in wire order.
+
+    urllib cannot send two fields with the same name, so this uses
+    http.client directly — the multi-field X-Forwarded-For spoof case
+    needs a visitor-supplied first field and the proxy's second one.
+    """
+    conn = http.client.HTTPConnection("127.0.0.1", bridge.port, timeout=5)
+    try:
+        conn.putrequest("GET", path)
+        for name, value in header_pairs:
+            conn.putheader(name, value)
+        conn.endheaders()
+        response = conn.getresponse()
+        return response.status, response.read()
+    finally:
+        conn.close()
 
 
 def _json(bridge, path, **kwargs):
@@ -13624,6 +13671,43 @@ def test_is_loopback_client():
     assert _is_loopback_client("not an address") is False
 
 
+def test_parse_trusted_proxies():
+    import ipaddress
+
+    from tau.webapi import WebBridgeError, _parse_trusted_proxies
+
+    assert _parse_trusted_proxies(None) == frozenset()
+    assert _parse_trusted_proxies([]) == frozenset()
+    assert _parse_trusted_proxies(["127.0.0.1"]) == frozenset(
+        [ipaddress.ip_address("127.0.0.1")]
+    )
+    assert _parse_trusted_proxies(["localhost"]) == frozenset(
+        [ipaddress.ip_address("127.0.0.1"), ipaddress.ip_address("::1")]
+    )
+    assert _parse_trusted_proxies(["  203.0.113.7 "]) == frozenset(
+        [ipaddress.ip_address("203.0.113.7")]
+    )
+    with pytest.raises(WebBridgeError, match="not an IP address"):
+        _parse_trusted_proxies(["proxy.example"])
+    with pytest.raises(WebBridgeError, match="must not be blank"):
+        _parse_trusted_proxies(["  "])
+
+
+def test_trusted_proxy_value_rejected_at_startup(node, tmp_path):
+    from tau.webapi import WebBridge, WebBridgeError
+
+    web_dir = tmp_path / "out"
+    web_dir.mkdir()
+    with pytest.raises(WebBridgeError, match="not an IP address"):
+        WebBridge(
+            node,
+            host="127.0.0.1",
+            port=0,
+            web_dir=web_dir,
+            trusted_proxies=["not-an-ip"],
+        )
+
+
 def test_tan_likers_caps_at_max_likers(tmp_path, monkeypatch):
     import tau.webapi
 
@@ -25085,6 +25169,166 @@ def test_tan_media_draft_image_is_loopback_only(bridge, node, tmp_path):
     found = bridge.tan_media(digest)
     assert found is not None
     assert found[0] == png
+
+
+def test_trusted_proxy_forwarded_for_gates_owner_data(bridge, proxied_bridge):
+    """A proxied visitor stops looking like the local console (#821).
+
+    The test client always connects from 127.0.0.1, like a reverse
+    proxy forwarding to the bridge over loopback. Without a trusted
+    proxy the forwarded header is ignored — the socket peer is the
+    client, as before. Once the loopback proxy is trusted, the gate
+    reads the real client from X-Forwarded-For: a remote visitor gets
+    the remote answer (403 on the export), the owner on loopback keeps
+    the local one, a headerless loopback peer is the owner's direct
+    console (a proxy always sends the header), and a spoofed loopback
+    entry to the left of the proxy's own hop buys nothing — only the
+    last address of the last field counts, even across fields.
+    """
+    # No trusted proxy: the header is ignored, the loopback peer wins.
+    status, _, _ = _json(
+        bridge, "/api/messages/export", headers={"X-Forwarded-For": "203.0.113.7"}
+    )
+    assert status == 200
+
+    # Trusted proxy, remote visitor: owner-only data is refused.
+    status, _, _ = _json(
+        proxied_bridge,
+        "/api/messages/export",
+        headers={"X-Forwarded-For": "203.0.113.7"},
+    )
+    assert status == 403
+
+    # Trusted proxy, owner on loopback: still local.
+    status, _, _ = _json(
+        proxied_bridge,
+        "/api/messages/export",
+        headers={"X-Forwarded-For": "127.0.0.1"},
+    )
+    assert status == 200
+
+    # Trusted proxy, no forwarding header: the owner's direct console.
+    status, _, _ = _json(proxied_bridge, "/api/messages/export")
+    assert status == 200
+
+    # Spoofed loopback entry to the left of the proxy's hop: the last
+    # entry is the real client, so this is still a remote visitor.
+    status, _, _ = _json(
+        proxied_bridge,
+        "/api/messages/export",
+        headers={"X-Forwarded-For": "127.0.0.1, 203.0.113.7"},
+    )
+    assert status == 403
+
+    # Spoofed first field, proxy's hop in a second field: the final
+    # field's final address is the real client (Qodo Critical on #837).
+    status, _ = _request_headers(
+        proxied_bridge,
+        "/api/messages/export",
+        [
+            ("X-Forwarded-For", "127.0.0.1"),
+            ("X-Forwarded-For", "203.0.113.7"),
+        ],
+    )
+    assert status == 403
+
+    # A present-but-empty header names no client: fails closed.
+    status, _ = _request_headers(
+        proxied_bridge, "/api/messages/export", [("X-Forwarded-For", "")]
+    )
+    assert status == 403
+
+
+def test_trusted_proxy_appended_forwarded_field_wins(proxied_bridge):
+    """A visitor's first X-Forwarded-For field cannot spoof loopback.
+
+    The proxy appends a second X-Forwarded-For field instead of
+    extending the first; the last value of the last field is the real
+    client, so a remote visitor stays remote (#821).
+    """
+    import http.client
+
+    conn = http.client.HTTPConnection("127.0.0.1", proxied_bridge.port, timeout=5)
+    try:
+        conn.putrequest("GET", "/api/messages/export")
+        conn.putheader("X-Forwarded-For", "127.0.0.1")
+        conn.putheader("X-Forwarded-For", "203.0.113.7")
+        conn.endheaders()
+        response = conn.getresponse()
+        response.read()
+        assert response.status == 403
+    finally:
+        conn.close()
+
+
+def test_trusted_proxy_draft_media(proxied_bridge, bridge, node, tmp_path):
+    """A draft's image stays private behind a trusted proxy (#821).
+
+    Same setup as test_tan_media_draft_image_is_loopback_only, but
+    the request arrives through a loopback proxy: without the trust
+    the digest serves (the hole), with the trust and a remote
+    X-Forwarded-For it 404s, and with a loopback X-Forwarded-For the
+    owner's console still loads the draft image.
+    """
+    import base64
+    import hashlib
+
+    from tau.tangents.tan import (
+        image_attachment_from_data_url,
+        init_db,
+        save_draft,
+    )
+
+    _with_config(node, tmp_path)
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+    digest = hashlib.sha256(png).hexdigest()
+    data_url = "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+    conn = init_db(node.config.social_db_path)
+    try:
+        attachment = image_attachment_from_data_url(data_url, tmp_path)
+        save_draft(conn, "draft pic", image=attachment)
+    finally:
+        conn.close()
+
+    # The hole: no trusted proxy, the proxied visitor reads the draft.
+    status, _, body = _request(bridge, f"/api/tan/media/{digest}")
+    assert status == 200
+    assert body == png
+
+    # Trusted proxy, remote visitor: the draft's bytes are not served.
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        _request(
+            proxied_bridge,
+            f"/api/tan/media/{digest}",
+            headers={"X-Forwarded-For": "203.0.113.7"},
+        )
+    assert excinfo.value.code == 404
+
+    # Spoofed first field, proxy's hop in a second field: still remote.
+    status, _ = _request_headers(
+        proxied_bridge,
+        f"/api/tan/media/{digest}",
+        [
+            ("X-Forwarded-For", "127.0.0.1"),
+            ("X-Forwarded-For", "203.0.113.7"),
+        ],
+    )
+    assert status == 404
+
+    # Trusted proxy, no header: the owner's direct console still loads
+    # it — a proxy always sends the header.
+    status, _, body = _request(proxied_bridge, f"/api/tan/media/{digest}")
+    assert status == 200
+    assert body == png
+
+    # Trusted proxy, owner on loopback: the composer still loads it.
+    status, _, body = _request(
+        proxied_bridge,
+        f"/api/tan/media/{digest}",
+        headers={"X-Forwarded-For": "127.0.0.1"},
+    )
+    assert status == 200
+    assert body == png
 
 
 def test_tan_save_draft_reattaches_image_by_descriptor(bridge, node, tmp_path):
