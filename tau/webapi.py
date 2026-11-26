@@ -14401,15 +14401,25 @@ class _WebHandler(BaseHTTPRequestHandler):
         """True when the request comes from the owner's own console.
 
         The socket peer is the client — unless it is a configured
-        trusted proxy, in which case the real client is the last entry
-        of ``X-Forwarded-For``: the hop the proxy appended, since a
-        visitor can prepend anything to the left of it. A trusted proxy
-        that sends no forwarding header hides the real client, so it
-        fails closed; an untrusted peer's forwarding header is ignored
-        entirely, so a spoofed header buys nothing. Without a trusted
-        proxy configured, a loopback reverse proxy still looks like a
-        loopback client — that is the hole #821 closes only once the
-        operator names the proxy with ``--http-trusted-proxy``.
+        trusted proxy that sent an ``X-Forwarded-For`` header, in
+        which case the real client is the last address of the last
+        field, in wire order: the hop the proxy appended, since a
+        visitor can prepend anything to the left of it — including a
+        whole spoofed first field when the proxy appends a second one
+        instead of extending the first. A present-but-empty header
+        fails closed, and an untrusted peer's forwarding header is
+        ignored entirely, so a spoofed header buys nothing.
+
+        A trusted peer with no forwarding header is the owner's own
+        console connecting directly: a correctly configured proxy
+        always sends the header, and a loopback peer with none is
+        indistinguishable from the owner, so it stays local. (That is
+        also why the flag's docs require the proxy to send the header:
+        a proxy that strips it leaves its visitors looking like the
+        owner.) Without a trusted proxy configured, a loopback reverse
+        proxy still looks like a loopback client — that is the hole
+        #821 closes only once the operator names the proxy with
+        ``--http-trusted-proxy``.
         """
         peer = self.client_address[0]
         try:
@@ -14417,11 +14427,18 @@ class _WebHandler(BaseHTTPRequestHandler):
         except ValueError:
             return False
         if peer_ip in self.bridge.trusted_proxies:
-            forwarded = self.headers.get("X-Forwarded-For")
-            if forwarded is None:
+            fields = self.headers.get_all("X-Forwarded-For") or []
+            if not fields:
+                return _is_loopback_client(peer)
+            values = [
+                part.strip()
+                for field in fields
+                for part in field.split(",")
+                if part.strip()
+            ]
+            if not values:
                 return False
-            client = forwarded.split(",")[-1].strip()
-            return _is_loopback_client(client)
+            return _is_loopback_client(values[-1])
         return _is_loopback_client(peer)
 
     def log_message(self, fmt: str, *args: Any) -> None:  # noqa: A003

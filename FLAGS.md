@@ -159,7 +159,9 @@ tau serve --http
 tau serve --http 0.0.0.0:8787 --http-allow-remote
 
 # Serve behind a reverse proxy on loopback: trust its X-Forwarded-For
-# so proxied visitors stop looking like the local console
+# so proxied visitors stop looking like the local console (the proxy
+# must send X-Forwarded-For; a loopback client with no header is the
+# owner's direct console and stays local)
 tau serve --http --http-trusted-proxy 127.0.0.1
 
 # Enable the social feed and refresh it every minute

@@ -1116,6 +1116,25 @@ def _request(bridge, path, *, method="GET", body=None, raw=None, headers=None):
         return response.status, dict(response.headers), response.read()
 
 
+def _request_headers(bridge, path, header_pairs):
+    """One GET with repeated headers, in wire order.
+
+    urllib cannot send two fields with the same name, so this uses
+    http.client directly — the multi-field X-Forwarded-For spoof case
+    needs a visitor-supplied first field and the proxy's second one.
+    """
+    conn = http.client.HTTPConnection("127.0.0.1", bridge.port, timeout=5)
+    try:
+        conn.putrequest("GET", path)
+        for name, value in header_pairs:
+            conn.putheader(name, value)
+        conn.endheaders()
+        response = conn.getresponse()
+        return response.status, response.read()
+    finally:
+        conn.close()
+
+
 def _json(bridge, path, **kwargs):
     try:
         status, headers, body = _request(bridge, path, **kwargs)
@@ -25161,9 +25180,10 @@ def test_trusted_proxy_forwarded_for_gates_owner_data(bridge, proxied_bridge):
     client, as before. Once the loopback proxy is trusted, the gate
     reads the real client from X-Forwarded-For: a remote visitor gets
     the remote answer (403 on the export), the owner on loopback keeps
-    the local one, a proxy that sends no header fails closed, and a
-    spoofed loopback entry to the left of the proxy's own hop buys
-    nothing — only the last entry counts.
+    the local one, a headerless loopback peer is the owner's direct
+    console (a proxy always sends the header), and a spoofed loopback
+    entry to the left of the proxy's own hop buys nothing — only the
+    last address of the last field counts, even across fields.
     """
     # No trusted proxy: the header is ignored, the loopback peer wins.
     status, _, _ = _json(
@@ -25187,9 +25207,9 @@ def test_trusted_proxy_forwarded_for_gates_owner_data(bridge, proxied_bridge):
     )
     assert status == 200
 
-    # Trusted proxy, no forwarding header: fails closed.
+    # Trusted proxy, no forwarding header: the owner's direct console.
     status, _, _ = _json(proxied_bridge, "/api/messages/export")
-    assert status == 403
+    assert status == 200
 
     # Spoofed loopback entry to the left of the proxy's hop: the last
     # entry is the real client, so this is still a remote visitor.
@@ -25197,6 +25217,24 @@ def test_trusted_proxy_forwarded_for_gates_owner_data(bridge, proxied_bridge):
         proxied_bridge,
         "/api/messages/export",
         headers={"X-Forwarded-For": "127.0.0.1, 203.0.113.7"},
+    )
+    assert status == 403
+
+    # Spoofed first field, proxy's hop in a second field: the final
+    # field's final address is the real client (Qodo Critical on #837).
+    status, _ = _request_headers(
+        proxied_bridge,
+        "/api/messages/export",
+        [
+            ("X-Forwarded-For", "127.0.0.1"),
+            ("X-Forwarded-For", "203.0.113.7"),
+        ],
+    )
+    assert status == 403
+
+    # A present-but-empty header names no client: fails closed.
+    status, _ = _request_headers(
+        proxied_bridge, "/api/messages/export", [("X-Forwarded-For", "")]
     )
     assert status == 403
 
@@ -25244,10 +25282,22 @@ def test_trusted_proxy_draft_media(proxied_bridge, bridge, node, tmp_path):
         )
     assert excinfo.value.code == 404
 
-    # Trusted proxy, no header: fails closed too.
-    with pytest.raises(urllib.error.HTTPError) as excinfo:
-        _request(proxied_bridge, f"/api/tan/media/{digest}")
-    assert excinfo.value.code == 404
+    # Spoofed first field, proxy's hop in a second field: still remote.
+    status, _ = _request_headers(
+        proxied_bridge,
+        f"/api/tan/media/{digest}",
+        [
+            ("X-Forwarded-For", "127.0.0.1"),
+            ("X-Forwarded-For", "203.0.113.7"),
+        ],
+    )
+    assert status == 404
+
+    # Trusted proxy, no header: the owner's direct console still loads
+    # it — a proxy always sends the header.
+    status, _, body = _request(proxied_bridge, f"/api/tan/media/{digest}")
+    assert status == 200
+    assert body == png
 
     # Trusted proxy, owner on loopback: the composer still loads it.
     status, _, body = _request(

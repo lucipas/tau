@@ -234,10 +234,12 @@ client being loopback — and a reverse proxy forwarding to the bridge over
 loopback makes every visitor look loopback. If you put a proxy in front,
 name it with `--http-trusted-proxy <proxy-ip>` (repeatable): the gate then
 reads the real client from the proxy's `X-Forwarded-For` header instead of
-the proxy's address, and a proxy that sends no forwarding header fails
-closed. Use `--web-dir` or `TAU_WEB_DIR` to serve a different build, and
-`make web-dev` for the Next.js dev server on port 3000 (the console
-automatically talks to the bridge on port 8787).
+the proxy's address. The proxy must send that header — a loopback client
+with no forwarding header is the owner's own console connecting directly,
+so it keeps its owner-only data, and a proxy that strips the header leaves
+its visitors looking like the owner. Use `--web-dir` or `TAU_WEB_DIR` to serve a
+different build, and `make web-dev` for the Next.js dev server on port 3000
+(the console automatically talks to the bridge on port 8787).
 
 ## Social feed: Tan
 

@@ -627,7 +627,9 @@ def build_parser() -> argparse.ArgumentParser:
             "(repeatable; the loopback gate then reads the real client "
             "from the forwarded header instead of the proxy, so a "
             "visitor through the proxy no longer looks like the local "
-            "console)"
+            "console — the proxy must send X-Forwarded-For, since a "
+            "loopback client with no forwarding header is the owner's "
+            "direct console)"
         ),
     )
     serve.add_argument(
