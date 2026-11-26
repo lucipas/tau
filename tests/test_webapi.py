@@ -25423,6 +25423,148 @@ def test_tan_save_draft_reattaches_image_by_descriptor(bridge, node, tmp_path):
     assert status == 400
 
 
+def test_image_attachment_from_upload_refuses_descriptor_when_remote(tmp_path):
+    """A descriptor is refused when the caller may not use one (#836).
+
+    The upload helper is the single choke point for descriptor
+    images: with ``allow_descriptor`` false, a ``{sha256, name}``
+    descriptor is refused before the store is even consulted, while a
+    data URL carrying fresh bytes still decodes.
+    """
+    import base64
+    import hashlib
+
+    import pytest
+
+    from tau.tangents.tan import PostError, image_attachment_from_upload
+
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+    digest = hashlib.sha256(png).hexdigest()
+    data_url = "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+    image_attachment_from_upload(data_url, tmp_path)
+    with pytest.raises(PostError, match="local client"):
+        image_attachment_from_upload(
+            {"sha256": digest, "name": "pic.png"},
+            tmp_path,
+            allow_descriptor=False,
+        )
+    rebuilt = image_attachment_from_upload(
+        data_url, tmp_path, allow_descriptor=False
+    )
+    assert rebuilt == {
+        "sha256": digest,
+        "size": len(png),
+        "mime": "image/png",
+        "name": "image.png",
+    }
+
+
+def test_remote_client_cannot_publish_draft_image_by_descriptor(
+    proxied_bridge, node, tmp_path
+):
+    """A remote client cannot publish a private draft photo by digest (#836).
+
+    The drafts listing hands a draft image's digest and name to any
+    remote client, so a descriptor is no proof the caller may publish
+    those bytes: only a local client may attach a draft-only image by
+    reference when publishing or scheduling.  A remote client that
+    holds the bytes can still publish them, and saving a draft by
+    descriptor still works — the draft itself never leaves the node.
+    """
+    import base64
+    import hashlib
+
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import (
+        TanApp,
+        image_attachment_from_data_url,
+        init_db,
+        save_draft,
+    )
+
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+        digest = hashlib.sha256(png).hexdigest()
+        attachment = image_attachment_from_data_url(
+            "data:image/png;base64," + base64.b64encode(png).decode("ascii"),
+            tmp_path,
+        )
+        save_draft(conn, "draft pic", image=attachment)
+    finally:
+        conn.close()
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+
+    descriptor = {"sha256": digest, "name": "pic.png"}
+    remote = {"X-Forwarded-For": "203.0.113.7"}
+
+    # The attack from the issue: digest + name from the drafts
+    # listing, submitted to /api/tan/posts by a remote client.
+    status, _, payload = _json(
+        proxied_bridge,
+        "/api/tan/posts",
+        method="POST",
+        body={"text": "stolen pic", "image": descriptor},
+        headers=remote,
+    )
+    assert status == 400
+    assert "local client" in payload["error"]["message"]
+    # Nothing was published.
+    status, _, payload = _json(proxied_bridge, "/api/tan/timeline?all=1")
+    assert status == 200
+    assert payload["posts"] == []
+
+    # Scheduling the same descriptor remotely is refused the same way.
+    status, _, payload = _json(
+        proxied_bridge,
+        "/api/tan/schedule",
+        method="POST",
+        body={"text": "stolen later", "image": descriptor, "send_in": 3600},
+        headers=remote,
+    )
+    assert status == 400
+    assert "local client" in payload["error"]["message"]
+
+    # A remote client that holds the bytes can still publish them.
+    data_url = "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+    status, _, payload = _json(
+        proxied_bridge,
+        "/api/tan/posts",
+        method="POST",
+        body={"text": "my own pic", "image": data_url},
+        headers=remote,
+    )
+    assert status == 200
+    assert payload["post"]["image"]["sha256"] == digest
+
+    # The owner's own console — local, through the trusted proxy —
+    # can still publish the draft image by descriptor.
+    status, _, payload = _json(
+        proxied_bridge,
+        "/api/tan/posts",
+        method="POST",
+        body={"text": "draft pic", "image": descriptor},
+    )
+    assert status == 200
+    assert payload["post"]["image"]["sha256"] == digest
+
+    # And a remote console can still save a draft by descriptor: the
+    # draft stays on the node, nothing is broadcast.
+    status, _, payload = _json(
+        proxied_bridge,
+        "/api/tan/drafts",
+        method="POST",
+        body={"text": "remote re-save", "image": descriptor},
+        headers=remote,
+    )
+    assert status == 200
+    assert payload["draft"]["image"]["sha256"] == digest
+
+
 def test_tan_media_fetch_accepts_and_validates(bridge, node, tmp_path):
     _with_config(node, tmp_path)
     digest = "ab" * 32
