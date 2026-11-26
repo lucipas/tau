@@ -6,6 +6,7 @@ import time
 import pytest
 import RNS
 
+from tau.beacons import BEACON_MAX_DURATION
 from tau.blocklist import BlockList, save_blocklist
 from tau.channels import (
     CHANNEL_EXPORT_FORMAT,
@@ -205,6 +206,21 @@ def test_create_message_refuses_malformed_beacon(identities, tmp_path):
         create_message(
             conn, alice, "general", "Rock Springs Park",
             name="alice", now=1000, location=BEACON_PIN, beacon={"id": "x"},
+        )
+
+
+def test_create_message_refuses_overlong_beacon(identities, tmp_path):
+    # A marker that claims to stay live longer than any beacon can
+    # run is refused on a local send, mirroring the receive-path
+    # drop — a local send never posts a pin that renders live
+    # indefinitely.
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    overlong = dict(BEACON_MARKER, expires_at=1000 + BEACON_MAX_DURATION + 1)
+    with pytest.raises(ChannelError):
+        create_message(
+            conn, alice, "general", "Rock Springs Park",
+            name="alice", now=1000, location=BEACON_PIN, beacon=overlong,
         )
 
 
