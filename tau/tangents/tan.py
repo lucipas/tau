@@ -1582,6 +1582,79 @@ def image_attachment_from_data_url(
     return {"sha256": digest, "size": len(data), "mime": mime, "name": f"image.{ext}"}
 
 
+def image_attachment_from_descriptor(
+    value: Any, data_dir: Union[str, Path]
+) -> Dict[str, Any]:
+    """Re-attach an image the caller already holds by digest.
+
+    A console that loaded a draft over a non-loopback address cannot
+    fetch the draft image's bytes (the media endpoint serves an
+    unpublished draft's bytes to loopback clients only), so it re-sends
+    the descriptor it kept instead of the bytes.  The bytes must still
+    be in the local media store: the digest is looked up there and the
+    stored bytes are re-checked (size and magic bytes), so a stale
+    descriptor for pruned or replaced bytes is refused loudly instead
+    of silently publishing or saving a post without its image.  The
+    name rides the descriptor — the store keeps bytes, not names.
+    Returns the ``{sha256, size, mime, name}`` descriptor the signed
+    post carries.  Raises :class:`PostError` on bad input or missing
+    bytes.
+    """
+    if not isinstance(value, dict):
+        raise PostError("post image must be an object with a sha256")
+    sha256 = value.get("sha256")
+    if not isinstance(sha256, str) or len(sha256) != HASH_HEX_LENGTH:
+        raise PostError("post image sha256 must be a 64 character hex digest")
+    try:
+        bytes.fromhex(sha256)
+    except ValueError as exc:
+        raise PostError("post image sha256 must be a 64 character hex digest") from exc
+    digest = sha256.lower()
+    name = value.get("name")
+    if (
+        not isinstance(name, str)
+        or not sanitize_file_name(name)
+        or sanitize_file_name(name) != name
+    ):
+        raise PostError("post image name must be a safe bare file name")
+    stored = media_path(data_dir, digest)
+    if stored is None:
+        raise PostError(
+            "post image bytes are no longer cached for this sha256;"
+            " remove the image to continue without it"
+        )
+    try:
+        data = stored.read_bytes()
+    except OSError as exc:
+        raise PostError("post image bytes could not be read") from exc
+    if len(data) < 1 or len(data) > MAX_IMAGE_BYTES:
+        raise PostError(
+            f"post image of {len(data)} bytes is outside the "
+            f"1..{MAX_IMAGE_BYTES} byte limit"
+        )
+    mime = detect_image_mime(data)
+    if mime is None:
+        raise PostError("post image must be a JPEG, PNG, GIF or WebP file")
+    return {"sha256": digest, "size": len(data), "mime": mime, "name": name}
+
+
+def image_attachment_from_upload(
+    value: Any, data_dir: Union[str, Path]
+) -> Dict[str, Any]:
+    """Decode an image upload in either form the console sends.
+
+    A base64 data URL carries fresh bytes (a newly picked file, or a
+    draft image the console fetched); a ``{sha256, name}`` descriptor
+    re-attaches bytes already pinned in the local media store (a draft
+    image the console could not fetch).  Anything else is refused.
+    """
+    if isinstance(value, str):
+        return image_attachment_from_data_url(value, data_dir)
+    if isinstance(value, dict):
+        return image_attachment_from_descriptor(value, data_dir)
+    raise PostError("post image must be a base64 data URL or an object with a sha256")
+
+
 def _prune_media_store(directory: Path, *, max_total_bytes: int) -> None:
     """Drop least-recently-used media files until under *max_total_bytes*."""
     try:

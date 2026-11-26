@@ -1239,12 +1239,27 @@ export interface PublishTanOptions {
   replyTo?: string;
   /** Post lifetime in seconds (0 < n <= 7 days). */
   expiresIn?: number;
-  /** Image to attach, as a base64 data URL (top-level posts only). */
-  image?: { dataUrl: string };
+  /** Image to attach: fresh bytes as a base64 data URL, or — for a
+   *  draft image the console could not fetch — the descriptor of
+   *  bytes already pinned in the node's media store, re-attached
+   *  server-side by digest. */
+  image?: { dataUrl?: string; sha256?: string };
   /** Place to attach (top-level posts only). */
   location?: LocationPin;
   /** Contact card to attach (top-level posts only). */
   contact?: { name: string; destination_hash: string };
+}
+
+/** Encode a Tan image option for the wire: fresh bytes ride as the
+ *  data URL string, a kept descriptor rides as `{sha256}` so the
+ *  server re-attaches the pinned bytes by digest. */
+function tanImagePayload(
+  image: PublishTanOptions["image"],
+): string | { sha256: string } | undefined {
+  if (!image) return undefined;
+  if (image.dataUrl) return image.dataUrl;
+  if (image.sha256) return { sha256: image.sha256 };
+  return undefined;
 }
 
 export async function publishTanPost(
@@ -1255,7 +1270,7 @@ export async function publishTanPost(
     text,
     reply_to: opts.replyTo,
     expires_in: opts.expiresIn,
-    image: opts.image?.dataUrl,
+    image: tanImagePayload(opts.image),
     location: opts.location,
     contact: opts.contact,
   });
@@ -1284,7 +1299,7 @@ export async function scheduleTanPost(
     reply_to: opts.replyTo,
     send_in: sendIn,
     expires_in: opts.expiresIn ?? 0,
-    image: opts.image?.dataUrl,
+    image: tanImagePayload(opts.image),
     location: opts.location,
     contact: opts.contact,
   });
@@ -1366,7 +1381,7 @@ export async function saveTanDraft(
     text,
     reply_to: opts.replyTo,
     expires_in: opts.expiresIn,
-    image: opts.image?.dataUrl,
+    image: tanImagePayload(opts.image),
     location: opts.location,
     contact: opts.contact,
   });

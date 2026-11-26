@@ -82,9 +82,14 @@ export default function SocialSection() {
    *  when a different draft is loaded, so its initial text applies. */
   const [loadedDraft, setLoadedDraft] = useState<TanDraft | null>(null);
   /** A loaded draft's image, fetched as a data URL so the composer can
-   *  re-send it; cleared with the draft. */
+   *  re-send it; cleared with the draft. When the bytes cannot be
+   *  fetched — the media endpoint serves an unpublished draft's image
+   *  to loopback clients only — the descriptor is kept instead, so a
+   *  re-save re-sends it by digest and the image survives; a
+   *  descriptor-only image has no preview. */
   const [loadedDraftImage, setLoadedDraftImage] = useState<{
-    dataUrl: string;
+    dataUrl?: string;
+    sha256?: string;
     name: string;
     size: number;
   } | null>(null);
@@ -142,14 +147,17 @@ export default function SocialSection() {
    *  a top-level draft goes to the feed composer. The draft stays saved
    *  until the composer posts it, so leaving the thread loses nothing.
    *  A draft's image is fetched as a data URL first, so the composer
-   *  can re-send it; when its bytes are no longer cached the image is
-   *  dropped and the notice says so, instead of silently losing it.
-   *  The load claims a selection generation before the fetch and
-   *  commits only if it is still the latest — a slower earlier load
-   *  must not overwrite a newer selection. */
+   *  can re-send it; when the fetch fails the descriptor is kept
+   *  instead, so a re-save carries it back by digest and the image
+   *  survives — only a genuinely uncached image is lost, and then the
+   *  save fails loudly rather than dropping it silently. The load
+   *  claims a selection generation before the fetch and commits only
+   *  if it is still the latest — a slower earlier load must not
+   *  overwrite a newer selection. */
   async function loadDraft(draft: TanDraft) {
     const generation = ++draftLoadGeneration.current;
-    let image: { dataUrl: string; name: string; size: number } | null = null;
+    let image: { dataUrl?: string; sha256?: string; name: string; size: number } | null =
+      null;
     if (draft.image) {
       const dataUrl = await fetchTanImageDataUrl(draft.image.sha256).catch(
         () => null,
@@ -157,6 +165,15 @@ export default function SocialSection() {
       if (dataUrl) {
         image = {
           dataUrl,
+          name: draft.image.name ?? "image",
+          size: draft.image.size ?? 0,
+        };
+      } else {
+        // Bytes unreachable from this console (loopback-gated media
+        // over a remote address, or genuinely uncached): keep the
+        // descriptor so the next save re-attaches it by digest.
+        image = {
+          sha256: draft.image.sha256,
           name: draft.image.name ?? "image",
           size: draft.image.size ?? 0,
         };
@@ -173,8 +190,8 @@ export default function SocialSection() {
       setView("feed");
     }
     setNotice(
-      draft.image && !image
-        ? "Draft loaded — its image is no longer cached, so it was dropped; the text and other attachments are kept."
+      draft.image && !image?.dataUrl
+        ? "Draft loaded — its image could not be fetched from this console, so it is kept by reference; saving keeps it attached."
         : "Draft loaded — post it to publish, or save it again to keep editing.",
     );
   }

@@ -217,13 +217,13 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/tan/likes    who liked a Tan post (?target=<post hash>)
     GET  /api/tan/reposts  who reposted a Tan post (?target=<post hash>)
     GET  /api/tan/quotes   standing quotes of a Tan post (?target=<post hash>)
-    POST /api/tan/posts    publish a Tan post (optional "image" base64 data URL, optional "location" pin, optional "contact" card)
-    POST /api/tan/schedule schedule a Tan post, repost or quote — or a poll, with ``"poll_options"`` — for later (optional "image" base64 data URL, optional "location" pin, optional "contact" card)
+    POST /api/tan/posts    publish a Tan post (optional "image" base64 data URL or {sha256, name} descriptor, optional "location" pin, optional "contact" card)
+    POST /api/tan/schedule schedule a Tan post, repost or quote — or a poll, with ``"poll_options"`` — for later (optional "image" base64 data URL or {sha256, name} descriptor, optional "location" pin, optional "contact" card)
     GET  /api/tan/scheduled queued Tan posts, reposts, quotes and polls, soonest first
     POST /api/tan/cancel-scheduled cancel a queued Tan post
     POST /api/tan/edit-scheduled edit a queued Tan post's text/time
     GET  /api/tan/drafts   saved Tan post drafts, newest first
-    POST /api/tan/drafts   save a Tan post draft (optional "image" base64 data URL, optional "location" pin, optional "contact" card)
+    POST /api/tan/drafts   save a Tan post draft (optional "image" base64 data URL or {sha256, name} descriptor, optional "location" pin, optional "contact" card)
     POST /api/tan/drafts/delete discard a saved Tan post draft
     POST /api/tan/quote    quote a post with your own comment (optional "image" base64 data URL)
     POST /api/tan/like     like a post (signed reaction on your chain)
@@ -3973,7 +3973,7 @@ class WebBridge:
         *,
         reply_to: Optional[str] = None,
         expires_in: Optional[float] = None,
-        image: Optional[str] = None,
+        image: Optional[Any] = None,
         location: Optional[Dict[str, Any]] = None,
         contact: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
@@ -3994,9 +3994,14 @@ class WebBridge:
             )
         image_attachment: Optional[Dict[str, Any]] = None
         if image is not None:
-            from .tangents.tan import image_attachment_from_data_url
+            # A data URL carries fresh bytes; a {sha256, name}
+            # descriptor re-attaches bytes already pinned in the
+            # local media store — a draft image the console could
+            # not fetch over a non-loopback address, kept by
+            # reference instead of dropped.
+            from .tangents.tan import image_attachment_from_upload
 
-            image_attachment = image_attachment_from_data_url(
+            image_attachment = image_attachment_from_upload(
                 image, Path(self._tan_db_path()).parent
             )
         cleaned_location = (
@@ -4039,7 +4044,7 @@ class WebBridge:
         kind: Optional[str] = None,
         target_post: Optional[str] = None,
         poll_options: Optional[List[str]] = None,
-        image: Optional[str] = None,
+        image: Optional[Any] = None,
         location: Optional[Dict[str, Any]] = None,
         contact: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
@@ -4052,7 +4057,9 @@ class WebBridge:
         *image* data URL is decoded the same way :meth:`tan_post`
         decodes one — the bytes are stored pinned in the local media
         store at schedule time — and rides the queue entry until the
-        publish pass attaches it.  A *location* pin rides the queue
+        publish pass attaches it; a ``{sha256, name}`` descriptor
+        re-attaches bytes already pinned there instead (a draft image
+        the console could not fetch).  A *location* pin rides the queue
         entry itself the same way, and the publish pass attaches it.
         A *contact* card rides the queue entry itself the same way,
         and the publish pass attaches it.
@@ -4150,9 +4157,9 @@ class WebBridge:
                 conn.close()
         image_attachment: Optional[Dict[str, Any]] = None
         if image is not None:
-            from .tangents.tan import image_attachment_from_data_url
+            from .tangents.tan import image_attachment_from_upload
 
-            image_attachment = image_attachment_from_data_url(
+            image_attachment = image_attachment_from_upload(
                 image, Path(self._tan_db_path()).parent
             )
         config = self.node.config
@@ -4310,7 +4317,7 @@ class WebBridge:
         *,
         reply_to: Optional[str] = None,
         expires_in: Optional[float] = None,
-        image: Optional[str] = None,
+        image: Optional[Any] = None,
         location: Optional[Dict[str, Any]] = None,
         contact: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
@@ -4321,11 +4328,15 @@ class WebBridge:
         the draft is published, not when it is saved.  An *image*
         data URL is decoded the same way :meth:`tan_post` decodes
         one — the bytes are pinned in the local media store at save
-        time — and a *location* pin and a *contact* card ride the
-        draft the same way they ride a post.  All three are refused
-        on a reply draft, like on a post, and the card is vetted
-        against the sharing policy now, like :meth:`tan_post` vets
-        it; the publish path re-checks the policy again.
+        time — and a ``{sha256, name}`` descriptor re-attaches bytes
+        already pinned there, so a draft whose image the console
+        could not fetch (loopback-gated media over a remote address)
+        re-saves with its image kept by reference instead of losing
+        it.  A *location* pin and a *contact* card ride the draft the
+        same way they ride a post.  All three are refused on a reply
+        draft, like on a post, and the card is vetted against the
+        sharing policy now, like :meth:`tan_post` vets it; the publish
+        path re-checks the policy again.
         """
         from .tangents.tan import resolve_post, save_draft
 
@@ -4361,9 +4372,9 @@ class WebBridge:
             # media store, which is never pruned.
             image_attachment: Optional[Dict[str, Any]] = None
             if image is not None:
-                from .tangents.tan import image_attachment_from_data_url
+                from .tangents.tan import image_attachment_from_upload
 
-                image_attachment = image_attachment_from_data_url(
+                image_attachment = image_attachment_from_upload(
                     image, Path(self._tan_db_path()).parent
                 )
             return save_draft(
@@ -16865,11 +16876,11 @@ class _WebHandler(BaseHTTPRequestHandler):
                         )
                         return
                 image = body.get("image")
-                if image is not None and not isinstance(image, str):
+                if image is not None and not isinstance(image, (str, dict)):
                     self._send_json(
                         {
                             "error": {
-                                "message": "field 'image' must be a base64 data URL"
+                                "message": "field 'image' must be a base64 data URL or an object with a sha256"
                             }
                         },
                         head_only,
@@ -17133,11 +17144,11 @@ class _WebHandler(BaseHTTPRequestHandler):
                         )
                         return
                 image = body.get("image")
-                if image is not None and not isinstance(image, str):
+                if image is not None and not isinstance(image, (str, dict)):
                     self._send_json(
                         {
                             "error": {
-                                "message": "field 'image' must be a base64 data URL"
+                                "message": "field 'image' must be a base64 data URL or an object with a sha256"
                             }
                         },
                         head_only,
@@ -17327,11 +17338,11 @@ class _WebHandler(BaseHTTPRequestHandler):
                         )
                         return
                 image = body.get("image")
-                if image is not None and not isinstance(image, str):
+                if image is not None and not isinstance(image, (str, dict)):
                     self._send_json(
                         {
                             "error": {
-                                "message": "field 'image' must be a base64 data URL"
+                                "message": "field 'image' must be a base64 data URL or an object with a sha256"
                             }
                         },
                         head_only,
