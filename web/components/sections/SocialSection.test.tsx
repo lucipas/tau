@@ -91,6 +91,11 @@ beforeEach(() => {
   drafts = [
     makeDraft(1, "half-written thought"),
     makeDraft(2, "agreed", { reply_to: "h1".padEnd(64, "0"), expires_in: 3600 }),
+    makeDraft(3, "with everything", {
+      image: { sha256: "ab".repeat(32), size: 108, mime: "image/png", name: "pic.png" },
+      location: { lat: 34.05, lon: -83.88, name: "Rock Springs Park" },
+      contact: { name: "carol", destination_hash: "cc".repeat(16) },
+    }),
   ];
   lists = [];
   listMembers = [];
@@ -609,6 +614,10 @@ describe("SocialSection", () => {
     expect(screen.getByText("agreed")).toBeTruthy();
     expect(screen.getByText(/In reply to h1/)).toBeTruthy();
     expect(screen.getByText(/Disappears 1h after posting/)).toBeTruthy();
+    expect(screen.getByText("with everything")).toBeTruthy();
+    expect(screen.getByText(/Image: pic\.png/)).toBeTruthy();
+    expect(screen.getByText(/Place: Rock Springs Park/)).toBeTruthy();
+    expect(screen.getByText(/Sharing carol/)).toBeTruthy();
   });
 
   it("Save draft parks the composer's text", async () => {

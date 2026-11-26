@@ -274,6 +274,7 @@ from .scheduled_channel import (
     MAX_SCHEDULED_CHANNEL_DELAY,
     ScheduledChannelError,
     cancel_scheduled_channel_message,
+    channel_contact_refusal,
     edit_scheduled_channel_message,
     load_scheduled_channel_messages,
     schedule_channel_message,
@@ -332,6 +333,9 @@ from .tangents.tan import (
     TanError,
     _NOT_DELETED,
     _author_from_identity,
+    _clean_contact,
+    _clean_image,
+    _clean_location,
     _clean_poll_options,
     _decode_options,
     _muted_keyword_list,
@@ -3910,6 +3914,33 @@ def build_parser() -> argparse.ArgumentParser:
         "--file", type=Path, help="read the draft text from a file"
     )
     tan_draft.add_argument(
+        "--image",
+        type=Path,
+        default=None,
+        metavar="IMAGE",
+        help="attach one image to the draft (JPEG, PNG, GIF or WebP, at most "
+        "2 MiB) — the signed post carries its hash, size, mime and name, "
+        "and the bytes are fetched on demand with `tau tan media`",
+    )
+    tan_draft.add_argument(
+        "--location",
+        default=None,
+        metavar="LAT,LON [NAME]",
+        help="attach a place to the draft (e.g. --location "
+        '"34.05,-83.88 Rock Springs Park") — the signed post carries '
+        "the place, and the timeline and console show it with an "
+        "open-in-maps link",
+    )
+    tan_draft.add_argument(
+        "--contact",
+        default=None,
+        metavar="NAME|HASH",
+        help="share a peer's contact card on the draft (peer name, "
+        "alias, destination hash or hash prefix); the signed post "
+        "carries the card, and the timeline and console render it "
+        "with an add-peer action",
+    )
+    tan_draft.add_argument(
         "--reply-to",
         default=None,
         metavar="POST",
@@ -7008,6 +7039,18 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
             )
             return 2
         image = _read_image(args.image, config.data_dir)
+    elif getattr(args, "image_attachment", None) is not None:
+        # A stored attachment, handed over by publish-draft: the
+        # descriptor was validated at save time and re-checked there,
+        # so this is a second validation, not a file read.
+        if reply_to is not None:
+            print(
+                "error: --image can only be attached to a top-level post, "
+                "not a reply",
+                file=sys.stderr,
+            )
+            return 2
+        image = _clean_image(args.image_attachment)
 
     location = None
     if getattr(args, "location", None) is not None:
@@ -7019,6 +7062,15 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
             )
             return 2
         location = _location_from_args(args)
+    elif getattr(args, "location_attachment", None) is not None:
+        if reply_to is not None:
+            print(
+                "error: --location can only be attached to a top-level post, "
+                "not a reply",
+                file=sys.stderr,
+            )
+            return 2
+        location = _clean_location(args.location_attachment)
 
     contact = None
     if getattr(args, "contact", None) is not None:
@@ -7030,6 +7082,15 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
             )
             return 2
         contact = _contact_from_args(args, config)
+    elif getattr(args, "contact_attachment", None) is not None:
+        if reply_to is not None:
+            print(
+                "error: --contact can only be attached to a top-level post, "
+                "not a reply",
+                file=sys.stderr,
+            )
+            return 2
+        contact = _clean_contact(args.contact_attachment)
 
     delay_text = getattr(args, "delay", None)
     if delay_text is not None:
@@ -7284,10 +7345,50 @@ def cmd_tan_draft(args: argparse.Namespace) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 2
 
+    # Attachments are top-level-only, like on a post: refuse them on a
+    # reply here, before any file is read, rather than saving a draft
+    # that could never publish as written.
+    if reply_to and getattr(args, "image", None) is not None:
+        print(
+            "error: --image can only be attached to a top-level post, "
+            "not a reply",
+            file=sys.stderr,
+        )
+        return 2
+    if reply_to and getattr(args, "location", None) is not None:
+        print(
+            "error: --location can only be attached to a top-level post, "
+            "not a reply",
+            file=sys.stderr,
+        )
+        return 2
+    if reply_to and getattr(args, "contact", None) is not None:
+        print(
+            "error: --contact can only be attached to a top-level post, "
+            "not a reply",
+            file=sys.stderr,
+        )
+        return 2
+    image = None
+    if getattr(args, "image", None) is not None:
+        image = _read_image(args.image, config.data_dir)
+    location = None
+    if getattr(args, "location", None) is not None:
+        location = _location_from_args(args)
+    contact = None
+    if getattr(args, "contact", None) is not None:
+        contact = _contact_from_args(args, config)
+
     conn = init_db(config.social_db_path)
     try:
         draft = save_draft(
-            conn, text, reply_to=reply_to, expires_in=expires_in
+            conn,
+            text,
+            reply_to=reply_to,
+            expires_in=expires_in,
+            image=image,
+            location=location,
+            contact=contact,
         )
     finally:
         conn.close()
@@ -7302,7 +7403,29 @@ def cmd_tan_draft(args: argparse.Namespace) -> int:
             print(f"  in reply to {short_hash(reply_to)}")
         if expires_in is not None:
             print(f"  expires {_ago(expires_in)} after publishing")
+        _print_draft_attachments(draft)
     return _EXIT_OK
+
+
+def _print_draft_attachments(draft: Dict[str, Any]) -> None:
+    """Print a draft's stored attachments, like a posted post prints its own."""
+    image = draft.get("image")
+    if isinstance(image, dict):
+        size = int(image.get("size") or 0)
+        size_text = f"{size / 1024:.1f} KiB" if size >= 1024 else f"{size} B"
+        print(f"  image {image.get('name')} ({size_text}, {image.get('mime')})")
+    location = clean_location(draft.get("location"))
+    if location is not None:
+        name = location.get("name")
+        label = name if isinstance(name, str) and name else "Location"
+        print(f"  📍 {label} — {location['lat']}, {location['lon']}")
+        print(f"  {location_maps_url(location)}")
+    contact = clean_contact(draft.get("contact"))
+    if contact is not None:
+        print(
+            f"  👤 Shared contact: {contact['name']} "
+            f"({contact['destination_hash'][:8]}…)"
+        )
 
 
 def cmd_tan_drafts(args: argparse.Namespace) -> int:
@@ -7332,6 +7455,7 @@ def cmd_tan_drafts(args: argparse.Namespace) -> int:
             print(f"  in reply to {short_hash(draft['reply_to'])}")
         if draft["expires_in"] is not None:
             print(f"  expires {_ago(draft['expires_in'])} after publishing")
+        _print_draft_attachments(draft)
         if draft["post_hash"]:
             owed = len(draft["pending_peers"])
             suffix = f" to {owed} peer(s)" if owed else ""
@@ -7543,6 +7667,69 @@ def _publish_draft_claimed(
         str(draft["expires_in"]) if draft["expires_in"] is not None else None
     )
     args.delay = None
+    # A draft's stored attachments ride into the post: hand the
+    # validated descriptors to cmd_tan_post, which takes them the same
+    # way it takes --image/--location/--contact.  A hand-edited store
+    # must not sign a malformed attachment, so a bad descriptor keeps
+    # the draft instead of failing mid-publish.
+    try:
+        args.image_attachment = (
+            _clean_image(draft["image"])
+            if draft.get("image") is not None
+            else None
+        )
+        args.location_attachment = (
+            _clean_location(draft["location"])
+            if draft.get("location") is not None
+            else None
+        )
+        args.contact_attachment = (
+            _clean_contact(draft["contact"])
+            if draft.get("contact") is not None
+            else None
+        )
+    except PostError as exc:
+        print(
+            f"error: draft {draft['id']} kept — its stored attachment is "
+            f"unusable: {exc}",
+            file=sys.stderr,
+        )
+        return _EXIT_ERROR
+    # Re-check the card's policy at publish time, not only when the
+    # draft was saved: a peer blocked since then must not be amplified
+    # to a third party — the same rule the scheduled-post publish pass
+    # applies.  An unreadable block-list fails closed, like the
+    # immediate post path.
+    if args.contact_attachment is not None:
+        try:
+            blocklist = load_blocklist(config.blocklist_path)
+        except BlockListError as exc:
+            print(f"error: draft {draft['id']} kept — {exc}", file=sys.stderr)
+            return _EXIT_ERROR
+        identity = load_identity(config.identity_path)
+        own_hash = (
+            destination_hash(identity).hex() if identity is not None else ""
+        )
+        refusal = channel_contact_refusal(
+            args.contact_attachment, own_hash=own_hash, blocklist=blocklist
+        )
+        if refusal is not None:
+            print(
+                f"error: draft {draft['id']} kept — {refusal}",
+                file=sys.stderr,
+            )
+            return _EXIT_ERROR
+    # The image bytes must still be in the media store: the signed
+    # post carries only the digest, and a post whose image this node
+    # cannot serve would publish a dead attachment.
+    if args.image_attachment is not None:
+        if media_path(config.data_dir, args.image_attachment["sha256"]) is None:
+            print(
+                f"error: draft {draft['id']} kept — its image bytes are no "
+                "longer in the media store",
+                file=sys.stderr,
+            )
+            return _EXIT_ERROR
     # The sign happens inside cmd_tan_post: re-check the lease
     # immediately before it, so a publisher that lost its claim
     # while loading the draft can never sign a second copy.

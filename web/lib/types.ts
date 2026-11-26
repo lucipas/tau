@@ -676,6 +676,7 @@ export interface TanImage {
   sha256: string;
   size?: number;
   mime?: string;
+  name?: string;
   [key: string]: unknown;
 }
 
@@ -832,6 +833,12 @@ export interface TanDraft {
   text: string;
   reply_to: string;
   expires_in: number | null;
+  /** Attached image descriptor, when the draft carries one. */
+  image?: TanImage | null;
+  /** Attached place, when the draft carries one. */
+  location?: TanLocation | null;
+  /** Shared contact card, when the draft carries one. */
+  contact?: { name: string; destination_hash: string } | null;
   post_hash: string;
   pending_peers: string[];
   claimed_at: number | null;

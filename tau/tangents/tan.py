@@ -1115,6 +1115,9 @@ CREATE TABLE IF NOT EXISTS drafts (
     text TEXT NOT NULL,
     reply_to TEXT NOT NULL DEFAULT '',
     expires_in REAL,
+    image TEXT,
+    location TEXT,
+    contact TEXT,
     post_hash TEXT,
     pending_peers TEXT,
     claimed_at REAL,
@@ -1234,6 +1237,19 @@ def init_db(path: Optional[Union[str, Path]] = None) -> sqlite3.Connection:
         # the claim's owner token, so only the publisher that won
         # the claim can refresh or release it
         _add_draft_column(conn, "claim_token", "TEXT")
+    if draft_columns and "image" not in _table_columns(conn, "drafts"):
+        # migrate a pre-attachment database: a draft's image lives in
+        # one JSON column on its own entry, like a post's image
+        # attachment — the bytes stay pinned in the media store.
+        _add_draft_column(conn, "image", "TEXT")
+    if draft_columns and "location" not in _table_columns(conn, "drafts"):
+        # migrate a pre-attachment database: a draft's place lives in
+        # one JSON column on its own entry, like a post's place.
+        _add_draft_column(conn, "location", "TEXT")
+    if draft_columns and "contact" not in _table_columns(conn, "drafts"):
+        # migrate a pre-attachment database: a draft's shared card
+        # lives in one JSON column on its own entry, like a post's.
+        _add_draft_column(conn, "contact", "TEXT")
     purged_columns = _table_columns(conn, "purged_posts")
     if purged_columns and "linked" not in purged_columns:
         # migrate a pre-provenance database: purge records made
@@ -7499,6 +7515,9 @@ def _draft_dict(row: sqlite3.Row) -> Dict[str, Any]:
         "expires_in": (
             float(row["expires_in"]) if row["expires_in"] is not None else None
         ),
+        "image": _decode_image(row["image"]),
+        "location": _decode_location(row["location"]),
+        "contact": _decode_contact(row["contact"]),
         "post_hash": str(row["post_hash"] or ""),
         "pending_peers": _parse_pending_peers(row["pending_peers"]),
         "claimed_at": (
@@ -7524,6 +7543,9 @@ def save_draft(
     *,
     reply_to: str = "",
     expires_in: Optional[float] = None,
+    image: Optional[Dict[str, Any]] = None,
+    location: Optional[Dict[str, Any]] = None,
+    contact: Optional[Dict[str, Any]] = None,
     now: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Save a local-only Tan post draft.
@@ -7537,6 +7559,15 @@ def save_draft(
     publish time, or ``None`` for a post that never expires — the
     expiry clock starts when the draft is published, not when it is
     saved.
+
+    An *image* is the ``{sha256, size, mime, name}`` descriptor the
+    signed post will carry — the bytes must already be pinned in the
+    local media store, as :func:`image_attachment_from_data_url` and
+    the CLI's ``_read_image`` pin them.  A *location* pin and a
+    *contact* card ride the draft the same way they ride the post.
+    All three are top-level-only, like on a post: a reply draft
+    carrying one is refused here, not dropped at publish time, so a
+    saved draft always publishes exactly what was drafted.
     """
     clean_text = normalize_message(text)
     target = (reply_to or "").strip().lower()
@@ -7552,6 +7583,22 @@ def save_draft(
                 f"{MAX_TAN_POST_EXPIRY} seconds"
             )
     timestamp = float(now if now is not None else time.time())
+    if target and image is not None:
+        raise TanError(
+            "an image can only be attached to a top-level post, not a reply"
+        )
+    if target and location is not None:
+        raise TanError(
+            "a location can only be attached to a top-level post, not a reply"
+        )
+    if target and contact is not None:
+        raise TanError(
+            "a contact card can only be attached to a top-level post, "
+            "not a reply"
+        )
+    clean_image = _clean_image(image) if image is not None else None
+    clean_location = _clean_location(location) if location is not None else None
+    clean_contact = _clean_contact(contact) if contact is not None else None
     # Take the write lock before checking the capacity, so a competing
     # save cannot slip in between check and insert.
     conn.execute("BEGIN IMMEDIATE")
@@ -7560,9 +7607,18 @@ def save_draft(
         if int(count) >= MAX_DRAFTS:
             raise TanError(f"drafts are limited to {MAX_DRAFTS} entries")
         cursor = conn.execute(
-            "INSERT INTO drafts(text, reply_to, expires_in, created_at)"
-            " VALUES(?, ?, ?, ?)",
-            (clean_text, target, expires_in, timestamp),
+            "INSERT INTO drafts(text, reply_to, expires_in, image, location,"
+            " contact, created_at)"
+            " VALUES(?, ?, ?, ?, ?, ?, ?)",
+            (
+                clean_text,
+                target,
+                expires_in,
+                _encode_image(clean_image),
+                _encode_location(clean_location),
+                _encode_contact(clean_contact),
+                timestamp,
+            ),
         )
         conn.commit()
     except BaseException:
@@ -7606,6 +7662,31 @@ def delete_draft(conn: sqlite3.Connection, ref: Any) -> Dict[str, Any]:
     with conn:
         conn.execute("DELETE FROM drafts WHERE id = ?", (draft["id"],))
     return draft
+
+
+def find_draft_by_image(
+    conn: sqlite3.Connection, sha256: str
+) -> Optional[Dict[str, Any]]:
+    """Return the newest saved draft carrying image *sha256*, or ``None``.
+
+    Used when the console loads a draft's image back for the composer:
+    a draft's bytes are pinned in the media store at save time, but no
+    post carries them yet, so the media endpoint would otherwise treat
+    them as an unpublished upload and refuse to serve them.
+    """
+    digest = sha256.strip().lower()
+    if len(digest) != HASH_HEX_LENGTH:
+        return None
+    try:
+        bytes.fromhex(digest)
+    except ValueError:
+        return None
+    row = conn.execute(
+        "SELECT * FROM drafts "
+        "WHERE image LIKE ? ORDER BY created_at DESC LIMIT 1",
+        (f'%"sha256": "{digest}"%',),
+    ).fetchone()
+    return _draft_dict(row) if row is not None else None
 
 
 def record_draft_publish(

@@ -37,6 +37,7 @@ import type {
   HeldEnvelope,
   JoinRequest,
   LeftGroups,
+  LocationPin,
   MeshPage,
   MeshRow,
   MutedConversations,
@@ -1219,12 +1220,29 @@ export async function fetchTanMedia(sha256: string, author: string): Promise<unk
   return post(`/api/tan/media/${enc(sha256)}/fetch`, { author });
 }
 
+/** Read a cached Tan image's bytes as a base64 data URL, for re-attaching
+ *  a saved draft's image to the composer. Returns null when the bytes
+ *  are not cached locally (fetch them first with {@link fetchTanMedia}). */
+export async function fetchTanImageDataUrl(sha256: string): Promise<string | null> {
+  const res = await fetch(tanMediaUrl(sha256));
+  if (!res.ok) return null;
+  const blob = await res.blob();
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = () => reject(new Error("Could not read the image file."));
+    reader.readAsDataURL(blob);
+  });
+}
+
 export interface PublishTanOptions {
   replyTo?: string;
   /** Post lifetime in seconds (0 < n <= 7 days). */
   expiresIn?: number;
   /** Image to attach, as a base64 data URL (top-level posts only). */
   image?: { dataUrl: string };
+  /** Place to attach (top-level posts only). */
+  location?: LocationPin;
   /** Contact card to attach (top-level posts only). */
   contact?: { name: string; destination_hash: string };
 }
@@ -1238,6 +1256,7 @@ export async function publishTanPost(
     reply_to: opts.replyTo,
     expires_in: opts.expiresIn,
     image: opts.image?.dataUrl,
+    location: opts.location,
     contact: opts.contact,
   });
 }
@@ -1266,6 +1285,7 @@ export async function scheduleTanPost(
     send_in: sendIn,
     expires_in: opts.expiresIn ?? 0,
     image: opts.image?.dataUrl,
+    location: opts.location,
     contact: opts.contact,
   });
 }
@@ -1337,7 +1357,7 @@ export async function getTanDrafts(): Promise<TanDraft[]> {
   return data.drafts;
 }
 
-/** Save a Tan post draft (plain text plus optional reply and expiry). */
+/** Save a Tan post draft (plain text plus optional reply, expiry and attachments). */
 export async function saveTanDraft(
   text: string,
   opts: PublishTanOptions = {},
@@ -1346,6 +1366,9 @@ export async function saveTanDraft(
     text,
     reply_to: opts.replyTo,
     expires_in: opts.expiresIn,
+    image: opts.image?.dataUrl,
+    location: opts.location,
+    contact: opts.contact,
   });
   return data.draft;
 }
