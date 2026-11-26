@@ -185,6 +185,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import RNS
 
+from .beacons import BEACON_MAX_DURATION
 from .blocklist import load_blocklist
 from .disappearing import channel_default_for
 from .identity import load_public_key
@@ -659,6 +660,10 @@ def _normalize_message(mesg: Dict[str, Any], *, now: Optional[float] = None) -> 
         cleaned_location is None
         or reply_to
         or any(mesg.get(field) is not None for field in POLL_FIELDS)
+        # A marker that claims to stay live longer than any beacon
+        # can run is not a beacon update: drop it, so a remote peer
+        # cannot plant a pin that renders as live indefinitely.
+        or cleaned_beacon["expires_at"] > created_at + BEACON_MAX_DURATION
     ):
         cleaned_beacon = None
 
@@ -2320,18 +2325,15 @@ def create_message(
             raise ChannelError(
                 "beacon must have an id, an expiry and a sequence number"
             )
-        if location is None:
-            raise ChannelError(
-                "a beacon update must carry a location pin"
-            )
         if (
-            reply_to is not None
+            clean_location(location) is None
+            or reply_to is not None
             or poll_options is not None
             or poll_vote is not None
             or poll_close is not None
         ):
             raise ChannelError(
-                "a beacon update can only be attached to a "
+                "a beacon update must carry a location pin on a "
                 "top-level message, not a reply or a poll"
             )
         body["beacon"] = beacon

@@ -12165,6 +12165,8 @@ class TauNode:
         text: str,
         location: Dict[str, Any],
         marker: Dict[str, Any],
+        *,
+        now: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Post one beacon update into a channel.
 
@@ -12183,17 +12185,20 @@ class TauNode:
         if app is None:
             app = ChannelApp(self.config, self.identity, name=self.name)
             app.node = self
+        tick_now = now if now is not None else time.time()
+        # Each tick expires once it is stale — two intervals out, or
+        # when the beacon itself ends — so ticks never pile up
+        # against the channel's stored-message cap.  Expiring with
+        # the beacon alone would still store every tick of a long
+        # beacon (480 at the 60 s minimum over 8 h).
+        tick_expires_at = min(beacon.expires_at, tick_now + beacon.interval * 2)
         try:
             message = app.send(
                 beacon.target,
                 text,
                 location=location,
                 beacon=marker,
-                # Each tick expires with the beacon itself: without
-                # an expiry every tick stays stored until pruning,
-                # and a long beacon evicts the room's real history
-                # from the 500-message per-channel cap.
-                expires_at=marker["expires_at"],
+                expires_at=tick_expires_at,
             )
         except ChannelError as exc:
             raise NodeError(str(exc)) from exc
@@ -12252,7 +12257,7 @@ class TauNode:
             )
         elif beacon.target_kind == "channel":
             result = self._send_channel_beacon_update(
-                beacon, text, location, marker
+                beacon, text, location, marker, now=now
             )
         elif beacon.target_kind == "broadcast":
             result = self._send_broadcast_beacon_update(
