@@ -11966,6 +11966,7 @@ class TauNode:
         location: Dict[str, Any],
         *,
         group: bool = False,
+        broadcast: bool = False,
         coarse: bool = False,
         duration: float = BEACON_DEFAULT_DURATION,
         interval: float = BEACON_UPDATE_INTERVAL,
@@ -11974,16 +11975,21 @@ class TauNode:
         discover_timeout: Optional[float] = None,
         now: Optional[float] = None,
     ) -> Beacon:
-        """Start a live beacon for a DM peer or a group and return it.
+        """Start a live beacon for a DM peer, a group, or a broadcast
+        list, and return it.
 
         Resolves the conversation first — a peer by name or hash, a
-        group by id, prefix or name — so a beacon can never start for
-        a target this node cannot name.  The first update is the
-        caller's job (:meth:`send_beacon_update`): the beacon is
-        stored with its next update one interval out, so the mail
-        loop cannot double-send it in the same round.
+        group by id, prefix or name, a broadcast list by name — so a
+        beacon can never start for a target this node cannot name.
+        The first update is the caller's job
+        (:meth:`send_beacon_update`): the beacon is stored with its
+        next update one interval out, so the mail loop cannot
+        double-send it in the same round.
         """
         now = time.time() if now is None else now
+        if group and broadcast:
+            raise NodeError("a beacon targets a group or a broadcast list, not both")
+        target_id = ""
         if group:
             self.groups.list_groups()  # reload: a group made by another process
             record = self.groups.find(target)
@@ -11992,6 +11998,18 @@ class TauNode:
             target_hash = record["id"]
             target_kind = "group"
             target_name = record["name"]
+        elif broadcast:
+            try:
+                record = self.broadcasts.find(target)
+            except ValueError as exc:
+                raise NodeError(str(exc)) from exc
+            target_hash = record["name"]
+            target_kind = "broadcast"
+            target_name = record["name"]
+            # Pin the list's stable id: the name can be renamed or
+            # reused after a delete, and a tick must never retarget
+            # the beacon at a different list's members.
+            target_id = record["id"]
         else:
             peer = self.resolve_peer(
                 target,
@@ -12009,6 +12027,7 @@ class TauNode:
                     target=target_hash,
                     target_kind=target_kind,
                     target_name=target_name,
+                    target_id=target_id,
                     location=location,
                     coarse=coarse,
                     duration=duration,
@@ -12020,6 +12039,100 @@ class TauNode:
         except BeaconsError as exc:
             raise NodeError(str(exc)) from exc
         return beacon
+
+    def _send_broadcast_beacon_update(
+        self,
+        beacon: Beacon,
+        text: str,
+        location: Dict[str, Any],
+        marker: Dict[str, Any],
+        *,
+        now: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Fan one beacon update out to a broadcast list's members.
+
+        Members are resolved at each tick, like ``tau broadcast
+        send``: removing someone from the list stops their updates
+        at the next tick, and adding someone starts theirs.  The
+        list itself is resolved by the stable id the beacon pinned
+        at start — never by name alone — so a rename keeps the tick
+        on the same list and a deleted list recreated under the old
+        name never receives the owner's position.  Each
+        leg is one ordinary DM carrying the pin and the beacon
+        marker, so no list metadata ever reaches a recipient — and
+        a member that cannot be reached queues the update in the
+        outbox like any other message.  A refused or failed leg is
+        reported on that leg and never stops the rest, the group
+        fan-out's per-leg discipline.  Returns the group fan-out's
+        shape — ``results`` legs plus the shared ``sent_at`` — so
+        the console records the update the same way.
+        """
+        try:
+            if beacon.target_id:
+                broadcast = self.broadcasts.find_by_id(beacon.target_id)
+            else:
+                # A beacon stored before lists carried stable ids
+                # resolves by name, as before.
+                broadcast = self.broadcasts.find(beacon.target)
+        except ValueError as exc:
+            raise NodeError(str(exc)) from exc
+        own_hash = self.destination_hexhash
+        members = [m for m in broadcast["members"] if m != own_hash]
+        if not members:
+            # A self-only list has no one to send to: fail the tick
+            # like a deleted list, so the update stays due instead
+            # of counting as sent (all([]) would say success).
+            raise NodeError(
+                f"broadcast list {broadcast['name']} has no members to send to"
+            )
+        sent_at = time.time() if now is None else now
+        results: List[Dict[str, Any]] = []
+        for member in members:
+            peer = self.registry.get(member)
+            display = peer.display_name if peer is not None else ""
+            try:
+                leg = self.send_message(
+                    bytes.fromhex(member),
+                    text,
+                    location=location,
+                    beacon=marker,
+                    kind="location",
+                )
+            except (NotAllowedError, NodeError, MailboxError) as exc:
+                # The member refused, or the send could not even be
+                # queued: report the leg and keep going, so one bad
+                # member never silences the rest of the list.
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": display,
+                        "ok": False,
+                        "error": str(exc),
+                    }
+                )
+                continue
+            # A delivered leg answers ``ok`` with no ``queued`` flag;
+            # a queued leg carries ``queued: True`` (see
+            # :meth:`send_message`).
+            results.append(
+                {
+                    "to": member,
+                    "to_name": display,
+                    "delivered": bool(leg.get("ok")) and not leg.get("queued"),
+                    "queued": bool(leg.get("queued")),
+                    "id": leg.get("id"),
+                }
+            )
+        all_ok = all(
+            leg.get("delivered") or leg.get("queued") for leg in results
+        )
+        return {
+            "ok": all_ok,
+            "v": PROTOCOL_VERSION,
+            "broadcast": broadcast["name"],
+            "sent_at": sent_at,
+            "results": results,
+        }
 
     def send_beacon_update(
         self, beacon: Beacon, *, now: Optional[float] = None
@@ -12055,6 +12168,10 @@ class TauNode:
                 location=location,
                 beacon=marker,
                 kind="location",
+            )
+        elif beacon.target_kind == "broadcast":
+            result = self._send_broadcast_beacon_update(
+                beacon, text, location, marker, now=now
             )
         else:
             result = self.send_message(

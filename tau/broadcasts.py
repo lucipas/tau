@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import secrets
 import threading
 import time
 from contextlib import contextmanager
@@ -61,6 +62,28 @@ def _valid_hash(value: Any) -> Optional[str]:
     return value.lower()
 
 
+def new_broadcast_id() -> str:
+    """A fresh broadcast-list id: 8 random bytes, hex.
+
+    The id is the list's stable identity: names change (rename)
+    and are reusable (delete then recreate), so anything that must
+    keep pointing at the same list — a live beacon, above all —
+    pins the id, not the name.
+    """
+    return secrets.token_hex(8)
+
+
+def _valid_broadcast_id(value: Any) -> Optional[str]:
+    """A 16-hex broadcast-list id, lowercased, or ``None``."""
+    if not isinstance(value, str) or len(value) != 16:
+        return None
+    try:
+        bytes.fromhex(value)
+    except ValueError:
+        return None
+    return value.lower()
+
+
 def _valid_broadcast(raw: Any) -> Optional[Dict[str, Any]]:
     """Normalize one stored broadcast list, or ``None`` when it is unusable."""
     if not isinstance(raw, dict):
@@ -91,7 +114,12 @@ def _valid_broadcast(raw: Any) -> Optional[Dict[str, Any]]:
         return None
     if not math.isfinite(created_at):
         return None
+    # A list stored before ids existed gets one now; the load
+    # persists it (see :meth:`BroadcastStore._load`), so the id
+    # survives the next load instead of changing under a beacon
+    # that pinned it.
     return {
+        "id": _valid_broadcast_id(raw.get("id")) or new_broadcast_id(),
         "name": name,
         "members": sorted(cleaned),
         "created_at": created_at,
@@ -123,11 +151,25 @@ class BroadcastStore:
         if not isinstance(entries, list):
             return
         loaded: Dict[str, Dict[str, Any]] = {}
+        backfilled = False
         for entry in entries:
             broadcast = _valid_broadcast(entry)
             if broadcast is not None:
                 loaded[broadcast["name"].casefold()] = broadcast
+                if not isinstance(entry, dict) or _valid_broadcast_id(
+                    entry.get("id")
+                ) is None:
+                    backfilled = True
         self._lists = loaded
+        if backfilled:
+            # A list stored before ids existed was just given one;
+            # persist it now so the id is stable from here on.
+            try:
+                self._save()
+            except OSError:
+                log.warning(
+                    "Could not persist broadcast list ids", exc_info=True
+                )
 
     def _save(self) -> None:
         """Persist the store; raises :class:`OSError` when the write fails."""
@@ -355,6 +397,20 @@ class BroadcastStore:
         if broadcast is None:
             raise ValueError(f"unknown broadcast list: {query!r}")
         return dict(broadcast)
+
+    def find_by_id(self, list_id: str) -> Dict[str, Any]:
+        """Resolve a list by its stable id (see :meth:`find`).
+
+        Raises :class:`ValueError` when no list carries the id.  A
+        beacon pins the id at start, so a tick resolves the same
+        list across a rename — and a deleted list that was recreated
+        under the old name is never mistaken for the original.
+        """
+        with self._transaction():
+            for broadcast in self._lists.values():
+                if broadcast["id"] == list_id:
+                    return dict(broadcast)
+        raise ValueError(f"unknown broadcast list id: {list_id!r}")
 
     def list_broadcasts(self) -> List[Dict[str, Any]]:
         """All broadcast lists, oldest first.

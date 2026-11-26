@@ -150,6 +150,52 @@ describe("BeaconControl", () => {
     await waitFor(() => expect(onRefresh).toHaveBeenCalled());
   });
 
+  it("starts a broadcast beacon with the list name", async () => {
+    const onRefresh = vi.fn();
+    render(
+      <BeaconControl
+        target={{ kind: "broadcast", key: "family", name: "family" }}
+        beacons={[]}
+        onRefresh={onRefresh}
+        onError={() => undefined}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /Share live location/ }));
+    expect(screen.getByText(/private message/)).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("Latitude"), { target: { value: "34.05" } });
+    fireEvent.change(screen.getByLabelText("Longitude"), { target: { value: "-83.88" } });
+    fireEvent.click(screen.getByText("Start sharing"));
+    await waitFor(() =>
+      expect(mockedStart).toHaveBeenCalledWith(
+        { broadcast: "family" },
+        expect.objectContaining({ lat: 34.05, lon: -83.88, durationSeconds: 3600 }),
+      ),
+    );
+    expect(onRefresh).toHaveBeenCalled();
+  });
+
+  it("shows the active broadcast beacon and stops it", async () => {
+    const onRefresh = vi.fn();
+    render(
+      <BeaconControl
+        target={{ kind: "broadcast", key: "family", name: "family" }}
+        beacons={[
+          makeBeacon({
+            target: "family",
+            target_kind: "broadcast",
+            target_name: "family",
+          }),
+        ]}
+        onRefresh={onRefresh}
+        onError={() => undefined}
+      />,
+    );
+    expect(screen.getByText(/Sharing live location with family/)).toBeTruthy();
+    fireEvent.click(screen.getByText("Stop sharing"));
+    await waitFor(() => expect(mockedStop).toHaveBeenCalledWith("aabbccdd"));
+    await waitFor(() => expect(onRefresh).toHaveBeenCalled());
+  });
+
   it("ignores beacons for other conversations", () => {
     render(
       <BeaconControl

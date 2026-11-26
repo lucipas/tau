@@ -1,12 +1,13 @@
 """Live location beacons.
 
 A beacon shares the sender's position with one conversation — a DM
-peer or a group — as a series of location messages, one every few
-minutes, until it expires.  The static pin (``tau send --location``)
-is one place at one moment; a beacon is the same pin shape with a
-``beacon`` marker (see :func:`tau.protocol.clean_beacon`), so each
-update renders as a pin and the receiver can tell a live update
-from a one-off pin and show the beacon's expiry.
+peer, a group, or a broadcast list — as a series of location
+messages, one every few minutes, until it expires.  The static pin
+(``tau send --location``) is one place at one moment; a beacon is
+the same pin shape with a ``beacon`` marker (see
+:func:`tau.protocol.clean_beacon`), so each update renders as a pin
+and the receiver can tell a live update from a one-off pin and show
+the beacon's expiry.
 
 The position is resolved at each tick, not frozen at start: a beacon
 may name a position file (JSON ``{"lat", "lon", "name"?}``) that an
@@ -41,7 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional, Union
 
-from .protocol import clean_beacon, clean_location
+from .protocol import clean_beacon, clean_location, sanitize_group_name
 from .util import atomic_write_json, ensure_dir
 
 log = logging.getLogger(__name__)
@@ -126,7 +127,24 @@ def read_location_file(path: Union[str, Path]) -> Optional[Dict[str, Any]]:
     return cleaned
 
 
-def _clean_target(value: Any, *, kind: str) -> str:
+def _clean_target(value: Any, *, kind: str, target_kind: str) -> str:
+    """Clean a beacon target for its kind.
+
+    A DM or group target is a 32-hex destination hash or group id,
+    as before.  A broadcast target is a list name — the list itself
+    is resolved (and its members read) at each tick, so the stored
+    target is the name, cleaned the same way broadcast lists clean
+    theirs.
+    """
+    if target_kind == "broadcast":
+        # sanitize_group_name falls back to "group" for a blank name,
+        # so the blank check runs first: a blank list name is a bad
+        # target, not the list literally called "group".
+        if not isinstance(value, str) or not value.strip():
+            raise BeaconsError(
+                "beacon broadcast target must be a non-empty list name"
+            )
+        return sanitize_group_name(value)
     if not isinstance(value, str):
         raise BeaconsError(f"beacon {kind} target must be a string")
     cleaned = value.strip().lower()
@@ -142,8 +160,10 @@ def _clean_target(value: Any, *, kind: str) -> str:
 
 
 def _clean_target_kind(value: Any) -> str:
-    if value not in ("dm", "group"):
-        raise BeaconsError('beacon target kind must be "dm" or "group"')
+    if value not in ("dm", "group", "broadcast"):
+        raise BeaconsError(
+            'beacon target kind must be "dm", "group" or "broadcast"'
+        )
     return str(value)
 
 
@@ -177,6 +197,12 @@ class Beacon:
     target: str
     target_kind: str
     target_name: str = ""
+    # A broadcast beacon's list, pinned by stable id: the stored
+    # name can change (rename) and be reused (delete then recreate),
+    # so the tick resolves the id, never the name alone.  Empty for
+    # DM/group beacons — and for a beacon stored before lists
+    # carried ids, which keeps resolving by name as before.
+    target_id: str = ""
     started_at: float = 0.0
     expires_at: float = 0.0
     interval: float = BEACON_UPDATE_INTERVAL
@@ -227,6 +253,7 @@ class Beacon:
             "target": self.target,
             "target_kind": self.target_kind,
             "target_name": self.target_name,
+            "target_id": self.target_id,
             "started_at": self.started_at,
             "expires_at": self.expires_at,
             "interval": self.interval,
@@ -265,10 +292,17 @@ class Beacon:
             raise BeaconsError("beacon stopped must be a boolean")
         return cls(
             id=beacon_id,
-            target=_clean_target(data.get("target"), kind="beacon"),
+            target=_clean_target(
+                data.get("target"),
+                kind="beacon",
+                target_kind=_clean_target_kind(data.get("target_kind")),
+            ),
             target_kind=_clean_target_kind(data.get("target_kind")),
             target_name=data.get("target_name")
             if isinstance(data.get("target_name"), str)
+            else "",
+            target_id=data.get("target_id")
+            if isinstance(data.get("target_id"), str)
             else "",
             started_at=_clean_timestamp(data.get("started_at"), "started_at"),
             expires_at=_clean_timestamp(data.get("expires_at"), "expires_at"),
@@ -301,14 +335,26 @@ class Beacons:
     def by_target(
         self, target: str, target_kind: str, now: Optional[float] = None
     ) -> Optional[Beacon]:
-        """The active beacon for a conversation, if one is running."""
+        """The active beacon for a conversation, if one is running.
+
+        Broadcast targets compare case-insensitively, like the list
+        store itself: "Family" and "family" are the same list, so a
+        beacon started for one must be found — and refused as a
+        duplicate — under the other spelling.
+        """
         now = time.time() if now is None else now
         for beacon in self.beacons.values():
-            if (
-                beacon.target == target
-                and beacon.target_kind == target_kind
-                and beacon.is_active(now)
-            ):
+            if beacon.target_kind != target_kind:
+                continue
+            if target_kind == "broadcast":
+                same = (
+                    isinstance(beacon.target, str)
+                    and isinstance(target, str)
+                    and beacon.target.casefold() == target.casefold()
+                )
+            else:
+                same = beacon.target == target
+            if same and beacon.is_active(now):
                 return beacon
         return None
 
@@ -339,6 +385,7 @@ class Beacons:
         target: str,
         target_kind: str,
         target_name: str = "",
+        target_id: str = "",
         location: Dict[str, Any],
         coarse: bool = False,
         duration: float = BEACON_DEFAULT_DURATION,
@@ -353,8 +400,8 @@ class Beacons:
         double-send it in the same round.
         """
         now = time.time() if now is None else now
-        target = _clean_target(target, kind="beacon")
         target_kind = _clean_target_kind(target_kind)
+        target = _clean_target(target, kind="beacon", target_kind=target_kind)
         if self.by_target(target, target_kind, now) is not None:
             raise BeaconsError(
                 "a beacon is already running for this conversation; "
@@ -377,6 +424,7 @@ class Beacons:
             target=target,
             target_kind=target_kind,
             target_name=target_name,
+            target_id=target_id,
             started_at=now,
             expires_at=now + duration,
             interval=interval,
@@ -475,6 +523,75 @@ def save_beacons(path: Union[str, Path], beacons: Beacons) -> Path:
     return atomic_write_json(target, beacons.to_dict(), mode=BEACONS_FILE_MODE)
 
 
+def repoint_broadcast_beacons(
+    path: Optional[Union[str, Path]], old_name: str, new_name: str
+) -> int:
+    """Point active broadcast beacons at a renamed list.
+
+    A rename keeps the list's stable id, so ticks keep resolving —
+    but the beacon's stored target is the old name, and the CLI and
+    the console match beacons to lists by that name.  Update the
+    stored name (and display name) so ``tau beacon stop --broadcast
+    NEW`` and the console's list row still find the running beacon,
+    including after a case-only rename.  Returns how many beacons
+    were re-pointed; a missing beacons file means none running.
+    """
+    if path is None:
+        return 0
+    target = Path(path).expanduser()
+    count = 0
+    with beacons_lock(target):
+        beacons = load_beacons(target)
+        now = time.time()
+        for beacon in beacons.beacons.values():
+            if (
+                beacon.target_kind == "broadcast"
+                and beacon.is_active(now)
+                and isinstance(beacon.target, str)
+                and beacon.target.casefold() == old_name.casefold()
+            ):
+                beacon.target = new_name
+                beacon.target_name = new_name
+                count += 1
+        if count:
+            save_beacons(target, beacons)
+    return count
+
+
+def stop_broadcast_beacons(
+    path: Optional[Union[str, Path]], name: str, *, list_id: Optional[str] = None
+) -> int:
+    """Stop the active broadcast beacons for a deleted list.
+
+    The tick would fail on its own once the list is gone, but the
+    beacon would stay due until it expires; stopping it here ends
+    it at once.  Matches by stored name (case-insensitive) or, when
+    given, by the list's stable id.  Returns how many beacons were
+    stopped; a missing beacons file means none running.
+    """
+    if path is None:
+        return 0
+    target = Path(path).expanduser()
+    count = 0
+    with beacons_lock(target):
+        beacons = load_beacons(target)
+        now = time.time()
+        for beacon in beacons.beacons.values():
+            if beacon.target_kind != "broadcast" or not beacon.is_active(now):
+                continue
+            same_name = (
+                isinstance(beacon.target, str)
+                and beacon.target.casefold() == name.casefold()
+            )
+            same_id = list_id is not None and beacon.target_id == list_id
+            if same_name or same_id:
+                beacon.stopped = True
+                count += 1
+        if count:
+            save_beacons(target, beacons)
+    return count
+
+
 @contextmanager
 def beacons_lock(path: Union[str, Path]) -> Iterator[None]:
     """Serialize read-modify-write updates of the beacons file.
@@ -531,5 +648,7 @@ __all__ = [
     "load_beacons",
     "new_beacon_id",
     "read_location_file",
+    "repoint_broadcast_beacons",
     "save_beacons",
+    "stop_broadcast_beacons",
 ]

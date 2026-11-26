@@ -95,7 +95,8 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/beacons      live beacons this node is sharing, active first
     POST /api/beacons/start start a live beacon ``{"peer": "<name or hash>", "lat": ..,
                            "lon": .., "name": "..", "duration_seconds": 3600,
-                           "coarse": false}`` (or ``"group"`` for a group);
+                           "coarse": false}`` (or ``"group"`` for a group,
+                           ``"broadcast"`` for a broadcast list);
                            the browser feeds fresh positions afterwards
     POST /api/beacons/stop stop a live beacon ``{"id": "<beacon id>"}``
     POST /api/beacons/position feed a beacon a fresh position
@@ -400,7 +401,9 @@ from .beacons import (
     BeaconsError,
     beacons_lock,
     load_beacons,
+    repoint_broadcast_beacons,
     save_beacons,
+    stop_broadcast_beacons,
 )
 from .blocklist import BlockList, BlockListError, load_blocked_set, load_blocklist, save_blocklist
 from .bundle import BundleError, DEFAULT_MAX_BUNDLE_BYTES
@@ -7056,6 +7059,7 @@ class WebBridge:
         location: Dict[str, Any],
         *,
         group: bool = False,
+        broadcast: bool = False,
         coarse: bool = False,
         duration: float = BEACON_DEFAULT_DURATION,
     ) -> Dict[str, Any]:
@@ -7070,7 +7074,7 @@ class WebBridge:
         position.  ``duration`` is seconds (60s..8h, default 1h).
         """
         if not isinstance(target, str) or not target.strip():
-            raise ValueError("target peer or group is required")
+            raise ValueError("target peer, group, or broadcast list is required")
         cleaned = clean_location(location)
         if cleaned is None:
             raise ValueError(
@@ -7092,6 +7096,7 @@ class WebBridge:
             target.strip(),
             cleaned,
             group=bool(group),
+            broadcast=bool(broadcast),
             coarse=bool(coarse),
             duration=duration,
         )
@@ -7208,7 +7213,10 @@ class WebBridge:
         first update and every mail-loop tick alike land in the
         sender's thread as a live location entry — one entry per
         update, not one per leg, so a group beacon does not spam the
-        thread once per member.  The entry carries the pin and the
+        thread once per member.  A broadcast beacon instead records
+        one entry per member, in that member's DM thread: the update
+        was one DM per member, and there is no broadcast thread to
+        put a single entry in.  The entry carries the pin and the
         beacon marker, so the feed renders it with its map link and
         live countdown, exactly like a received update.
         """
@@ -7220,7 +7228,51 @@ class WebBridge:
         marker = beacon.wire_marker(beacon.updates_sent)
         text = location_default_text(location)
         is_group = beacon.target_kind == "group"
+        is_broadcast = beacon.target_kind == "broadcast"
         legs = result.get("results") if isinstance(result, dict) else None
+        if is_broadcast and isinstance(legs, list):
+            # A broadcast update fans out as one DM per member, so
+            # the console records it the same way: one entry in each
+            # member's thread, never one entry for the whole list
+            # (there is no broadcast thread to put it in).  A failed
+            # leg sent nothing, so it leaves no entry.
+            sent_at = result.get("sent_at")
+            if not isinstance(sent_at, (int, float)) or isinstance(
+                sent_at, bool
+            ):
+                sent_at = time.time()
+            messages = []
+            for leg in legs:
+                if not leg.get("delivered") and not leg.get("queued"):
+                    continue
+                member = leg.get("to")
+                if not isinstance(member, str) or not member:
+                    continue
+                with self._send_lock:
+                    message = self._append_message(
+                        direction="out",
+                        peer=member,
+                        peer_name=leg.get("to_name") or short_hash(member),
+                        text=text,
+                        sent_at=float(sent_at),
+                        received_at=time.time(),
+                        status="queued" if leg.get("queued") else "delivered",
+                        wire_id=leg.get("id")
+                        if isinstance(leg.get("id"), str)
+                        else None,
+                    )
+                    if message is None:
+                        continue
+                    # The append carries no pin or marker (see
+                    # :meth:`_append_message`), so they are attached
+                    # here and saved, like the reaction overlay in
+                    # :meth:`record_inbound`.
+                    message["location"] = location
+                    message["beacon"] = marker
+                    self._save_messages()
+                self.bus.publish({"type": "message", "message": message})
+                messages.append(message)
+            return messages[0] if messages else None
         if is_group and isinstance(legs, list):
             queued = all(bool(leg.get("queued")) for leg in legs) if legs else False
             delivered = any(bool(leg.get("delivered")) for leg in legs)
@@ -12336,6 +12388,17 @@ class WebBridge:
         broadcast = self.node.broadcasts.find(name.strip())
         if not self.node.broadcasts.delete(broadcast["name"]):
             raise ValueError(f"unknown broadcast list: {name.strip()!r}")
+        # The tick would fail on its own once the list is gone, but
+        # the beacon would stay due until it expires: stop it now.
+        # Best effort — the list is already deleted.
+        try:
+            stop_broadcast_beacons(
+                self.node.config.beacons_path,
+                broadcast["name"],
+                list_id=broadcast.get("id"),
+            )
+        except (OSError, BeaconsError) as exc:
+            log.warning("Could not stop beacons for deleted list: %s", exc)
         return {"name": broadcast["name"]}
 
     def rename_broadcast(self, name: str, new_name: Any) -> Dict[str, Any]:
@@ -12348,6 +12411,20 @@ class WebBridge:
         renamed = self.node.broadcasts.rename(
             broadcast["name"], new_name.strip()
         )
+        # The list keeps its stable id, so ticks keep resolving —
+        # but beacons match lists by name, so re-point the stored
+        # name or the console loses track of the running beacon.
+        # Best effort: the rename already landed.
+        try:
+            repoint_broadcast_beacons(
+                self.node.config.beacons_path,
+                broadcast["name"],
+                renamed["name"],
+            )
+        except (OSError, BeaconsError) as exc:
+            log.warning(
+                "Could not re-point beacons for renamed list: %s", exc
+            )
         return {
             "broadcast": self._describe_broadcast(renamed),
             "previous_name": broadcast["name"],
@@ -19088,24 +19165,25 @@ class _WebHandler(BaseHTTPRequestHandler):
     def _handle_beacon_start(self, body: Dict[str, Any], head_only: bool) -> None:
         peer = body.get("peer")
         group = body.get("group")
-        if peer is not None and group is not None:
+        broadcast = body.get("broadcast")
+        given = [name for name, value in
+                 (("peer", peer), ("group", group), ("broadcast", broadcast))
+                 if value is not None]
+        if len(given) != 1:
             self._send_json(
-                {"error": {"message": "pass 'peer' or 'group', not both"}},
+                {
+                    "error": {
+                        "message": "pass exactly one of 'peer', 'group', 'broadcast'"
+                    }
+                },
                 head_only,
                 400,
             )
             return
-        if peer is None and group is None:
-            self._send_json(
-                {"error": {"message": "pass 'peer' or 'group'"}},
-                head_only,
-                400,
-            )
-            return
-        target = peer if peer is not None else group
+        target = peer if peer is not None else group if group is not None else broadcast
         if not isinstance(target, str) or not target.strip():
             self._send_json(
-                {"error": {"message": "field 'peer'/'group' is required"}},
+                {"error": {"message": "field 'peer'/'group'/'broadcast' is required"}},
                 head_only,
                 400,
             )
@@ -19126,6 +19204,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                 target.strip(),
                 location,
                 group=group is not None,
+                broadcast=broadcast is not None,
                 coarse=coarse,
                 duration=body.get("duration_seconds", BEACON_DEFAULT_DURATION),
             )

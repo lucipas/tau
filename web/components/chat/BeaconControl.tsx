@@ -1,13 +1,14 @@
 // BeaconControl.tsx — share live location with the open conversation.
 //
-// A live beacon sends this node's position to one DM peer or group as a
-// series of location updates until it expires. Starting one needs a first
-// position: the browser's geolocation when available, or a typed
-// latitude/longitude when it is not. Once started, the shell-level feed
-// (useBeaconFeed, mounted in the Shell) keeps the beacon's position file
-// fresh from watchPosition, so sharing survives leaving the chat tab;
-// without geolocation the beacon simply repeats its start position,
-// like a CLI beacon with no position file.
+// A live beacon sends this node's position to one DM peer, group, or
+// broadcast list as a series of location updates until it expires.
+// Starting one needs a first position: the browser's geolocation when
+// available, or a typed latitude/longitude when it is not. Once
+// started, the shell-level feed (useBeaconFeed, mounted in the Shell)
+// keeps the beacon's position file fresh from watchPosition, so
+// sharing survives leaving the chat tab; without geolocation the
+// beacon simply repeats its start position, like a CLI beacon with no
+// position file.
 
 "use client";
 
@@ -18,7 +19,7 @@ import { useNow } from "@/lib/use-now";
 import type { Beacon } from "@/lib/types";
 
 export interface BeaconTarget {
-  kind: "dm" | "group";
+  kind: "dm" | "group" | "broadcast";
   key: string;
   name: string;
 }
@@ -28,6 +29,8 @@ interface BeaconControlProps {
   beacons: Beacon[];
   onRefresh: () => Promise<void> | void;
   onError: (message: string) => void;
+  /** Open the share form at once (a broadcast list expands into it). */
+  defaultOpen?: boolean;
 }
 
 const DURATIONS = [
@@ -53,7 +56,10 @@ export function validateBeaconPosition(lat: string, lon: string): string | null 
 }
 
 function activeBeaconFor(beacons: Beacon[], target: BeaconTarget): Beacon | undefined {
-  const kind = target.kind === "group" ? "group" : "dm";
+  // The chat calls a DM conversation "peer"; the beacon store calls
+  // it "dm". A broadcast list is "broadcast" in both places.
+  const kind =
+    target.kind === "group" ? "group" : target.kind === "broadcast" ? "broadcast" : "dm";
   return beacons.find((b) => b.active && b.target === target.key && b.target_kind === kind);
 }
 
@@ -71,9 +77,9 @@ function currentPosition(): Promise<GeolocationPosition> {
   });
 }
 
-export default function BeaconControl({ target, beacons, onRefresh, onError }: BeaconControlProps) {
+export default function BeaconControl({ target, beacons, onRefresh, onError, defaultOpen = false }: BeaconControlProps) {
   const now = useNow(1000);
-  const [showForm, setShowForm] = useState(false);
+  const [showForm, setShowForm] = useState(defaultOpen);
   const [durationSeconds, setDurationSeconds] = useState(3600);
   const [coarse, setCoarse] = useState(false);
   const [lat, setLat] = useState("");
@@ -90,7 +96,11 @@ export default function BeaconControl({ target, beacons, onRefresh, onError }: B
     setBusy(true);
     try {
       await startBeacon(
-        target.kind === "group" ? { group: target.key } : { peer: target.key },
+        target.kind === "group"
+          ? { group: target.key }
+          : target.kind === "broadcast"
+            ? { broadcast: target.key }
+            : { peer: target.key },
         {
           lat: latitude,
           lon: longitude,
@@ -280,8 +290,10 @@ export default function BeaconControl({ target, beacons, onRefresh, onError }: B
           </button>
         </div>
         <p className="text-xs text-zinc-500">
-          Updates go out every few minutes until the beacon expires. Your position stays in the conversation — it is never
-          sent anywhere else.
+          Updates go out every few minutes until the beacon expires.{" "}
+          {target.kind === "broadcast"
+            ? "Your position goes to every member of the list as a private message — members never see each other or the list."
+            : "Your position stays in the conversation — it is never sent anywhere else."}
         </p>
       </div>
     </div>

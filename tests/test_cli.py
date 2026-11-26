@@ -15311,15 +15311,34 @@ def test_parser_beacon_arguments():
     assert start.coarse is True
     assert start.duration_mins == 30.0
     assert start.interval_mins == 10.0
+    start_broadcast = parser.parse_args(
+        [
+            "beacon", "start", "--broadcast", "family",
+            "--location", "34.05,-83.88 Rock Springs Park",
+        ]
+    )
+    assert start_broadcast.beacon_command == "start"
+    assert start_broadcast.broadcast == "family"
+    assert start_broadcast.func is cli.cmd_beacon_start
     stop = parser.parse_args(["beacon", "stop", "--group", "crew"])
     assert stop.beacon_command == "stop"
     assert stop.group == "crew"
     assert stop.func is cli.cmd_beacon_stop
+    stop_broadcast = parser.parse_args(["beacon", "stop", "--broadcast", "family"])
+    assert stop_broadcast.beacon_command == "stop"
+    assert stop_broadcast.broadcast == "family"
+    assert stop_broadcast.func is cli.cmd_beacon_stop
     update = parser.parse_args(
         ["beacon", "update", BEACON_PEER, "--location", "35,-84"]
     )
     assert update.beacon_command == "update"
     assert update.func is cli.cmd_beacon_update
+    update_broadcast = parser.parse_args(
+        ["beacon", "update", "--broadcast", "family", "--location", "35,-84"]
+    )
+    assert update_broadcast.beacon_command == "update"
+    assert update_broadcast.broadcast == "family"
+    assert update_broadcast.func is cli.cmd_beacon_update
     listed = parser.parse_args(["beacon", "list"])
     assert listed.beacon_command == "list"
     assert listed.func is cli.cmd_beacon_list
@@ -15418,8 +15437,16 @@ class _FakeBeaconNode:
         beacons = load_beacons(self.config.beacons_path)
         beacon = beacons.start(
             target=target,
-            target_kind="group" if kwargs.get("group") else "dm",
-            target_name="alice",
+            target_kind=(
+                "broadcast"
+                if kwargs.get("broadcast")
+                else "group"
+                if kwargs.get("group")
+                else "dm"
+            ),
+            target_name=(
+                target if kwargs.get("broadcast") else "alice"
+            ),
             location=location,
             coarse=kwargs.get("coarse", False),
             duration=kwargs.get("duration", 3600.0),
@@ -15475,6 +15502,238 @@ def test_beacon_start_local_op_starts_and_sends(tmp_path):
     assert result["beacon"]["updates_sent"] == 1
     assert result["update"]["queued"] is True
     assert node.update_calls == [result["beacon"]["id"]]
+
+
+def _seed_broadcast_list(tmp_path, name="family"):
+    from tau.broadcasts import BroadcastStore
+    from tau.config import TauConfig
+
+    config = TauConfig.resolve(data_dir=tmp_path / "node", name="tester")
+    store = BroadcastStore(config.broadcasts_path)
+    store.create(name, [BEACON_PEER])
+    return config
+
+
+def test_beacon_stop_broadcast_list(tmp_path, capsys):
+    _seed_broadcast_list(tmp_path)
+    _seed_beacon(
+        tmp_path, target="family", target_kind="broadcast", target_name="family"
+    )
+    code = cli.main(
+        ["beacon", "stop", "--broadcast", "family", "--data-dir", str(tmp_path / "node")]
+    )
+    assert code == 0
+    assert "Stopped the live beacon for broadcast list family" in capsys.readouterr().out
+    # A second stop reports that nothing is running.
+    code = cli.main(
+        ["beacon", "stop", "--broadcast", "family", "--data-dir", str(tmp_path / "node")]
+    )
+    assert code == 0
+    assert "No beacon is running for broadcast list family" in capsys.readouterr().out
+
+
+def test_beacon_update_broadcast_list(tmp_path, capsys):
+    _seed_broadcast_list(tmp_path)
+    _seed_beacon(
+        tmp_path, target="family", target_kind="broadcast", target_name="family"
+    )
+    code = cli.main(
+        [
+            "beacon", "update", "--broadcast", "family",
+            "--location", "35.0,-84.0 New Park",
+            "--data-dir", str(tmp_path / "node"),
+        ]
+    )
+    assert code == 0
+    assert "New Park" in capsys.readouterr().out
+    from tau.beacons import load_beacons
+    from tau.config import TauConfig
+
+    config = TauConfig.resolve(data_dir=tmp_path / "node", name="tester")
+    stored = load_beacons(config.beacons_path)
+    beacon = next(iter(stored.beacons.values()))
+    assert beacon.location == {"lat": 35.0, "lon": -84.0, "name": "New Park"}
+
+
+def test_beacon_list_shows_broadcast_kind(tmp_path, capsys):
+    _seed_beacon(
+        tmp_path, target="family", target_kind="broadcast", target_name="family"
+    )
+    code = cli.main(["beacon", "list", "--data-dir", str(tmp_path / "node")])
+    assert code == 0
+    assert "family (broadcast list)" in capsys.readouterr().out
+
+
+def test_beacon_start_broadcast_via_one_shot_node(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(cli, "TauNode", _FakeBeaconNode)
+    _FakeBeaconNode.instances.clear()
+    code = cli.main(
+        [
+            "beacon", "start", "--broadcast", "family",
+            "--location", "34.05,-83.88 Rock Springs Park",
+            "--data-dir", str(tmp_path / "node"),
+        ]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "Started a live beacon for family (broadcast list)" in out
+    node = _FakeBeaconNode.instances[0]
+    assert len(node.start_calls) == 1
+    target, _location, kwargs = node.start_calls[0]
+    assert target == "family"
+    assert kwargs["broadcast"] is True
+    assert len(node.update_calls) == 1
+
+
+def test_beacon_stop_broadcast_after_rename(tmp_path, capsys):
+    _seed_broadcast_list(tmp_path)
+    _seed_beacon(
+        tmp_path, target="family", target_kind="broadcast", target_name="family"
+    )
+    code = cli.main(
+        ["broadcast", "rename", "family", "Crew", "--data-dir", str(tmp_path / "node")]
+    )
+    assert code == 0
+    # The rename re-points the stored beacon target, so the new
+    # name — including a case-only rename — still finds it.
+    from tau.beacons import load_beacons
+    from tau.config import TauConfig
+
+    config = TauConfig.resolve(data_dir=tmp_path / "node", name="tester")
+    stored = load_beacons(config.beacons_path)
+    beacon = next(iter(stored.beacons.values()))
+    assert beacon.target == "Crew"
+    assert beacon.target_name == "Crew"
+    code = cli.main(
+        ["beacon", "stop", "--broadcast", "Crew", "--data-dir", str(tmp_path / "node")]
+    )
+    assert code == 0
+    assert "Stopped the live beacon for broadcast list Crew" in (
+        capsys.readouterr().out
+    )
+
+
+def test_beacon_stop_broadcast_after_delete(tmp_path, capsys):
+    _seed_broadcast_list(tmp_path)
+    _seed_beacon(
+        tmp_path, target="family", target_kind="broadcast", target_name="family"
+    )
+    code = cli.main(
+        ["broadcast", "delete", "family", "--data-dir", str(tmp_path / "node")]
+    )
+    assert code == 0
+    # Deleting the list stops its beacon at once instead of leaving
+    # it due until expiry.
+    from tau.beacons import load_beacons
+    from tau.config import TauConfig
+
+    config = TauConfig.resolve(data_dir=tmp_path / "node", name="tester")
+    stored = load_beacons(config.beacons_path)
+    assert next(iter(stored.beacons.values())).stopped is True
+    code = cli.main(
+        ["beacon", "stop", "--broadcast", "family", "--data-dir", str(tmp_path / "node")]
+    )
+    assert code == 0
+    assert "No beacon is running for broadcast list family" in (
+        capsys.readouterr().out
+    )
+
+
+def test_beacon_stop_broadcast_when_list_deleted_elsewhere(tmp_path, capsys):
+    # The list is gone without the delete hook running (another
+    # process, a hand edit): stopping by the old name still works,
+    # because the target falls back to the name itself.
+    from tau.broadcasts import BroadcastStore
+
+    config = _seed_broadcast_list(tmp_path)
+    _seed_beacon(
+        tmp_path, target="family", target_kind="broadcast", target_name="family"
+    )
+    assert BroadcastStore(config.broadcasts_path).delete("family") is True
+    code = cli.main(
+        ["beacon", "stop", "--broadcast", "family", "--data-dir", str(tmp_path / "node")]
+    )
+    assert code == 0
+    assert "Stopped the live beacon for broadcast list family" in (
+        capsys.readouterr().out
+    )
+
+
+def test_broadcast_beacon_first_update_outcome():
+    from tau.cli import _broadcast_beacon_outcome
+
+    delivered = {"to": "aa" * 16, "delivered": True, "queued": False}
+    queued = {"to": "bb" * 16, "delivered": False, "queued": True}
+    failed = {"to": "cc" * 16, "ok": False, "error": "refused"}
+    assert (
+        _broadcast_beacon_outcome({"results": [delivered, delivered]}) == "sent"
+    )
+    assert (
+        _broadcast_beacon_outcome({"results": [delivered, queued]}) == "queued"
+    )
+    assert _broadcast_beacon_outcome({"results": [failed]}) == "failed"
+    assert (
+        _broadcast_beacon_outcome({"results": [delivered, failed]})
+        == "partially sent"
+    )
+    # No legs at all keeps the old wording instead of crashing.
+    assert _broadcast_beacon_outcome({}) == "sent"
+
+
+def test_beacon_start_broadcast_reports_failed_first_update(
+    tmp_path, capsys, monkeypatch
+):
+    monkeypatch.setattr(cli, "TauNode", _FakeBeaconNode)
+    _FakeBeaconNode.instances.clear()
+
+    def failed_update(self, beacon, **kwargs):
+        return {
+            "ok": False,
+            "broadcast": "family",
+            "sent_at": 0.0,
+            "results": [
+                {"to": BEACON_PEER, "ok": False, "error": "refused"},
+            ],
+        }
+
+    monkeypatch.setattr(_FakeBeaconNode, "send_beacon_update", failed_update)
+    code = cli.main(
+        [
+            "beacon", "start", "--broadcast", "family",
+            "--location", "34.05,-83.88 Rock Springs Park",
+            "--data-dir", str(tmp_path / "node"),
+        ]
+    )
+    assert code == 0
+    assert "first update failed" in capsys.readouterr().out
+
+
+def test_beacon_start_broadcast_reports_queued_first_update(
+    tmp_path, capsys, monkeypatch
+):
+    monkeypatch.setattr(cli, "TauNode", _FakeBeaconNode)
+    _FakeBeaconNode.instances.clear()
+
+    def queued_update(self, beacon, **kwargs):
+        return {
+            "ok": True,
+            "broadcast": "family",
+            "sent_at": 0.0,
+            "results": [
+                {"to": BEACON_PEER, "delivered": False, "queued": True},
+            ],
+        }
+
+    monkeypatch.setattr(_FakeBeaconNode, "send_beacon_update", queued_update)
+    code = cli.main(
+        [
+            "beacon", "start", "--broadcast", "family",
+            "--location", "34.05,-83.88 Rock Springs Park",
+            "--data-dir", str(tmp_path / "node"),
+        ]
+    )
+    assert code == 0
+    assert "first update queued" in capsys.readouterr().out
 
 
 # -- channel scheduled messages (#547) --------------------------------------

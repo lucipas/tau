@@ -256,4 +256,35 @@ describe("BroadcastsPanel", () => {
     renderPanel({ broadcasts: [] });
     expect(screen.getByText(/No broadcast lists/)).toBeTruthy();
   });
+
+  it("offers live location per list and opens the beacon control", () => {
+    renderPanel({ beacons: [] });
+    fireEvent.click(screen.getByRole("button", { name: /Share live location/ }));
+    expect(screen.getByText("Share live location with team")).toBeTruthy();
+  });
+
+  it("shows the running broadcast beacon's banner for its list", () => {
+    renderPanel({
+      beacons: [
+        {
+          id: "aabbccdd",
+          target: "team",
+          target_kind: "broadcast",
+          target_name: "team",
+          started_at: 1700000000,
+          expires_at: Date.now() / 1000 + 1860,
+          interval: 300,
+          coarse: false,
+          location: { lat: 34.05, lon: -83.88 },
+          next_update_at: 1700000300,
+          updates_sent: 1,
+          stopped: false,
+          active: true,
+          expires_in_seconds: 1860,
+        },
+      ],
+    });
+    expect(screen.getByText(/Sharing live location with team/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Stop sharing/ })).toBeTruthy();
+  });
 });

@@ -345,9 +345,9 @@ export interface LiveBeacon {
 /** A live beacon this node is sharing, as served by GET /api/beacons. */
 export interface Beacon {
   id: string;
-  /** Destination hash of the DM peer, or the group id. */
+  /** Destination hash of the DM peer, the group id, or the broadcast list name. */
   target: string;
-  target_kind: "dm" | "group";
+  target_kind: "dm" | "group" | "broadcast";
   target_name: string;
   started_at: number;
   expires_at: number;
