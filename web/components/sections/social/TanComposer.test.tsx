@@ -233,6 +233,89 @@ describe("TanComposer drafts", () => {
     );
   });
 
+  it("saves a picked image and contact card with the draft", async () => {
+    const composer = makeComposer();
+    const onSaveDraft = vi.fn().mockResolvedValue(undefined);
+    const peers = [{ key: "cc".repeat(16), name: "carol" }];
+    render(
+      <TanComposer composer={composer} onSaveDraft={onSaveDraft} contactPeers={peers} />,
+    );
+    pickImage();
+    fireEvent.click(screen.getByRole("button", { name: "👤 Contact" }));
+    fireEvent.change(screen.getByLabelText("Peer to share"), {
+      target: { value: "cc".repeat(16) },
+    });
+    typePost("with everything");
+    fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
+    await waitFor(() =>
+      expect(onSaveDraft).toHaveBeenCalledWith(
+        "with everything",
+        expect.objectContaining({
+          image: { dataUrl: "data:image/png;base64,aGVsbG8=" },
+          contact: { name: "carol", destination_hash: "cc".repeat(16) },
+        }),
+      ),
+    );
+  });
+
+  it("prefills a loaded draft's image, place and card, and publishes them", async () => {
+    const composer = makeComposer();
+    const onPosted = vi.fn();
+    render(
+      <TanComposer
+        composer={composer}
+        onPosted={onPosted}
+        initialText="with everything"
+        initialImage={{
+          dataUrl: "data:image/png;base64,aGVsbG8=",
+          name: "pic.png",
+          size: 5,
+        }}
+        initialContact={{ name: "carol", destination_hash: "cc".repeat(16) }}
+        initialLocation={{ lat: 34.05, lon: -83.88, name: "Rock Springs Park" }}
+        contactPeers={[{ key: "cc".repeat(16), name: "carol" }]}
+      />,
+    );
+    expect(screen.getByText("pic.png")).toBeTruthy();
+    expect(screen.getByText("Rock Springs Park")).toBeTruthy();
+    expect(screen.getByText(/Sharing:/)).toBeTruthy();
+    submit();
+    await waitFor(() =>
+      expect(composer.publish).toHaveBeenCalledWith(
+        "with everything",
+        expect.objectContaining({
+          image: { dataUrl: "data:image/png;base64,aGVsbG8=" },
+          location: { lat: 34.05, lon: -83.88, name: "Rock Springs Park" },
+          contact: { name: "carol", destination_hash: "cc".repeat(16) },
+        }),
+      ),
+    );
+    expect(onPosted).toHaveBeenCalled();
+  });
+
+  it("carries a loaded draft's card through when its peer is no longer listed", async () => {
+    const composer = makeComposer();
+    render(
+      <TanComposer
+        composer={composer}
+        initialText="for carol"
+        initialContact={{ name: "carol", destination_hash: "cc".repeat(16) }}
+        contactPeers={[]}
+      />,
+    );
+    expect(screen.getByText(/Sharing:/)).toBeTruthy();
+    expect(screen.getByText("carol")).toBeTruthy();
+    submit();
+    await waitFor(() =>
+      expect(composer.publish).toHaveBeenCalledWith(
+        "for carol",
+        expect.objectContaining({
+          contact: { name: "carol", destination_hash: "cc".repeat(16) },
+        }),
+      ),
+    );
+  });
+
   it("prefills text and expiry from a loaded draft", () => {
     const composer = makeComposer();
     render(

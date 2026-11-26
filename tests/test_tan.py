@@ -62,6 +62,7 @@ from tau.tangents.tan import (
     expand_follow_scope,
     extract_tags,
     feed,
+    find_draft_by_image,
     find_post_by_image,
     follow,
     follow_tag,
@@ -10702,6 +10703,72 @@ def test_drafts_crud_and_validation(tmp_path):
         conn.close()
 
 
+def test_drafts_carry_attachments(tmp_path):
+    conn = init_db(tmp_path / "tan.sqlite3")
+    try:
+        image = _image_for(_png_bytes())
+        location = {"lat": 34.05, "lon": -83.88, "name": "Rock Springs Park"}
+        contact = {"name": "carol", "destination_hash": "cc" * 16}
+        draft = save_draft(
+            conn,
+            "with everything",
+            image=image,
+            location=location,
+            contact=contact,
+            now=1000,
+        )
+        assert draft["image"] == image
+        assert draft["location"] == location
+        assert draft["contact"] == contact
+        assert get_draft(conn, draft["id"]) == draft
+        assert list_drafts(conn)[0]["contact"] == contact
+        # The media endpoint finds the draft by its image, so the
+        # console can load the image back for the composer.
+        assert find_draft_by_image(conn, image["sha256"])["id"] == draft["id"]
+        assert find_draft_by_image(conn, "00" * 32) is None
+        assert find_draft_by_image(conn, "not-hex") is None
+
+        # A reply draft cannot carry any of them — refused at save
+        # time, not dropped at publish time.
+        parent = "ab" * 32
+        for kwargs in (
+            {"image": image},
+            {"location": location},
+            {"contact": contact},
+        ):
+            with pytest.raises(TanError):
+                save_draft(conn, "a reply", reply_to=parent, **kwargs)
+
+        # Invalid attachments are refused at save time, like a post's.
+        with pytest.raises(PostError):
+            save_draft(
+                conn,
+                "bad image",
+                image={
+                    "sha256": "zz",
+                    "size": 10,
+                    "mime": "image/png",
+                    "name": "x.png",
+                },
+            )
+        with pytest.raises(PostError):
+            save_draft(conn, "bad pin", location={"lat": 91.0, "lon": 0.0})
+        with pytest.raises(PostError):
+            save_draft(
+                conn,
+                "bad card",
+                contact={"name": "carol", "destination_hash": "nope"},
+            )
+
+        # A plain draft still round-trips with no attachments.
+        plain = save_draft(conn, "plain", now=1001)
+        assert plain["image"] is None
+        assert plain["location"] is None
+        assert plain["contact"] is None
+    finally:
+        conn.close()
+
+
 def test_drafts_cap(tmp_path):
     conn = init_db(tmp_path / "tan.sqlite3")
     try:
@@ -10783,6 +10850,232 @@ def test_cli_tan_drafts(tmp_path, capsys):
     assert main(["tan", "discard-draft", "--data-dir", str(data_dir), "999"]) == 1
     assert "unknown draft" in capsys.readouterr().err
     assert main(["tan", "publish-draft", "--data-dir", str(data_dir), "999"]) == 1
+
+
+def test_cli_tan_draft_with_attachments(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    capsys.readouterr()
+    _seed_tan_contact_peer(data_dir)
+    photo = tmp_path / "photo.png"
+    photo.write_bytes(_png_bytes())
+    assert (
+        main(
+            [
+                "tan",
+                "draft",
+                "--data-dir",
+                str(data_dir),
+                "--image",
+                str(photo),
+                "--location",
+                "34.05,-83.88 Rock Springs Park",
+                "--contact",
+                "carol",
+                "--json",
+                "with everything",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    draft = payload["draft"]
+    assert draft["image"]["name"] == "photo.png"
+    assert draft["image"]["size"] == len(_png_bytes())
+    assert draft["location"] == {
+        "lat": 34.05,
+        "lon": -83.88,
+        "name": "Rock Springs Park",
+    }
+    assert draft["contact"] == {
+        "name": "carol",
+        "destination_hash": "cc" * 16,
+    }
+    # The list shows the attachments, like a post shows its own.
+    assert main(["tan", "drafts", "--data-dir", str(data_dir)]) == 0
+    out = capsys.readouterr().out
+    assert "image photo.png" in out
+    assert "📍 Rock Springs Park — 34.05, -83.88" in out
+    assert "👤 Shared contact: carol (cccccccc…)" in out
+    # Publishing forwards them into the signed post and consumes the draft.
+    assert (
+        main(
+            [
+                "tan",
+                "publish-draft",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                str(draft["id"]),
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["post"]["image"]["name"] == "photo.png"
+    assert payload["post"]["location"] == {
+        "lat": 34.05,
+        "lon": -83.88,
+        "name": "Rock Springs Park",
+    }
+    assert payload["post"]["contact"] == {
+        "name": "carol",
+        "destination_hash": "cc" * 16,
+    }
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        assert list_drafts(conn) == []
+    finally:
+        conn.close()
+
+
+def test_cli_tan_draft_refuses_attachments_on_reply(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    capsys.readouterr()
+    _seed_tan_contact_peer(data_dir)
+    photo = tmp_path / "photo.png"
+    photo.write_bytes(_png_bytes())
+    assert (
+        main(
+            [
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                "parent post",
+            ]
+        )
+        == 0
+    )
+    parent = json.loads(capsys.readouterr().out)["post"]["hash"]
+    for extra in (
+        ["--image", str(photo)],
+        ["--location", "34.05,-83.88 Park"],
+        ["--contact", "carol"],
+    ):
+        assert (
+            main(
+                [
+                    "tan",
+                    "draft",
+                    "--data-dir",
+                    str(data_dir),
+                    "--reply-to",
+                    parent,
+                    *extra,
+                    "a reply",
+                ]
+            )
+            == 2
+        )
+        assert "can only be attached to a top-level post" in capsys.readouterr().err
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        assert list_drafts(conn) == []
+    finally:
+        conn.close()
+
+
+def test_cli_tan_publish_draft_refuses_blocked_contact(tmp_path, capsys):
+    from tau.blocklist import BlockList, save_blocklist
+
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    capsys.readouterr()
+    _seed_tan_contact_peer(data_dir)
+    assert (
+        main(
+            [
+                "tan",
+                "draft",
+                "--data-dir",
+                str(data_dir),
+                "--contact",
+                "carol",
+                "--json",
+                "talk to carol",
+            ]
+        )
+        == 0
+    )
+    draft_id = json.loads(capsys.readouterr().out)["draft"]["id"]
+    config = TauConfig.resolve(data_dir=data_dir, name="alice")
+    save_blocklist(config.blocklist_path, BlockList(blocked=frozenset({"cc" * 16})))
+    assert (
+        main(
+            [
+                "tan",
+                "publish-draft",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                str(draft_id),
+            ]
+        )
+        == 1
+    )
+    err = capsys.readouterr().err
+    assert "kept" in err
+    assert "blocked peer" in err
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        assert [d["id"] for d in list_drafts(conn)] == [draft_id]
+    finally:
+        conn.close()
+
+
+def test_cli_tan_publish_draft_refuses_missing_image_bytes(tmp_path, capsys):
+    from tau.tangents.tan import media_path
+
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    capsys.readouterr()
+    photo = tmp_path / "photo.png"
+    photo.write_bytes(_png_bytes())
+    assert (
+        main(
+            [
+                "tan",
+                "draft",
+                "--data-dir",
+                str(data_dir),
+                "--image",
+                str(photo),
+                "--json",
+                "with a photo",
+            ]
+        )
+        == 0
+    )
+    draft = json.loads(capsys.readouterr().out)["draft"]
+    stored = media_path(data_dir, draft["image"]["sha256"])
+    assert stored is not None
+    stored.unlink()
+    assert (
+        main(
+            [
+                "tan",
+                "publish-draft",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                str(draft["id"]),
+            ]
+        )
+        == 1
+    )
+    err = capsys.readouterr().err
+    assert "kept" in err
+    assert "image bytes" in err
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        assert [d["id"] for d in list_drafts(conn)] == [draft["id"]]
+    finally:
+        conn.close()
 
 
 def test_cli_tan_draft_expiry_starts_at_publish(tmp_path, capsys):
@@ -11554,6 +11847,52 @@ def test_drafts_table_migrates_post_hash_columns(tmp_path):
         assert draft["post_hash"] == ""
         assert draft["pending_peers"] == []
         assert draft["claimed_at"] is None
+    finally:
+        conn.close()
+
+
+def test_drafts_table_migrates_attachment_columns(tmp_path):
+    db_path = tmp_path / "tan.sqlite3"
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            "CREATE TABLE drafts ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "text TEXT NOT NULL, "
+            "reply_to TEXT NOT NULL DEFAULT '', "
+            "expires_in REAL, "
+            "created_at REAL NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO drafts(text, reply_to, expires_in, created_at) "
+            "VALUES('old draft', '', NULL, 123.0)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    conn = init_db(db_path)
+    try:
+        columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(drafts)").fetchall()
+        }
+        assert {"image", "location", "contact"} <= columns
+        draft = get_draft(conn, 1)
+        assert draft["text"] == "old draft"
+        assert draft["image"] is None
+        assert draft["location"] is None
+        assert draft["contact"] is None
+        # And a draft with attachments works on the migrated store.
+        saved = save_draft(
+            conn,
+            "with everything",
+            image=_image_for(_png_bytes()),
+            location={"lat": 34.05, "lon": -83.88, "name": "Rock Springs Park"},
+            contact={"name": "carol", "destination_hash": "cc" * 16},
+        )
+        assert saved["image"]["name"] == "photo.png"
+        assert saved["location"]["name"] == "Rock Springs Park"
+        assert saved["contact"]["name"] == "carol"
     finally:
         conn.close()
 

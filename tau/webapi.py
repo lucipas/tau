@@ -215,13 +215,13 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/tan/likes    who liked a Tan post (?target=<post hash>)
     GET  /api/tan/reposts  who reposted a Tan post (?target=<post hash>)
     GET  /api/tan/quotes   standing quotes of a Tan post (?target=<post hash>)
-    POST /api/tan/posts    publish a Tan post (optional "image" base64 data URL, optional "contact" card)
+    POST /api/tan/posts    publish a Tan post (optional "image" base64 data URL, optional "location" pin, optional "contact" card)
     POST /api/tan/schedule schedule a Tan post, repost or quote — or a poll, with ``"poll_options"`` — for later (optional "image" base64 data URL, optional "location" pin, optional "contact" card)
     GET  /api/tan/scheduled queued Tan posts, reposts, quotes and polls, soonest first
     POST /api/tan/cancel-scheduled cancel a queued Tan post
     POST /api/tan/edit-scheduled edit a queued Tan post's text/time
     GET  /api/tan/drafts   saved Tan post drafts, newest first
-    POST /api/tan/drafts   save a Tan post draft
+    POST /api/tan/drafts   save a Tan post draft (optional "image" base64 data URL, optional "location" pin, optional "contact" card)
     POST /api/tan/drafts/delete discard a saved Tan post draft
     POST /api/tan/quote    quote a post with your own comment (optional "image" base64 data URL)
     POST /api/tan/like     like a post (signed reaction on your chain)
@@ -3970,6 +3970,7 @@ class WebBridge:
         reply_to: Optional[str] = None,
         expires_in: Optional[float] = None,
         image: Optional[str] = None,
+        location: Optional[Dict[str, Any]] = None,
         contact: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         app = self._tan_app()
@@ -3978,6 +3979,10 @@ class WebBridge:
         if image is not None and reply_to is not None:
             raise ValueError(
                 "an image can only be attached to a top-level post, not a reply"
+            )
+        if location is not None and reply_to is not None:
+            raise ValueError(
+                "a location can only be attached to a top-level post, not a reply"
             )
         if contact is not None and reply_to is not None:
             raise ValueError(
@@ -3989,6 +3994,14 @@ class WebBridge:
 
             image_attachment = image_attachment_from_data_url(
                 image, Path(self._tan_db_path()).parent
+            )
+        cleaned_location = (
+            clean_location(location) if location is not None else None
+        )
+        if location is not None and cleaned_location is None:
+            raise ValueError(
+                "field 'location' must be an object with latitude "
+                "-90..90 and longitude -180..180"
             )
         # Same refusals as the channel, DM and group sends: a card for
         # your own hash or a blocked peer is refused, and an unreadable
@@ -4012,6 +4025,7 @@ class WebBridge:
             publish=True,
             expires_at=expires_at,
             image=image_attachment,
+            location=cleaned_location,
             contact=cleaned_contact,
         )
 
@@ -4292,24 +4306,70 @@ class WebBridge:
         *,
         reply_to: Optional[str] = None,
         expires_in: Optional[float] = None,
+        image: Optional[str] = None,
+        location: Optional[Dict[str, Any]] = None,
+        contact: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Save a Tan post draft, like ``tau tan draft``.
 
         The reply target is resolved to its full hash, like
         :meth:`tan_post` resolves it; the expiry clock starts when
-        the draft is published, not when it is saved.
+        the draft is published, not when it is saved.  An *image*
+        data URL is decoded the same way :meth:`tan_post` decodes
+        one — the bytes are pinned in the local media store at save
+        time — and a *location* pin and a *contact* card ride the
+        draft the same way they ride a post.  All three are refused
+        on a reply draft, like on a post, and the card is vetted
+        against the sharing policy now, like :meth:`tan_post` vets
+        it; the publish path re-checks the policy again.
         """
         from .tangents.tan import resolve_post, save_draft
+
+        if image is not None and reply_to is not None:
+            raise ValueError(
+                "an image can only be attached to a top-level post, not a reply"
+            )
+        if location is not None and reply_to is not None:
+            raise ValueError(
+                "a location can only be attached to a top-level post, not a reply"
+            )
+        if contact is not None and reply_to is not None:
+            raise ValueError(
+                "a contact card can only be attached to a top-level post, "
+                "not a reply"
+            )
+        cleaned_location = (
+            clean_location(location) if location is not None else None
+        )
+        if location is not None and cleaned_location is None:
+            raise ValueError(
+                "field 'location' must be an object with latitude "
+                "-90..90 and longitude -180..180"
+            )
+        cleaned_contact = self._vet_channel_contact(contact)
 
         conn = self._tan_conn()
         try:
             if reply_to is not None:
                 reply_to = resolve_post(conn, reply_to)["hash"]
+            # Decode the image after the reply resolves: a refused
+            # save must not leave unreferenced bytes in the pinned
+            # media store, which is never pruned.
+            image_attachment: Optional[Dict[str, Any]] = None
+            if image is not None:
+                from .tangents.tan import image_attachment_from_data_url
+
+                image_attachment = image_attachment_from_data_url(
+                    image, Path(self._tan_db_path()).parent
+                )
             return save_draft(
                 conn,
                 text,
                 reply_to=reply_to or "",
                 expires_in=expires_in,
+                image=image_attachment,
+                location=cleaned_location,
+                contact=cleaned_contact,
             )
         finally:
             conn.close()
@@ -13141,9 +13201,13 @@ class WebBridge:
         digest, so a stored file is always served with the type its
         author declared; a digest with no local post falls back to a
         generic name and ``application/octet-stream``.  The bytes are
-        re-checked against the digest before serving.
+        re-checked against the digest before serving.  A digest carried
+        only by a saved draft is served the same way, so the owner's
+        console can load the draft's image back for the composer — the
+        peer fetch path still refuses unpublished uploads.
         """
         from .tangents.tan import (
+            find_draft_by_image,
             find_post_by_image,
             init_db,
             media_path,
@@ -13176,15 +13240,20 @@ class WebBridge:
             conn = init_db(self._tan_db_path())
             try:
                 post = find_post_by_image(conn, digest)
+                draft = (
+                    find_draft_by_image(conn, digest) if post is None else None
+                )
             finally:
                 conn.close()
         except Exception:  # pragma: no cover - a broken Tan DB must not block serving
             post = None
-        if post is None and media_requires_publication(stored):
+            draft = None
+        if post is None and draft is None and media_requires_publication(stored):
             # A local upload whose post was never published stays private.
             return None
-        if post is not None:
-            image = post.get("image") or {}
+        carrier = post if post is not None else draft
+        if carrier is not None:
+            image = carrier.get("image") or {}
             if isinstance(image.get("mime"), str) and image["mime"]:
                 mime = image["mime"]
             if isinstance(image.get("name"), str) and image["name"]:
@@ -16708,6 +16777,23 @@ class _WebHandler(BaseHTTPRequestHandler):
                         400,
                     )
                     return
+                location = body.get("location")
+                if location is not None:
+                    if not isinstance(location, dict) or (
+                        clean_location(location) is None
+                    ):
+                        self._send_json(
+                            {
+                                "error": {
+                                    "message": "field 'location' must be an "
+                                    "object with latitude -90..90 and "
+                                    "longitude -180..180"
+                                }
+                            },
+                            head_only,
+                            400,
+                        )
+                        return
                 contact = body.get("contact")
                 if contact is not None:
                     if not isinstance(contact, dict):
@@ -16743,6 +16829,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                             float(expires_in) if expires_in is not None else None
                         ),
                         image=image,
+                        location=location,
                         contact=contact,
                     )
                 except (ValueError, ProtocolError) as exc:
@@ -17140,6 +17227,62 @@ class _WebHandler(BaseHTTPRequestHandler):
                             400,
                         )
                         return
+                image = body.get("image")
+                if image is not None and not isinstance(image, str):
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "field 'image' must be a base64 data URL"
+                            }
+                        },
+                        head_only,
+                        400,
+                    )
+                    return
+                location = body.get("location")
+                if location is not None:
+                    if not isinstance(location, dict) or (
+                        clean_location(location) is None
+                    ):
+                        self._send_json(
+                            {
+                                "error": {
+                                    "message": "field 'location' must be an "
+                                    "object with latitude -90..90 and "
+                                    "longitude -180..180"
+                                }
+                            },
+                            head_only,
+                            400,
+                        )
+                        return
+                contact = body.get("contact")
+                if contact is not None:
+                    if not isinstance(contact, dict):
+                        self._send_json(
+                            {
+                                "error": {
+                                    "message": "field 'contact' must be an object "
+                                    "with a name and a destination hash"
+                                }
+                            },
+                            head_only,
+                            400,
+                        )
+                        return
+                    if clean_contact(contact) is None:
+                        self._send_json(
+                            {
+                                "error": {
+                                    "message": "field 'contact' must be a card "
+                                    "with a name and a 32-character hex "
+                                    "destination hash"
+                                }
+                            },
+                            head_only,
+                            400,
+                        )
+                        return
                 try:
                     draft = self.bridge.tan_save_draft(
                         text,
@@ -17147,6 +17290,9 @@ class _WebHandler(BaseHTTPRequestHandler):
                         expires_in=(
                             float(expires_in) if expires_in is not None else None
                         ),
+                        image=image,
+                        location=location,
+                        contact=contact,
                     )
                 except (ValueError, ProtocolError) as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
