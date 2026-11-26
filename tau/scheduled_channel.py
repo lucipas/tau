@@ -35,6 +35,17 @@ published message is the same one an immediate send would have
 made.  Queue files written before cards could be scheduled carry
 no ``contact`` and load with no card, exactly as before.
 
+An explicit expiry queues the same way (``tau channel send
+--expire 2h --delay 5m``): the queued entry carries the lifetime in
+seconds from publish, and the publish pass signs the message with
+``expires_at`` set that far past the publish time, so the published
+message disappears exactly like an immediate ``--expire`` send
+would.  The explicit expiry wins over the channel's disappearing
+default at publish time, the same way an explicit ``expires_at``
+wins in ``ChannelApp.send``.  Queue files written before expiries
+could be scheduled carry no ``expires_in`` and load with no explicit
+expiry, exactly as before.
+
 Entries are validated on load the way the other small JSON stores
 are: a malformed file raises rather than silently dropping queued
 messages, and the mail-loop publisher treats a corrupt queue as
@@ -45,6 +56,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import secrets
 import time
@@ -53,7 +65,13 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
-from .protocol import ProtocolError, clean_contact, clean_location, normalize_message
+from .protocol import (
+    MAX_MAIL_TTL,
+    ProtocolError,
+    clean_contact,
+    clean_location,
+    normalize_message,
+)
 from .util import atomic_write_json, ensure_dir
 
 log = logging.getLogger(__name__)
@@ -239,6 +257,38 @@ def _clean_contact(value: Any) -> Optional[Dict[str, Any]]:
     return cleaned
 
 
+def _clean_expires_in(value: Any) -> Optional[float]:
+    # None stays None (no explicit expiry — the publish pass falls
+    # back to the channel's disappearing default, exactly like an
+    # immediate send with no --expire).  A present value must be a
+    # positive lifetime no longer than the mail TTL, or the entry is
+    # malformed: a scheduled message must not silently drop an expiry
+    # the user asked for, and an expiry longer than the envelope that
+    # might carry the message could never be honoured.
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ScheduledChannelError(
+            "scheduled channel message expires_in must be a number of seconds"
+        )
+    try:
+        seconds = float(value)
+    except OverflowError as exc:
+        # A huge JSON integer cannot convert to a float; treat it as the
+        # same invalid duration so the queue reads as unusable, not as a
+        # crash that skips every queued message.
+        raise ScheduledChannelError(
+            "scheduled channel message expires_in must be more than 0s and "
+            "at most 30d"
+        ) from exc
+    if not math.isfinite(seconds) or seconds <= 0 or seconds > MAX_MAIL_TTL:
+        raise ScheduledChannelError(
+            "scheduled channel message expires_in must be more than 0s and "
+            "at most 30d"
+        )
+    return seconds
+
+
 def channel_contact_refusal(
     contact: Dict[str, Any],
     *,
@@ -306,6 +356,14 @@ class ScheduledChannelMessage:
     # "destination_hash": <32 hex>}``.  Defaults to None so queue
     # files written before cards could be scheduled load unchanged.
     contact: Optional[Dict[str, Any]] = None
+    # An explicit expiry on the queued message, in seconds from
+    # publish, like an immediate ``tau channel send --expire``: the
+    # publish pass signs the message with ``expires_at`` that far past
+    # the publish time.  Defaults to None so queue files written
+    # before expiries could be scheduled load unchanged — and a None
+    # here means the channel's disappearing default applies at
+    # publish time, exactly like an immediate send with no --expire.
+    expires_in: Optional[float] = None
 
     def __post_init__(self) -> None:
         # A frozen dataclass still builds through __init__: validate
@@ -327,6 +385,7 @@ class ScheduledChannelMessage:
         object.__setattr__(self, "options", _clean_options(self.options))
         object.__setattr__(self, "location", _clean_location(self.location))
         object.__setattr__(self, "contact", _clean_contact(self.contact))
+        object.__setattr__(self, "expires_in", _clean_expires_in(self.expires_in))
         if self.kind == "poll":
             # A poll is a top-level entry: its options are fixed at
             # schedule time.
@@ -363,6 +422,7 @@ class ScheduledChannelMessage:
             "options": list(self.options),
             "location": self.location,
             "contact": self.contact,
+            "expires_in": self.expires_in,
         }
 
     @classmethod
@@ -386,6 +446,7 @@ class ScheduledChannelMessage:
             options=_clean_options(data.get("options")),
             location=_clean_location(data.get("location")),
             contact=_clean_contact(data.get("contact")),
+            expires_in=_clean_expires_in(data.get("expires_in")),
         )
 
 
@@ -531,6 +592,19 @@ def scheduled_channel_messages_lock(path: Union[str, Path]) -> Iterator[None]:
                 msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
 
 
+def _wire_created_at(publish_at: float) -> float:
+    """The largest ``created_at`` the publish pass can stamp.
+
+    The publish pass stamps ``created_at`` with the send time,
+    rounded to milliseconds, so its fractional digits can be longer
+    than a whole publish time.  Measuring with a full three-digit
+    fraction keeps the schedule and edit preflights from
+    undercounting the bytes the timestamp takes on the wire.  Both
+    paths share this helper so they cannot drift.
+    """
+    return math.floor(publish_at) + 0.999
+
+
 def _preflight_envelope(
     *,
     channel: str,
@@ -614,6 +688,7 @@ def schedule_channel_message(
     options: Optional[Sequence[str]] = None,
     location: Optional[Dict[str, Any]] = None,
     contact: Optional[Dict[str, Any]] = None,
+    expires_in: Optional[float] = None,
     disappearing_path: Optional[Union[str, Path]] = None,
 ) -> ScheduledChannelMessage:
     """Queue a channel message for *publish_at*; returns the stored entry.
@@ -651,6 +726,17 @@ def schedule_channel_message(
     immediate ``tau channel send --contact``: it is validated here,
     rides in the measured envelope, and the publish pass attaches it
     when the message goes out.  A poll cannot carry one.
+
+    An *expires_in* makes the queued message a disappearing one, like
+    an immediate ``tau channel send --expire``: seconds from publish
+    until the message expires, at most the 30-day mail TTL.  It is
+    validated here, rides in the measured envelope as ``expires_at``
+    that far past the publish time, and the publish pass signs the
+    message with that expiry — winning over the channel's
+    disappearing default, exactly like an explicit ``expires_at``
+    wins in ``ChannelApp.send``.  A poll can carry one: expiry is
+    not a top-level attachment like a pin or a card, and the protocol
+    already allows ``expires_at`` on poll messages.
     """
     clean_channel = _clean_channel(channel)
     clean_text = _clean_text(text)
@@ -683,28 +769,41 @@ def schedule_channel_message(
     clean_contact_value = _clean_contact(contact)
     if clean_kind == "poll" and clean_contact_value is not None:
         raise ScheduledChannelError("a scheduled poll cannot carry a contact card")
+    clean_expires_in = _clean_expires_in(expires_in)
+    clean_publish_at = _clean_timestamp(publish_at, "publish_at")
+    # The publish pass stamps created_at with the send time, rounded to
+    # milliseconds — see _wire_created_at — and signs expires_at as
+    # that send time plus the raw expiry, unrounded: ChannelApp.send
+    # retains the unrounded expiry from a fractional expires_in or the
+    # channel's disappearing default.  Measure the expiry unrounded
+    # too, so the preflight never undercounts the bytes the
+    # timestamps take on the wire.
+    wire_at = _wire_created_at(clean_publish_at)
     envelope = {
         # Placeholder author/key at their real lengths (destination
         # hash 32 hex, RNS public key 128 hex): a shorter placeholder
         # would admit a message that only fails once signed.  The
         # remaining signed fields are carried at their real shape too:
         # the version and an empty reply target.  An expiry rides
-        # only when the channel has a disappearing default — the
-        # publish pass applies that same default, and a channel
-        # without one publishes with no expiry at all, so sizing
-        # one in here would reject a poll that fits on the wire.
+        # only when the message will actually carry one at publish
+        # time — an explicit *expires_in* here, else the channel's
+        # disappearing default — and a channel without either
+        # publishes with no expiry at all, so sizing one in here
+        # would reject a poll that fits on the wire.
         "v": CHANNEL_VERSION,
         "channel": clean_channel,
         "author": "0" * 32,
         "key": "0" * 128,
         "name": sanitize_name(name or "anonymous"),
         "text": clean_text,
-        "created_at": publish_at,
+        "created_at": wire_at,
         "reply_to": "",
     }
     default_expire = channel_default_for(disappearing_path, clean_channel)
-    if default_expire is not None:
-        envelope["expires_at"] = publish_at + default_expire
+    if clean_expires_in is not None:
+        envelope["expires_at"] = wire_at + clean_expires_in
+    elif default_expire is not None:
+        envelope["expires_at"] = wire_at + default_expire
     if clean_kind == "poll":
         envelope["poll_options"] = list(clean_options)
     if clean_location_value is not None:
@@ -727,6 +826,7 @@ def schedule_channel_message(
         options=clean_options,
         location=clean_location_value,
         contact=clean_contact_value,
+        expires_in=clean_expires_in,
     )
     with scheduled_channel_messages_lock(path):
         queue = load_scheduled_channel_messages(path)
@@ -745,13 +845,16 @@ def schedule_channel_poll(
     ttl: int = 3,
     now: Optional[float] = None,
     name: Optional[str] = None,
+    expires_in: Optional[float] = None,
     disappearing_path: Optional[Union[str, Path]] = None,
 ) -> ScheduledChannelMessage:
     """Queue a poll for *publish_at*; returns the stored entry.
 
     Thin wrapper over :func:`schedule_channel_message` with
     ``kind="poll"``: the question is the entry text and the options
-    ride alongside it.
+    ride alongside it.  An *expires_in* makes the poll a disappearing
+    one, seconds from publish until it expires, like an immediate
+    poll's channel disappearing default — only explicit.
     """
     return schedule_channel_message(
         path,
@@ -764,6 +867,7 @@ def schedule_channel_poll(
         name=name,
         kind="poll",
         options=options,
+        expires_in=expires_in,
         disappearing_path=disappearing_path,
     )
 
@@ -849,15 +953,20 @@ def edit_scheduled_channel_message(
         # against the full normalized shape too.  The entry's pin rides
         # in the measurement: a time-only edit must not bless a message
         # that only fits without it.  The entry's card rides in the
-        # measurement too, for the same reason.
+        # measurement too, for the same reason.  The measured
+        # created_at is the wire-time stamp (see _wire_created_at),
+        # not the raw publish time — the publish pass rounds the send
+        # time to milliseconds, so a whole-second publish time would
+        # undercount the timestamp bytes by two.
+        effective_publish_at = (
+            clean_publish_at
+            if clean_publish_at is not None
+            else message.publish_at
+        )
         _preflight_envelope(
             channel=message.channel,
             text=clean_text if clean_text is not None else message.text,
-            created_at=(
-                clean_publish_at
-                if clean_publish_at is not None
-                else message.publish_at
-            ),
+            created_at=_wire_created_at(effective_publish_at),
             name=name,
             location=message.location,
             contact=message.contact,
@@ -910,7 +1019,11 @@ def publish_due_scheduled_channel_messages(
     signed message is created once and its hash saved before sending,
     so retries re-send the same message.  Peers that already accepted
     it are not sent it again.  A queued poll publishes the same way,
-    through ``app.send`` with its question and fixed options.
+    through ``app.send`` with its question and fixed options.  A queued
+    message with an explicit expiry publishes with ``expires_at`` that
+    far past the publish time, winning over the channel's disappearing
+    default; without one the default applies, exactly like an
+    immediate send.
 
     A failed attempt (exception or per-peer errors) keeps the entry
     queued with exponential backoff.  After ``MAX_PUBLISH_ATTEMPTS`` it
@@ -985,34 +1098,99 @@ def publish_due_scheduled_channel_messages(
                         continue
                 failed_peers: Optional[Tuple[str, ...]] = None
                 try:
-                    targets = _resolve_publish_targets(
-                        message, resolve_peer, should_stop, deadline
-                    )
+                    # First reading, before resolution: a stored copy
+                    # that already expired gets a fresh replacement for
+                    # the full intended set (see below), so the
+                    # replacement is resolved for everyone, not only
+                    # the peers that missed the old copy.
+                    checked_at = round(now if now is not None else time.time(), 3)
                     stored = (
                         app.get_message(message.message_hash)
                         if message.message_hash
                         else None
                     )
+                    expired_copy = (
+                        stored is not None
+                        and stored.get("expires_at") is not None
+                        and float(stored["expires_at"]) <= checked_at
+                    )
+                    if expired_copy:
+                        # The stored copy expired while earlier attempts
+                        # backed off; recipients would discard it, so
+                        # sign a fresh one instead of resending it.
+                        stored = None
+                    if stored is None and message.message_hash is not None:
+                        # A fresh copy will be signed for an entry that
+                        # already has one.  The stored copy is gone —
+                        # expired and cleaned up, or evicted — and peers
+                        # that received the first copy may hold an
+                        # expired one, so the replacement goes to the
+                        # full intended set.  Clearing pending_peers
+                        # makes the resolver fall back to the entry's
+                        # full list.  Decide this before resolving
+                        # targets: a replacement resolved for only the
+                        # retry peers would leave the others with the
+                        # expired copy.
+                        message = replace(message, pending_peers=())
+                    targets = _resolve_publish_targets(
+                        message, resolve_peer, should_stop, deadline
+                    )
+                    # Second reading, after resolution: peer resolution
+                    # can outlast the remaining lifetime.  The send-time
+                    # clock, not the pass start: target resolution and
+                    # earlier messages can use up a short lifetime
+                    # before signing.  Rounded like ChannelApp.send
+                    # rounds created_at, so the lifetime never grows
+                    # past what was asked for.
+                    sent_at = round(now if now is not None else time.time(), 3)
+                    if (
+                        stored is not None
+                        and stored.get("expires_at") is not None
+                        and float(stored["expires_at"]) <= sent_at
+                    ):
+                        # The copy expired while resolving: publishing
+                        # it would look delivered while recipients
+                        # discard it.  Sign a fresh copy for the full
+                        # set instead, and take a fresh reading
+                        # immediately before sending so the new copy's
+                        # lifetime is not spent resolving.
+                        expired_copy = True
+                        stored = None
+                        message = replace(message, pending_peers=())
+                        targets = _resolve_publish_targets(
+                            message, resolve_peer, should_stop, deadline
+                        )
+                        sent_at = round(
+                            now if now is not None else time.time(), 3
+                        )
                     if stored is None:
                         if message.message_hash is not None:
                             # The signed message was created on an
                             # earlier pass but is gone from the local
-                            # store (retention evicted it): sign a
-                            # fresh copy rather than leaving the entry
-                            # stuck forever.  Peers that received the
-                            # first copy see a second message — the
-                            # eviction window makes this rare, and a
-                            # stuck queue entry is worse than a
-                            # duplicate.
+                            # store (retention evicted it), or it expired
+                            # before it could be delivered: sign a fresh
+                            # copy rather than leaving the entry stuck
+                            # forever.  Peers that received the first
+                            # copy see a second message — the window
+                            # makes this rare, and a stuck queue entry
+                            # is worse than a duplicate.
                             log.warning(
-                                "Scheduled channel message %s lost its stored "
-                                "copy; signing a fresh one",
+                                "Scheduled channel message %s %s; signing a "
+                                "fresh one",
                                 message.id,
+                                "expired before delivery"
+                                if expired_copy
+                                else "lost its stored copy",
                             )
                         created = app.send(
                             message.channel,
                             message.text,
                             publish=False,
+                            expires_at=(
+                                sent_at + message.expires_in
+                                if message.expires_in is not None
+                                else None
+                            ),
                             poll_options=(
                                 list(message.options)
                                 if message.kind == "poll"

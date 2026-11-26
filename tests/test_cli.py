@@ -15630,6 +15630,42 @@ def test_channel_send_delay_with_contact_schedules_and_lists(tmp_path, capsys):
     assert "Shared contact: carol" in out
 
 
+def test_channel_send_delay_with_expires_in_schedules_and_lists(tmp_path, capsys):
+    _init_node(tmp_path, "node", "alice")
+    assert _run_channel(tmp_path, "join", "general") == 0
+    capsys.readouterr()
+
+    code = _run_channel(
+        tmp_path,
+        "send",
+        "general",
+        "goodbye soon",
+        "--expire",
+        "2h",
+        "--delay",
+        "5m",
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "scheduled" in out
+    assert "publishes in 5m" in out
+
+    code = _run_channel(tmp_path, "scheduled")
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "#general" in out
+    assert "goodbye soon" in out
+    assert "disappears 2h after publishing" in out
+
+    # The JSON form carries the lifetime in seconds from publish.
+    code = cli.main(
+        ["channel", "--data-dir", str(tmp_path / "node"), "--json", "scheduled"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["scheduled"][0]["expires_in"] == 7200.0
+
+
 def test_channel_send_delay_rejects_bad_combinations(tmp_path, capsys):
     _init_node(tmp_path, "node", "alice")
     assert _run_channel(tmp_path, "join", "general") == 0

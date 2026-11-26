@@ -942,6 +942,8 @@ export interface ScheduledChannelMessage {
   location?: LocationPin;
   /** Shared contact card on a queued message, if any. */
   contact?: { name: string; destination_hash: string };
+  /** Seconds from publish until the message expires, if it is a disappearing message. */
+  expires_in?: number;
   [key: string]: unknown;
 }
 

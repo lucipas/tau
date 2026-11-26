@@ -25471,6 +25471,78 @@ def test_channel_schedule_contact_via_api(tmp_path):
         bridge.stop()
 
 
+def test_channel_schedule_expires_in_via_api(tmp_path):
+    from tau.channels import init_db as init_channel_db, join_channel
+    from tau.config import TauConfig
+
+    assert cli.main(["init", "--data-dir", str(tmp_path), "--name", "tester"]) == 0
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    conn = init_channel_db(node.config.channels_db_path)
+    try:
+        join_channel(conn, "general")
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/schedule",
+            method="POST",
+            body={
+                "channel": "general",
+                "text": "goodbye soon",
+                "send_in": 3600,
+                "expires_in": 7200,
+            },
+        )
+        assert status == 200
+        scheduled = payload["scheduled"]
+        assert scheduled["expires_in"] == 7200
+
+        # The scheduled list carries the expiry.
+        status, _, payload = _json(bridge, "/api/channels/scheduled")
+        assert status == 200
+        assert payload["count"] == 1
+        assert payload["scheduled"][0]["expires_in"] == 7200
+
+        # A scheduled poll can carry one too.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/schedule",
+            method="POST",
+            body={
+                "channel": "general",
+                "text": "which day?",
+                "send_in": 60,
+                "poll_options": ["Saturday", "Sunday"],
+                "expires_in": 3600,
+            },
+        )
+        assert status == 200
+        assert payload["scheduled"]["expires_in"] == 3600
+
+        # A bad lifetime is a bad request, not a silently dropped expiry.
+        for bad in (0, -5, 30 * 24 * 60 * 60 + 1, "2h", True):
+            status, _, payload = _json(
+                bridge,
+                "/api/channels/schedule",
+                method="POST",
+                body={
+                    "channel": "general",
+                    "text": "goodbye soon",
+                    "send_in": 60,
+                    "expires_in": bad,
+                },
+            )
+            assert status == 400
+            assert "expires_in" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
 def test_channel_schedule_rejects_bad_requests(tmp_path):
     from tau.channels import init_db as init_channel_db, join_channel
     from tau.config import TauConfig
