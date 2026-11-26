@@ -182,7 +182,14 @@ def _clean_ttl(value: Any) -> int:
 def _clean_timestamp(value: Any, label: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ScheduledChannelError(f"not a timestamp: {label}={value!r}")
-    stamp = float(value)
+    try:
+        stamp = float(value)
+    except OverflowError as exc:
+        # A huge JSON integer cannot convert to a float; treat it as the
+        # same invalid timestamp so the queue reads as unusable, not as a
+        # crash that skips every queued message.  The value is left out
+        # of the message: a 400-digit integer does not belong in a log.
+        raise ScheduledChannelError(f"not a timestamp: {label}") from exc
     if stamp <= 0 or stamp != stamp or stamp in (float("inf"), float("-inf")):
         raise ScheduledChannelError(f"not a timestamp: {label}={value!r}")
     return stamp
@@ -198,7 +205,13 @@ def _clean_retry_at(value: Any) -> float:
     # 0.0 means "eligible now"; unlike publish_at it is not a real time.
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ScheduledChannelError(f"not a retry time: {value!r}")
-    stamp = float(value)
+    try:
+        stamp = float(value)
+    except OverflowError as exc:
+        # A huge JSON integer cannot convert to a float; treat it as the
+        # same invalid retry time so the queue reads as unusable, not as
+        # a crash that skips every queued message.
+        raise ScheduledChannelError("not a retry time") from exc
     if stamp < 0 or stamp != stamp or stamp == float("inf"):
         raise ScheduledChannelError(f"not a retry time: {value!r}")
     return stamp
