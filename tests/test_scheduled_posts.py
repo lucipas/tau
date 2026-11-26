@@ -101,6 +101,7 @@ def test_store_rejects_reply_with_attachment(tmp_path):
     # carrying either must fail to load.
     for field, value in (
         ("location", {"lat": 34.05, "lon": -83.88}),
+        ("contact", {"name": "carol", "destination_hash": "cc" * 16}),
         ("image", {"sha256": "ab" * 32, "size": 10, "mime": "image/png"}),
     ):
         path = tmp_path / "scheduled-posts.json"
@@ -607,6 +608,104 @@ def test_schedule_post_rejects_text_that_only_fits_without_location(tmp_path):
     assert len(load_scheduled_posts(path).posts) == 1
 
 
+def _contact() -> dict:
+    return {"name": "carol", "destination_hash": "cc" * 16}
+
+
+def test_schedule_post_with_contact_round_trips(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    post = schedule_post(
+        path, text="morning", publish_at=1000.0, now=900.0, contact=_contact()
+    )
+    assert post.contact == _contact()
+    assert load_scheduled_posts(path).posts[0].contact == _contact()
+    assert load_scheduled_posts(path).posts[0].to_dict()["contact"] == _contact()
+
+
+def test_schedule_post_without_contact_loads_as_none(tmp_path):
+    # Old queue files predate the contact field: they load with no card.
+    path = tmp_path / "scheduled-posts.json"
+    post = schedule_post(path, text="plain", publish_at=1000.0, now=900.0)
+    assert post.contact is None
+    stored = post.to_dict()
+    del stored["contact"]
+    path.write_text(json.dumps({"posts": [stored]}))
+    assert load_scheduled_posts(path).posts[0].contact is None
+
+
+def test_schedule_post_rejects_contact_on_reply(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    with pytest.raises(ScheduledPostsError, match="top-level"):
+        schedule_post(
+            path,
+            text="reply",
+            publish_at=1000.0,
+            now=900.0,
+            reply_to="b" * 64,
+            contact=_contact(),
+        )
+    assert load_scheduled_posts(path).posts == ()
+
+
+def test_schedule_post_rejects_contact_on_poll_repost_and_quote(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    target = "d" * 64
+    with pytest.raises(ScheduledPostsError, match="cannot carry a contact card"):
+        schedule_post(
+            path,
+            text="where?",
+            publish_at=1000.0,
+            now=900.0,
+            kind="poll",
+            options=["here", "there"],
+            contact=_contact(),
+        )
+    with pytest.raises(ScheduledPostsError, match="cannot carry a contact card"):
+        schedule_post(
+            path, text="", publish_at=1000.0, now=900.0,
+            kind="repost", target_post=target, contact=_contact(),
+        )
+    with pytest.raises(ScheduledPostsError, match="cannot carry a contact card"):
+        schedule_post(
+            path, text="look", publish_at=1000.0, now=900.0,
+            kind="quote", target_post=target, contact=_contact(),
+        )
+    assert load_scheduled_posts(path).posts == ()
+
+
+def test_schedule_post_rejects_bad_contact(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    bad_contacts = [
+        {"name": "", "destination_hash": "cc" * 16},
+        {"name": "carol"},
+        {"destination_hash": "cc" * 16},
+        {"name": "carol", "destination_hash": "cc" * 15},
+        {"name": "carol", "destination_hash": "zz" * 16},
+        "not-an-object",
+    ]
+    for bad in bad_contacts:
+        with pytest.raises(ScheduledPostsError):
+            schedule_post(
+                path, text="x", publish_at=1000.0, now=900.0, contact=bad
+            )
+    assert load_scheduled_posts(path).posts == ()
+
+
+def test_schedule_post_rejects_text_that_only_fits_without_contact(tmp_path):
+    # The card is ~70 bytes of JSON inside the 8 KiB Tan request:
+    # 1,875 four-byte characters fit on their own but not with one
+    # attached.  Refuse at schedule time, instead of failing every
+    # publish attempt forever.
+    path = tmp_path / "scheduled-posts.json"
+    schedule_post(path, text="😀" * 1875, publish_at=1000.0, now=900.0)
+    with pytest.raises(ScheduledPostsError, match="encoded limit"):
+        schedule_post(
+            path, text="😀" * 1875, publish_at=1000.0, now=900.0,
+            contact=_contact(),
+        )
+    assert len(load_scheduled_posts(path).posts) == 1
+
+
 def test_cancel_scheduled_post_end_to_end(tmp_path):
     path = tmp_path / "scheduled-posts.json"
     post = schedule_post(path, text="later", publish_at=2000.0, now=1000.0)
@@ -825,6 +924,19 @@ def test_edit_scheduled_post_counts_location_in_size_check(tmp_path):
     assert edited.text == "😀" * 1875
 
 
+def test_edit_scheduled_post_counts_contact_in_size_check(tmp_path):
+    # 1,875 four-byte characters fit a plain post, but the card rides
+    # in the same entry: refuse the edit instead of queueing a post
+    # that could never publish.
+    path = tmp_path / "scheduled-posts.json"
+    post = schedule_post(
+        path, text="morning", publish_at=2000.0, now=1000.0, contact=_contact()
+    )
+    with pytest.raises(ScheduledPostsError, match="encoded limit"):
+        edit_scheduled_post(path, post.id, text="😀" * 1875, now=1000.0)
+    assert load_scheduled_posts(path).posts[0].text == "morning"
+
+
 def test_edit_scheduled_post_revalidates_time_after_lock(tmp_path, monkeypatch):
     # The requested time was in the future when the edit started, but
     # the clock moved past it while the edit waited for the queue
@@ -883,7 +995,8 @@ class _FakeTanApp:
         self.fail_repost = fail_repost
 
     def create_post(
-        self, text, *, reply_to=None, expires_at=None, image=None, location=None
+        self, text, *, reply_to=None, expires_at=None, image=None, location=None,
+        contact=None
     ):
         post = {
             "hash": "c" * 64,
@@ -892,6 +1005,7 @@ class _FakeTanApp:
             "expires_at": expires_at,
             "image": image,
             "location": location,
+            "contact": contact,
         }
         self.created.append(post)
         return post
@@ -1109,6 +1223,20 @@ def test_publish_due_attaches_scheduled_location(tmp_path):
     assert result == {"published": 1, "kept": 0}
     assert app.created[0]["location"] == _location()
     assert app.published[0][0]["location"] == _location()
+    assert load_scheduled_posts(path).posts == ()
+
+
+def test_publish_due_attaches_scheduled_contact(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    schedule_post(
+        path, text="morning", publish_at=1000.0, now=900.0, contact=_contact()
+    )
+    app = _FakeTanApp()
+
+    result = publish_due_scheduled_posts(path, app, now=2000.0)
+    assert result == {"published": 1, "kept": 0}
+    assert app.created[0]["contact"] == _contact()
+    assert app.published[0][0]["contact"] == _contact()
     assert load_scheduled_posts(path).posts == ()
 
 

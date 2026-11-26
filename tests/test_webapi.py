@@ -15647,6 +15647,95 @@ def test_tan_post_via_api_accepts_image(tmp_path):
         bridge.stop()
 
 
+def test_tan_post_via_api_accepts_contact(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        parent = create_post(conn, identity, "parent", name="tester", now=1000)
+    finally:
+        conn.close()
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/posts",
+            method="POST",
+            body={
+                "text": "talk to carol",
+                "contact": {"name": "carol", "destination_hash": "cc" * 16},
+            },
+        )
+        assert status == 200
+        post = payload["post"]
+        assert post["kind"] == "post"
+        assert post["contact"] == {
+            "name": "carol",
+            "destination_hash": "cc" * 16,
+        }
+
+        # Bad cards are 400s, not crashes — and store nothing.
+        for body, fragment in [
+            ({"text": "x", "contact": "carol"}, "contact"),
+            ({"text": "x", "contact": {"name": "carol"}}, "contact"),
+            (
+                {"text": "x", "contact": {"name": "", "destination_hash": "cc" * 16}},
+                "contact",
+            ),
+            (
+                {
+                    "text": "x",
+                    "contact": {"name": "carol", "destination_hash": "zz" * 16},
+                },
+                "contact",
+            ),
+            (
+                {
+                    "text": "x",
+                    "contact": {"name": "carol", "destination_hash": "cc" * 15},
+                },
+                "contact",
+            ),
+        ]:
+            status, _, payload = _json(
+                bridge, "/api/tan/posts", method="POST", body=body
+            )
+            assert status == 400, body
+            assert fragment in payload["error"]["message"], body
+
+        # A reply cannot carry a card — same rule as the CLI.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/posts",
+            method="POST",
+            body={
+                "text": "reply with card",
+                "reply_to": parent["hash"][:16],
+                "contact": {"name": "carol", "destination_hash": "cc" * 16},
+            },
+        )
+        assert status == 400
+        assert "not a reply" in payload["error"]["message"]
+
+        # Only the one good post was stored.
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        assert [item["text"] for item in payload["posts"]] == [
+            "talk to carol",
+            "parent",
+        ]
+    finally:
+        bridge.stop()
+
+
 def test_tan_quote_via_api(tmp_path):
     import RNS
 
@@ -16079,6 +16168,80 @@ def test_tan_schedule_post_with_location_via_api(tmp_path):
             "lon": -83.88,
             "name": "Rock Springs Park",
         }
+    finally:
+        bridge.stop()
+
+
+def test_tan_schedule_post_with_contact_via_api(tmp_path):
+    from tau.config import TauConfig
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # A card rides the queue entry, like a pin.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/schedule",
+            method="POST",
+            body={
+                "text": "talk to carol about this",
+                "send_in": 3600,
+                "contact": {"name": "carol", "destination_hash": "cc" * 16},
+            },
+        )
+        assert status == 200
+        assert payload["scheduled"]["contact"] == {
+            "name": "carol",
+            "destination_hash": "cc" * 16,
+        }
+
+        status, _, payload = _json(bridge, "/api/tan/scheduled")
+        assert status == 200
+        assert payload["count"] == 1
+        assert payload["scheduled"][0]["contact"] == {
+            "name": "carol",
+            "destination_hash": "cc" * 16,
+        }
+
+        # A malformed card is a 400, not a crash — and queues nothing.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/schedule",
+            method="POST",
+            body={
+                "text": "talk to mallory",
+                "send_in": 3600,
+                "contact": {"name": "mallory", "destination_hash": "zz" * 16},
+            },
+        )
+        assert status == 400
+        assert "contact" in payload["error"]["message"]
+        status, _, payload = _json(bridge, "/api/tan/scheduled")
+        assert payload["count"] == 1
+
+        # A card cannot ride a poll or a reply — same rule as the CLI.
+        for body in [
+            {
+                "text": "who?",
+                "send_in": 3600,
+                "poll_options": ["Carol", "Dave"],
+                "contact": {"name": "carol", "destination_hash": "cc" * 16},
+            },
+            {
+                "text": "agreed",
+                "send_in": 3600,
+                "reply_to": "ab" * 32,
+                "contact": {"name": "carol", "destination_hash": "cc" * 16},
+            },
+        ]:
+            status, _, payload = _json(
+                bridge, "/api/tan/schedule", method="POST", body=body
+            )
+            assert status == 400, body
+            assert "contact card" in payload["error"]["message"], body
     finally:
         bridge.stop()
 

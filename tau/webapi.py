@@ -215,8 +215,8 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/tan/likes    who liked a Tan post (?target=<post hash>)
     GET  /api/tan/reposts  who reposted a Tan post (?target=<post hash>)
     GET  /api/tan/quotes   standing quotes of a Tan post (?target=<post hash>)
-    POST /api/tan/posts    publish a Tan post (optional "image" base64 data URL)
-    POST /api/tan/schedule schedule a Tan post, repost or quote — or a poll, with ``"poll_options"`` — for later (optional "image" base64 data URL, optional "location" pin)
+    POST /api/tan/posts    publish a Tan post (optional "image" base64 data URL, optional "contact" card)
+    POST /api/tan/schedule schedule a Tan post, repost or quote — or a poll, with ``"poll_options"`` — for later (optional "image" base64 data URL, optional "location" pin, optional "contact" card)
     GET  /api/tan/scheduled queued Tan posts, reposts, quotes and polls, soonest first
     POST /api/tan/cancel-scheduled cancel a queued Tan post
     POST /api/tan/edit-scheduled edit a queued Tan post's text/time
@@ -3970,6 +3970,7 @@ class WebBridge:
         reply_to: Optional[str] = None,
         expires_in: Optional[float] = None,
         image: Optional[str] = None,
+        contact: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         app = self._tan_app()
         if app is None:
@@ -3978,12 +3979,22 @@ class WebBridge:
             raise ValueError(
                 "an image can only be attached to a top-level post, not a reply"
             )
+        if contact is not None and reply_to is not None:
+            raise ValueError(
+                "a contact card can only be attached to a top-level post, not a reply"
+            )
         image_attachment: Optional[Dict[str, Any]] = None
         if image is not None:
             from .tangents.tan import image_attachment_from_data_url
 
             image_attachment = image_attachment_from_data_url(
                 image, Path(self._tan_db_path()).parent
+            )
+        cleaned_contact = clean_contact(contact) if contact is not None else None
+        if contact is not None and cleaned_contact is None:
+            raise ValueError(
+                "field 'contact' must be a card with a name and a "
+                "32-character hex destination hash"
             )
         if reply_to is not None:
             conn = self._tan_conn()
@@ -4002,6 +4013,7 @@ class WebBridge:
             publish=True,
             expires_at=expires_at,
             image=image_attachment,
+            contact=cleaned_contact,
         )
 
     def tan_schedule_post(
@@ -4012,6 +4024,7 @@ class WebBridge:
         poll_options: Optional[List[str]] = None,
         image: Optional[str] = None,
         location: Optional[Dict[str, Any]] = None,
+        contact: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Queue a Tan post for later, like ``tau tan post --delay``.
 
@@ -4024,6 +4037,8 @@ class WebBridge:
         store at schedule time — and rides the queue entry until the
         publish pass attaches it.  A *location* pin rides the queue
         entry itself the same way, and the publish pass attaches it.
+        A *contact* card rides the queue entry itself the same way,
+        and the publish pass attaches it.
 
         With *kind* ``"repost"`` / ``"quote"`` the entry amplifies
         *target_post* instead: a repost carries no text, a quote
@@ -4034,12 +4049,14 @@ class WebBridge:
         entry, so it may carry an image, exactly like a post — so any
         of those fields with one of those kinds is refused here,
         before the image bytes are decoded or pinned, rather than
-        scheduled and silently dropped at publish time.
+        scheduled and silently dropped at publish time.  Neither kind
+        carries a contact card either, for the same reason as a
+        location.
 
         With *poll_options* the entry is a poll instead: the text is
         its question, the options ride alongside it, and a reply
         target is refused — polls are top-level entries.  A poll
-        cannot carry an image or a location.
+        cannot carry an image or a location or a contact card.
         """
         from .scheduled_posts import (
             schedule_poll,
@@ -4061,11 +4078,19 @@ class WebBridge:
             )
         if location is not None and poll_options is not None:
             raise ValueError("a scheduled poll cannot carry a location")
+        if contact is not None and reply_to is not None:
+            raise ValueError(
+                "a contact card can only be attached to a top-level post, not a reply"
+            )
+        if contact is not None and poll_options is not None:
+            raise ValueError("a scheduled poll cannot carry a contact card")
         if kind in ("repost", "quote"):
             if kind == "repost" and image is not None:
                 raise ValueError("a scheduled repost cannot carry an image")
             if location is not None:
                 raise ValueError(f"a scheduled {kind} cannot carry a location")
+            if contact is not None:
+                raise ValueError(f"a scheduled {kind} cannot carry a contact card")
             if poll_options is not None:
                 raise ValueError(
                     f"a scheduled {kind} cannot carry poll options"
@@ -4081,6 +4106,16 @@ class WebBridge:
             raise ValueError(
                 "field 'location' must be an object with latitude "
                 "-90..90 and longitude -180..180"
+            )
+        # Validate the card the same way, before anything is pinned:
+        # a malformed card fails later in schedule_post, after the
+        # image bytes are already pinned with nothing referencing
+        # them. Cleaned once here, the same value rides on.
+        cleaned_contact = clean_contact(contact) if contact is not None else None
+        if contact is not None and cleaned_contact is None:
+            raise ValueError(
+                "field 'contact' must be a card with a name and a "
+                "32-character hex destination hash"
             )
         # Resolve the reply and quote targets before decoding or
         # pinning the image: a refused schedule must not leave
@@ -4151,6 +4186,7 @@ class WebBridge:
             expires_in=float(expires_in),
             image=image_attachment,
             location=cleaned_location,
+            contact=cleaned_contact,
         )
         return post.to_dict()
 
@@ -16656,6 +16692,33 @@ class _WebHandler(BaseHTTPRequestHandler):
                         400,
                     )
                     return
+                contact = body.get("contact")
+                if contact is not None:
+                    if not isinstance(contact, dict):
+                        self._send_json(
+                            {
+                                "error": {
+                                    "message": "field 'contact' must be an object "
+                                    "with a name and a destination hash"
+                                }
+                            },
+                            head_only,
+                            400,
+                        )
+                        return
+                    if clean_contact(contact) is None:
+                        self._send_json(
+                            {
+                                "error": {
+                                    "message": "field 'contact' must be a card "
+                                    "with a name and a 32-character hex "
+                                    "destination hash"
+                                }
+                            },
+                            head_only,
+                            400,
+                        )
+                        return
                 try:
                     post = self.bridge.tan_post(
                         text,
@@ -16664,6 +16727,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                             float(expires_in) if expires_in is not None else None
                         ),
                         image=image,
+                        contact=contact,
                     )
                 except (ValueError, ProtocolError) as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
@@ -16891,6 +16955,33 @@ class _WebHandler(BaseHTTPRequestHandler):
                         400,
                     )
                     return
+                contact = body.get("contact")
+                if contact is not None:
+                    if not isinstance(contact, dict):
+                        self._send_json(
+                            {
+                                "error": {
+                                    "message": "field 'contact' must be an object "
+                                    "with a name and a destination hash"
+                                }
+                            },
+                            head_only,
+                            400,
+                        )
+                        return
+                    if clean_contact(contact) is None:
+                        self._send_json(
+                            {
+                                "error": {
+                                    "message": "field 'contact' must be a card "
+                                    "with a name and a 32-character hex "
+                                    "destination hash"
+                                }
+                            },
+                            head_only,
+                            400,
+                        )
+                        return
                 try:
                     scheduled = self.bridge.tan_schedule_post(
                         text,
@@ -16904,6 +16995,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                         poll_options=poll_options,
                         image=image,
                         location=location,
+                        contact=contact,
                     )
                 except (ValueError, ProtocolError) as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)

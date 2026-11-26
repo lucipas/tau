@@ -719,6 +719,8 @@ export interface TanPost {
   options?: string[];
   image?: TanImage | null;
   location?: TanLocation | null;
+  /** Shared contact card on a top-level post, if any. */
+  contact?: { name: string; destination_hash: string } | null;
   // --- annotations added by the bridge (tau/tangents/tan.py) ---
   likes: number;
   liked: boolean;
@@ -818,6 +820,8 @@ export interface ScheduledTanPost {
   options?: string[];
   /** Image attachment descriptor, when the queued post carries one. */
   image?: { sha256: string; size: number; mime: string; name: string } | null;
+  /** Contact card, when the queued post carries one. */
+  contact?: { name: string; destination_hash: string } | null;
   [key: string]: unknown;
 }
 

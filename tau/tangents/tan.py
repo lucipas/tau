@@ -117,6 +117,7 @@ from ..protocol import (
     MAX_NAME_LENGTH,
     MAX_REQUEST_BYTES,
     ProtocolError,
+    clean_contact,
     clean_location,
     decode,
     encode,
@@ -283,6 +284,7 @@ _POST_COLUMNS = (
     "options",
     "image",
     "location",
+    "contact",
 )
 
 
@@ -345,6 +347,11 @@ def _hash_fields_for(mesg: Dict[str, Any]) -> Tuple[str, ...]:
         # post to another place without breaking the hash, and a post
         # without one hashes exactly as before.
         fields = fields + ("location",)
+    if mesg.get("contact") is not None:
+        # A shared card is signed the same way: a relay cannot swap
+        # the peer the post points at without breaking the hash, and
+        # a post without one hashes exactly as before.
+        fields = fields + ("contact",)
     return fields
 
 
@@ -495,6 +502,58 @@ def _decode_location(value: Any) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _clean_contact(value: Any) -> Dict[str, Any]:
+    """Validate a Tan post contact-card attachment: ``{name, destination_hash}``.
+
+    The card rides the signed post, so a malformed one must be
+    rejected here — not dropped — or the hash would no longer cover
+    what the author meant to publish.  Reuses the DM card validator
+    (:func:`tau.protocol.clean_contact`), which also rejects a blank
+    name and a hash that is not 32 hex characters.
+    """
+    cleaned = clean_contact(value)
+    if cleaned is None:
+        raise PostError(
+            "post contact must be an object with a name and a "
+            "32-character hex destination hash"
+        )
+    return cleaned
+
+
+def _encode_contact(contact: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Encode a post's contact-card attachment for the posts table, or None."""
+    if contact is None:
+        return None
+    return json.dumps(_clean_contact(contact), ensure_ascii=False)
+
+
+def _decode_contact(value: Any) -> Optional[Dict[str, Any]]:
+    """Decode a stored contact-card attachment: a dict, a JSON string, or None.
+
+    Rows read from the posts table carry the JSON string; normalised
+    entries carry the dict itself.  Anything else decodes to None, so
+    a damaged row never crashes a display surface.
+    """
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        try:
+            return _clean_contact(value)
+        except PostError:
+            return None
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            return None
+        if isinstance(parsed, dict):
+            try:
+                return _clean_contact(parsed)
+            except PostError:
+                return None
+    return None
+
+
 def _decode_options(value: Any) -> Optional[List[str]]:
     """Decode stored poll options: a list, a JSON string, or None.
 
@@ -577,6 +636,10 @@ def _canonical_post(post: Dict[str, Any]) -> Dict[str, Any]:
         # The place rides with the post entry itself, so an exported
         # or synced post carries its place with it.
         canonical["location"] = _decode_location(post.get("location"))
+    if post.get("contact") is not None:
+        # The card rides with the post entry itself, so an exported
+        # or synced post carries its peer with it.
+        canonical["contact"] = _decode_contact(post.get("contact"))
     return canonical
 
 
@@ -708,6 +771,9 @@ def _normalize_post(mesg: Dict[str, Any], *, now: Optional[float] = None) -> Dic
         # and on-demand bytes as a post's.  A location stays post-only:
         # a quote already names the place it answers through its
         # target, and a second pin would fight the embedded original.
+        # A contact card stays post-only for the same reason: the card
+        # names a peer the post points at, and a quote already names
+        # the post it answers.
         image = (
             _clean_image(mesg["image"]) if mesg.get("image") is not None else None
         )
@@ -717,17 +783,28 @@ def _normalize_post(mesg: Dict[str, Any], *, now: Optional[float] = None) -> Dic
                 if mesg.get("location") is not None
                 else None
             )
+            contact = (
+                _clean_contact(mesg["contact"])
+                if mesg.get("contact") is not None
+                else None
+            )
         else:
             if mesg.get("location") is not None:
                 raise PostError("only posts can carry a location")
+            if mesg.get("contact") is not None:
+                raise PostError("only posts can carry a contact card")
             location = None
+            contact = None
     else:
         if mesg.get("image") is not None:
             raise PostError("only posts and quotes can carry an image")
         if mesg.get("location") is not None:
             raise PostError("only posts can carry a location")
+        if mesg.get("contact") is not None:
+            raise PostError("only posts can carry a contact card")
         image = None
         location = None
+        contact = None
 
     post = {
         "v": TAN_VERSION,
@@ -743,6 +820,7 @@ def _normalize_post(mesg: Dict[str, Any], *, now: Optional[float] = None) -> Dic
         "options": options,
         "image": image,
         "location": location,
+        "contact": contact,
     }
     _check_wire_size(post)
     return post
@@ -778,6 +856,7 @@ def check_post_text_fits(
     expires: bool = False,
     image: Optional[Dict[str, Any]] = None,
     location: Optional[Dict[str, Any]] = None,
+    contact: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Raise PostError if *text* cannot fit a Tan request once encoded.
 
@@ -793,6 +872,8 @@ def check_post_text_fits(
     the attachment rides in the estimate too — its descriptor is
     ~150 bytes of JSON, enough to push a borderline text over budget.
     When *location* is given the pin rides in the estimate the same
+    way — its name can be long enough to matter on a borderline text.
+    When *contact* is given the card rides in the estimate the same
     way — its name can be long enough to matter on a borderline text.
     """
     try:
@@ -822,6 +903,11 @@ def check_post_text_fits(
             **(
                 {"location": _clean_location(location)}
                 if location is not None
+                else {}
+            ),
+            **(
+                {"contact": _clean_contact(contact)}
+                if contact is not None
                 else {}
             ),
         }
@@ -940,7 +1026,8 @@ CREATE TABLE IF NOT EXISTS posts (
     target TEXT NOT NULL DEFAULT '',
     options TEXT,
     image TEXT,
-    location TEXT
+    location TEXT,
+    contact TEXT
 );
 
 CREATE INDEX IF NOT EXISTS posts_author_seq ON posts(author, seq);
@@ -1128,6 +1215,10 @@ def init_db(path: Optional[Union[str, Path]] = None) -> sqlite3.Connection:
         # A post's place lives in one JSON column on its own entry,
         # like a post's image attachment.
         _add_column(conn, "posts", "location", "TEXT")
+    if columns and "contact" not in columns:  # migrate a pre-contact database
+        # A post's shared card lives in one JSON column on its own
+        # entry, like a post's place attachment.
+        _add_column(conn, "posts", "contact", "TEXT")
     draft_columns = _table_columns(conn, "drafts")
     if draft_columns and "post_hash" not in draft_columns:
         # migrate a pre-retry database: drafts could not remember
@@ -1779,8 +1870,8 @@ def store_post(
         with conn:
             conn.execute(
                 "INSERT INTO posts(v, hash, author, prev, key, name, text, created_at, "
-                "received_at, expires_at, sig, seq, linked, kind, target, options, image, location) "
-                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "received_at, expires_at, sig, seq, linked, kind, target, options, image, location, contact) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     TAN_VERSION,
                     digest,
@@ -1800,6 +1891,7 @@ def store_post(
                     _encode_options(post.get("options")),
                     _encode_image(post.get("image")),
                     _encode_location(post.get("location")),
+                    _encode_contact(post.get("contact")),
                 ),
             )
             if linked:
@@ -1852,6 +1944,7 @@ def create_post(
     expires_at: Optional[float] = None,
     image: Optional[Dict[str, Any]] = None,
     location: Optional[Dict[str, Any]] = None,
+    contact: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Create, sign and store a post owned by *identity*.
 
@@ -1864,7 +1957,10 @@ def create_post(
     the local media store, never in the post.  When *location* is
     given — ``{lat, lon, name?}`` — the place is signed with the post
     the same way, so a relay cannot move the post without breaking
-    the hash.
+    the hash.  When *contact* is given — ``{name, destination_hash}``
+    — the card is signed with the post the same way, so a relay
+    cannot swap the peer the post points at without breaking the
+    hash.
     """
     timestamp = round(float(now if now is not None else time.time()), 3)
     author = _author_from_identity(identity)
@@ -1872,6 +1968,7 @@ def create_post(
     clean_text = normalize_message(text)
     clean_image = _clean_image(image) if image is not None else None
     clean_location = _clean_location(location) if location is not None else None
+    clean_contact = _clean_contact(contact) if contact is not None else None
     if expires_at is not None:
         expires_at = _require_timestamp(expires_at, "expires_at")
         if expires_at <= timestamp:
@@ -1901,6 +1998,8 @@ def create_post(
             body["image"] = clean_image
         if clean_location is not None:
             body["location"] = clean_location
+        if clean_contact is not None:
+            body["contact"] = clean_contact
         digest = hash(body, previous=prev)
         mesg = dict(body)
         mesg["hash"] = digest
@@ -8995,6 +9094,7 @@ class TanApp:
         expires_at: Optional[float] = None,
         image: Optional[Dict[str, Any]] = None,
         location: Optional[Dict[str, Any]] = None,
+        contact: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Create a post, or a reply when *reply_to* names a parent post.
 
@@ -9002,6 +9102,7 @@ class TanApp:
         surfaces once that time passes; see :func:`create_post`.
         A reply cannot carry an image — only a top-level post can.
         A reply cannot carry a location either, for the same reason.
+        A reply cannot carry a contact card either, for the same reason.
         """
         conn = self.connect()
         try:
@@ -9023,6 +9124,7 @@ class TanApp:
                     expires_at=expires_at,
                     image=image,
                     location=location,
+                    contact=contact,
                 )
         finally:
             conn.close()

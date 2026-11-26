@@ -578,6 +578,22 @@ it("schedules a Tan repost or quote with kind and target_post", async () => {
     });
   });
 
+  it("schedules a Tan post with a contact card", async () => {
+    nextJson = { ok: true, scheduled: {} };
+    await scheduleTanPost("later with carol", 300, {
+      contact: { name: "carol", destination_hash: "cc".repeat(16) },
+    });
+    expect(captured[0].url).toBe("/api/tan/schedule");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({
+      text: "later with carol",
+      reply_to: undefined,
+      send_in: 300,
+      expires_in: 0,
+      contact: { name: "carol", destination_hash: "cc".repeat(16) },
+    });
+  });
+
   it("cancels a scheduled channel message by id", async () => {
     nextJson = { ok: true };
     await cancelScheduledChannelMessage("abc123");
@@ -746,6 +762,18 @@ it("schedules a Tan repost or quote with kind and target_post", async () => {
     expect(bodyOf(0)).toEqual({
       text: "with a picture",
       image: "data:image/png;base64,iVBORw==",
+    });
+  });
+
+  it("publishes a Tan post with a contact card when attached", async () => {
+    nextJson = { ok: true, post: {} };
+    await publishTanPost("talk to carol", {
+      contact: { name: "carol", destination_hash: "cc".repeat(16) },
+    });
+    expect(captured[0].url).toBe("/api/tan/posts");
+    expect(bodyOf(0)).toEqual({
+      text: "talk to carol",
+      contact: { name: "carol", destination_hash: "cc".repeat(16) },
     });
   });
 

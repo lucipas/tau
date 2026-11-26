@@ -418,6 +418,98 @@ def test_only_posts_carry_locations(identities, tmp_path):
         tan_module._normalize_post(crafted)
 
 
+def _contact_for() -> dict:
+    return {"name": "carol", "destination_hash": "cc" * 16}
+
+
+def test_create_post_with_contact_round_trips(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    contact = _contact_for()
+    post = create_post(
+        conn, alice, "talk to carol", name="alice", now=1000, contact=contact
+    )
+
+    assert post["contact"] == contact
+    assert verify_post(post)["contact"] == contact
+    stored = get_post(conn, post["hash"])
+    assert stored is not None and stored["contact"] == contact
+    assert [entry["contact"] for entry in feed(conn, author=post["author"])] == [
+        contact
+    ]
+
+
+def test_contact_is_signed_with_the_post(identities, tmp_path):
+    alice, _ = identities
+    first = init_db(tmp_path / "a.sqlite3")
+    second = init_db(tmp_path / "b.sqlite3")
+    plain = create_post(first, alice, "same text", name="alice", now=1000)
+    with_contact = create_post(
+        second, alice, "same text", name="alice", now=1000, contact=_contact_for()
+    )
+    assert plain["hash"] != with_contact["hash"]
+
+    tampered = dict(
+        with_contact, contact={**with_contact["contact"], "name": "mallory"}
+    )
+    with pytest.raises(PostError):
+        verify_post(tampered)
+
+
+def test_contact_rejected_when_invalid(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    good = _contact_for()
+    bad_contacts = [
+        {**good, "name": ""},
+        {**good, "name": "   "},
+        {**good, "name": 42},
+        {"destination_hash": good["destination_hash"]},
+        {**good, "destination_hash": "cc" * 15},
+        {**good, "destination_hash": "zz" * 16},
+        {**good, "destination_hash": 42},
+        {"name": "carol"},
+        "carol",
+    ]
+    for bad in bad_contacts:
+        with pytest.raises(PostError):
+            create_post(conn, alice, "x", name="alice", now=1000, contact=bad)
+
+
+def test_only_posts_carry_contacts(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "parent", name="alice", now=1000)
+    reply = create_reply(conn, alice, post["hash"], "a reply", name="alice", now=1001)
+    crafted = dict(reply, contact=_contact_for())
+    with pytest.raises(PostError):
+        tan_module._normalize_post(crafted)
+    # A card stays post-only: a quote already names the peer it
+    # answers through its target, so a second card is refused at
+    # verification.
+    quote = create_quote(conn, bob, post["hash"], "ok", name="bob", now=1002)
+    crafted = dict(quote, contact=_contact_for())
+    with pytest.raises(PostError):
+        tan_module._normalize_post(crafted)
+    # And a repost still carries no card at all.
+    repost = create_repost(conn, bob, post["hash"], name="bob", now=1003)
+    crafted = dict(repost, contact=_contact_for())
+    with pytest.raises(PostError):
+        tan_module._normalize_post(crafted)
+
+
+def test_contact_counts_toward_wire_size(identities, tmp_path):
+    # 1900 four-byte characters fit on their own but overflow the
+    # 8 KiB Tan request once a card rides along, so the preflight
+    # must refuse the combination before anything is stored.
+    from tau.tangents.tan import check_post_text_fits
+
+    text = "𝄞" * 1900
+    check_post_text_fits(text, name="alice")
+    with pytest.raises(PostError):
+        check_post_text_fits(text, name="alice", contact=_contact_for())
+
+
 def test_media_store_round_trip_and_prune(tmp_path):
     data = _png_bytes()
     digest = hashlib.sha256(data).hexdigest()
@@ -10168,6 +10260,42 @@ def test_init_db_migrates_pre_location_store(identities, tmp_path):
         conn.close()
 
 
+def test_init_db_migrates_pre_contact_store(identities, tmp_path):
+    alice, _ = identities
+    db_path = tmp_path / "tan.sqlite3"
+    conn = init_db(db_path)
+    post = create_post(conn, alice, "legacy row", name="alice", now=1000)
+    conn.execute("ALTER TABLE posts DROP COLUMN contact")
+    conn.commit()
+    conn.close()
+    conn = init_db(db_path)
+    try:
+        columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(posts)").fetchall()
+        }
+        assert "contact" in columns
+        stored = get_post(conn, post["hash"])
+        assert stored is not None
+        assert "contact" not in stored
+        assert verify_post(stored)["hash"] == post["hash"]
+        # And a post with a card works on the migrated store.
+        with_card = create_post(
+            conn,
+            alice,
+            "talk to carol",
+            name="alice",
+            now=1001,
+            contact={"name": "carol", "destination_hash": "cc" * 16},
+        )
+        assert get_post(conn, with_card["hash"])["contact"] == {
+            "name": "carol",
+            "destination_hash": "cc" * 16,
+        }
+    finally:
+        conn.close()
+
+
 def test_cli_post_expire_stores_expiry(tmp_path, capsys):
     data_dir = tmp_path / "alice"
     assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
@@ -10267,6 +10395,179 @@ def test_cli_post_delay_with_location_queues_pin(tmp_path, capsys):
     listed = capsys.readouterr().out
     assert "📍 Rock Springs Park — 34.05, -83.88" in listed
     assert "openstreetmap.org/?mlat=34.05&mlon=-83.88" in listed
+
+
+def _seed_tan_contact_peer(data_dir, name="carol", hash_hex="cc" * 16):
+    """Register a peer the tan --contact flag can resolve, in *data_dir*."""
+    from tau.peers import PeerRegistry
+
+    config = TauConfig.resolve(data_dir=data_dir, name="alice")
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(bytes.fromhex(hash_hex), b"\x03" * 64, name=name, now=1.0)
+    registry.save()
+
+
+def test_cli_post_with_contact_publishes_card(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    capsys.readouterr()
+    _seed_tan_contact_peer(data_dir)
+    assert (
+        main(
+            [
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--contact",
+                "carol",
+                "--json",
+                "talk to carol about this",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["post"]["contact"] == {
+        "name": "carol",
+        "destination_hash": "cc" * 16,
+    }
+    # `tau tan show` prints the card, like it prints a pin.
+    assert (
+        main(
+            [
+                "tan",
+                "show",
+                "--data-dir",
+                str(data_dir),
+                payload["post"]["hash"],
+            ]
+        )
+        == 0
+    )
+    assert "👤 carol — tau:cccccccc…" in capsys.readouterr().out
+
+
+def test_cli_post_with_contact_prints_card_line(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    capsys.readouterr()
+    _seed_tan_contact_peer(data_dir)
+    assert (
+        main(
+            [
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--contact",
+                "carol",
+                "talk to carol about this",
+            ]
+        )
+        == 0
+    )
+    assert "👤 Shared contact: carol (cccccccc…)" in capsys.readouterr().out
+
+
+def test_cli_post_delay_with_contact_queues_card(tmp_path, capsys):
+    from tau.scheduled_posts import load_scheduled_posts
+
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    capsys.readouterr()
+    _seed_tan_contact_peer(data_dir)
+    assert (
+        main(
+            [
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--delay",
+                "1h",
+                "--contact",
+                "carol",
+                "--json",
+                "talk to carol about this",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["scheduled"]["contact"] == {
+        "name": "carol",
+        "destination_hash": "cc" * 16,
+    }
+    queued = load_scheduled_posts(data_dir / "scheduled-posts.json")
+    assert len(queued) == 1
+    assert queued.posts[0].contact == {
+        "name": "carol",
+        "destination_hash": "cc" * 16,
+    }
+    # The queue listing shows the card, like it shows a pin.
+    assert main(["tan", "scheduled", "--data-dir", str(data_dir)]) == 0
+    assert "👤 carol — tau:cccccccc…" in capsys.readouterr().out
+
+
+def test_cli_post_contact_refuses_reply_and_unknown_peer(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    capsys.readouterr()
+    _seed_tan_contact_peer(data_dir)
+    assert (
+        main(
+            [
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                "parent post",
+            ]
+        )
+        == 0
+    )
+    parent = json.loads(capsys.readouterr().out)["post"]["hash"]
+    # A reply cannot carry a card, like it cannot carry a pin.
+    assert (
+        main(
+            [
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--reply-to",
+                parent,
+                "--contact",
+                "carol",
+                "a reply",
+            ]
+        )
+        == 2
+    )
+    assert "can only be attached to a top-level post" in capsys.readouterr().err
+    # An unknown peer is refused up front.
+    assert (
+        main(
+            [
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--contact",
+                "mallory",
+                "talk to mallory",
+            ]
+        )
+        != 0
+    )
+    assert "unknown peer" in capsys.readouterr().err
 
 
 def test_cli_post_expire_rejects_over_cap(tmp_path, capsys):

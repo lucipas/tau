@@ -266,3 +266,105 @@ describe("TanComposer drafts", () => {
     expect(screen.queryByRole("button", { name: "Save draft" })).toBeNull();
   });
 });
+
+describe("TanComposer contact attach", () => {
+  const PEERS = [{ key: "cc".repeat(16), name: "carol" }];
+  const CARD = { name: "carol", destination_hash: "cc".repeat(16) };
+
+  function pickContact() {
+    fireEvent.click(screen.getByRole("button", { name: "👤 Contact" }));
+    fireEvent.change(screen.getByLabelText("Peer to share"), {
+      target: { value: "cc".repeat(16) },
+    });
+  }
+
+  it("publishes a picked contact card with the post", async () => {
+    const composer = makeComposer();
+    const onPosted = vi.fn();
+    render(<TanComposer composer={composer} onPosted={onPosted} contactPeers={PEERS} />);
+    pickContact();
+    expect(screen.getByText(/Sharing:/)).toBeTruthy();
+    typePost("talk to carol about this");
+    submit();
+    await waitFor(() =>
+      expect(composer.publish).toHaveBeenCalledWith(
+        "talk to carol about this",
+        expect.objectContaining({ contact: CARD }),
+      ),
+    );
+    expect(onPosted).toHaveBeenCalled();
+  });
+
+  it("posts text-only once the picked peer is removed", async () => {
+    const composer = makeComposer();
+    render(<TanComposer composer={composer} contactPeers={PEERS} />);
+    pickContact();
+    fireEvent.click(screen.getByRole("button", { name: "Remove" }));
+    typePost("text only");
+    submit();
+    await waitFor(() =>
+      expect(composer.publish).toHaveBeenCalledWith(
+        "text only",
+        expect.objectContaining({ contact: undefined }),
+      ),
+    );
+  });
+
+  it("hides the Contact toggle when there are no known peers", () => {
+    const composer = makeComposer();
+    render(<TanComposer composer={composer} contactPeers={[]} />);
+    expect(screen.queryByRole("button", { name: "👤 Contact" })).toBeNull();
+  });
+
+  it("disables the contact picker while replying and drops a picked peer", () => {
+    const composer = makeComposer();
+    const { rerender } = render(
+      <TanComposer composer={composer} contactPeers={PEERS} />,
+    );
+    pickContact();
+    expect(screen.getByText(/Sharing:/)).toBeTruthy();
+    rerender(
+      <TanComposer
+        composer={composer}
+        contactPeers={PEERS}
+        replyTo={"ab".repeat(32)}
+      />,
+    );
+    expect(screen.queryByText(/Sharing:/)).toBeNull();
+    const contact = screen.getByRole("button", { name: "👤 Contact" });
+    expect(contact.hasAttribute("disabled")).toBe(true);
+    expect(contact.getAttribute("title")).toMatch(/Replies can't carry a contact card/);
+  });
+
+  it("disables the contact picker in poll mode and drops a picked peer", () => {
+    const composer = makeComposer();
+    render(<TanComposer composer={composer} contactPeers={PEERS} />);
+    pickContact();
+    fireEvent.click(screen.getByRole("button", { name: "📊 Poll" }));
+    expect(screen.queryByText(/Sharing:/)).toBeNull();
+    const contact = screen.getByRole("button", { name: "👤 Contact" });
+    expect(contact.hasAttribute("disabled")).toBe(true);
+    expect(contact.getAttribute("title")).toMatch(/Polls can't carry a contact card/);
+  });
+
+  it("schedules a post with a contact card attached", async () => {
+    const composer = makeComposer();
+    const onPosted = vi.fn();
+    render(<TanComposer composer={composer} onPosted={onPosted} contactPeers={PEERS} />);
+    pickContact();
+    typePost("later with carol");
+    fireEvent.change(screen.getByLabelText("Send later"), {
+      target: { value: "300" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Schedule" }));
+    await waitFor(() =>
+      expect(composer.schedule).toHaveBeenCalledWith(
+        "later with carol",
+        300,
+        expect.objectContaining({ contact: CARD }),
+      ),
+    );
+    expect(composer.publish).not.toHaveBeenCalled();
+    expect(onPosted).toHaveBeenCalled();
+  });
+});
