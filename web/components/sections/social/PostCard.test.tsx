@@ -40,6 +40,7 @@ function makeActions(): FeedActions {
     scheduleRepost: vi.fn().mockResolvedValue(undefined),
     scheduleQuote: vi.fn().mockResolvedValue({}),
     vote: vi.fn().mockResolvedValue(undefined),
+    unvote: vi.fn().mockResolvedValue(undefined),
     share: vi.fn().mockResolvedValue(undefined),
     save: vi.fn().mockResolvedValue(undefined),
     unsave: vi.fn().mockResolvedValue(undefined),
@@ -306,5 +307,42 @@ describe("PostCard contact card", () => {
       expect(screen.getByRole("alert").textContent).toMatch(/no route/),
     );
     expect(screen.getByRole("button", { name: "Add peer" })).toBeTruthy();
+  });
+});
+
+describe("PostCard poll withdraw", () => {
+  function makePollPost(voted: number | null, closed = false): TanPost {
+    return {
+      ...makePost(),
+      kind: "poll",
+      text: "which day?",
+      options: ["Thursday", "Friday"],
+      poll: {
+        options: ["Thursday", "Friday"],
+        counts: voted === null ? [0, 0] : [1, 0],
+        total: voted === null ? 0 : 1,
+        closed,
+        voted,
+      },
+    };
+  }
+
+  it("offers Withdraw vote after voting and calls unvote", async () => {
+    const actions = makeActions();
+    render(<PostCard post={makePollPost(0)} actions={actions} />);
+    expect(screen.getByText(/you voted/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Withdraw vote" }));
+    await waitFor(() => expect(actions.unvote).toHaveBeenCalledWith(POST_HASH));
+  });
+
+  it("hides Withdraw vote before voting and on a closed poll", () => {
+    const actions = makeActions();
+    const { rerender } = render(
+      <PostCard post={makePollPost(null)} actions={actions} />,
+    );
+    expect(screen.queryByRole("button", { name: "Withdraw vote" })).toBeNull();
+    rerender(<PostCard post={makePollPost(0, true)} actions={actions} />);
+    expect(screen.queryByRole("button", { name: "Withdraw vote" })).toBeNull();
+    expect(screen.getByText(/poll closed/)).toBeTruthy();
   });
 });

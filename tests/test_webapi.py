@@ -12697,6 +12697,7 @@ def test_tan_rules_via_api(tmp_path):
             "delete",
             "repost",
             "close",
+            "unvote",
             "reply",
             "edit",
             "quote",

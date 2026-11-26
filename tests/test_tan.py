@@ -52,6 +52,7 @@ from tau.tangents.tan import (
     create_reaction,
     create_reply,
     create_repost,
+    create_unvote,
     create_vote,
     clean_tag,
     deleted_targets,
@@ -3032,6 +3033,291 @@ def test_poll_vote_tally_latest_vote_wins(identities, tmp_path):
         "closed": False,
         "voted": 1,
     }
+
+
+def test_unvote_withdraws_vote_and_revote_counts(identities, tmp_path):
+    alice, bob = identities
+    carol = RNS.Identity()
+    conn = init_db(tmp_path / "tan.sqlite3")
+    poll = create_poll(
+        conn, alice, "which day?", ["Thursday", "Friday"],
+        name="alice", now=1000,
+    )
+    create_vote(conn, bob, poll["hash"], 0, name="bob", now=1001)
+    create_vote(conn, carol, poll["hash"], 1, name="carol", now=1002)
+    result = poll_results(conn, poll["hash"])
+    assert result["counts"] == [1, 1]
+    assert result["total"] == 2
+
+    # Withdrawing drops the vote from the tally and the voter list.
+    record = create_unvote(conn, bob, poll["hash"], name="bob", now=1003)
+    assert record["kind"] == "unvote"
+    assert record["text"] == ""
+    assert record["target"] == poll["hash"]
+    result = poll_results(conn, poll["hash"])
+    assert result["counts"] == [0, 1]
+    assert result["total"] == 1
+    assert [voter["author"] for voter in result["voters"]] == [author_of(carol)]
+    assert vote_states(conn, [poll["hash"]]) == {
+        poll["hash"]: {author_of(carol): 1}
+    }
+
+    # The timeline no longer shows the withdrawn vote as yours.
+    posts = timeline(conn, [author_of(alice)], viewer=author_of(bob))
+    assert len(posts) == 1
+    assert posts[0]["poll"]["counts"] == [0, 1]
+    assert posts[0]["poll"]["total"] == 1
+    assert posts[0]["poll"]["voted"] is None
+
+    # Voting again after unvoting re-establishes the vote.
+    create_vote(conn, bob, poll["hash"], 1, name="bob", now=1004)
+    result = poll_results(conn, poll["hash"])
+    assert result["counts"] == [0, 2]
+    assert result["total"] == 2
+
+    # Unvoting without a standing vote is a no-op in effect.
+    create_unvote(conn, bob, poll["hash"], name="bob", now=1005)
+    create_unvote(conn, bob, poll["hash"], name="bob", now=1006)
+    result = poll_results(conn, poll["hash"])
+    assert result["counts"] == [0, 1]
+    assert result["total"] == 1
+    assert [voter["author"] for voter in result["voters"]] == [author_of(carol)]
+
+
+def test_create_unvote_rejects_bad_targets(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "not a poll", name="alice", now=1000)
+    poll = create_poll(
+        conn, alice, "pick one", ["a", "b"], name="alice", now=1001,
+    )
+
+    with pytest.raises(TanError, match="only polls can be unvoted on"):
+        create_unvote(conn, bob, post["hash"], name="bob", now=1002)
+    with pytest.raises(TanError, match="unknown post"):
+        create_unvote(conn, bob, "cd" * 32, name="bob", now=1002)
+
+    # An unvote on a deleted poll is rejected, like a vote on one.
+    create_delete(conn, alice, poll["hash"], name="alice", now=1003)
+    with pytest.raises(TanError, match="has been deleted"):
+        create_unvote(conn, bob, poll["hash"], name="bob", now=1004)
+
+    # An unvote on an expired poll is rejected too.
+    short = create_poll(
+        conn, alice, "quick?", ["yes", "no"], name="alice", now=1005,
+        expires_at=1006.0,
+    )
+    with pytest.raises(TanError, match="has expired"):
+        create_unvote(conn, bob, short["hash"], name="bob", now=1007)
+
+    # An unvote on a closed poll is rejected, like a late vote.
+    closable = create_poll(
+        conn, alice, "closing?", ["yes", "no"], name="alice", now=1008,
+    )
+    create_vote(conn, bob, closable["hash"], 0, name="bob", now=1009)
+    create_close_poll(conn, alice, closable["hash"], name="alice", now=1010)
+    with pytest.raises(TanError, match="poll is closed"):
+        create_unvote(conn, bob, closable["hash"], name="bob", now=1011)
+
+
+def test_unvote_after_close_via_sync_does_not_withdraw(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    poll = create_poll(
+        conn, alice, "which day?", ["Thursday", "Friday"],
+        name="alice", now=1000,
+    )
+    create_vote(conn, bob, poll["hash"], 0, name="bob", now=1001)
+    create_close_poll(conn, alice, poll["hash"], name="alice", now=1002)
+
+    # An unvote created after the close — hand-built, since
+    # create_unvote rejects it — arrives through the sync path
+    # anyway. It must not withdraw the pre-close vote, the same way
+    # a late vote neither counts nor supersedes one.
+    body = {
+        "v": 1,
+        "author": author_of(bob),
+        "key": bob.get_public_key().hex(),
+        "name": "bob",
+        "text": "",
+        "created_at": 1003.0,
+        "prev": head(conn, author_of(bob)),
+        "kind": "unvote",
+        "target": poll["hash"],
+    }
+    digest = hash(body, previous=body["prev"])
+    mesg = dict(body, hash=digest, sig=bob.sign(bytes.fromhex(digest)).hex())
+    store_post(conn, mesg, now=1004)
+    result = poll_results(conn, poll["hash"])
+    assert result["counts"] == [1, 0]
+    assert result["total"] == 1
+    assert result["voters"][0]["option"] == 0
+    assert result["voters"][0]["voted_at"] == 1001.0
+    assert vote_states(conn, [poll["hash"]]) == {
+        poll["hash"]: {author_of(bob): 0}
+    }
+
+    # The timeline tally keeps the pre-close vote too.
+    posts = timeline(conn, [author_of(alice)], viewer=author_of(bob))
+    assert len(posts) == 1
+    assert posts[0]["poll"] == {
+        "options": ["Thursday", "Friday"],
+        "counts": [1, 0],
+        "total": 1,
+        "closed": True,
+        "voted": 0,
+    }
+
+
+def test_unvote_entry_is_textless_and_targeted(identities, tmp_path):
+    _, bob = identities
+    base = {
+        "v": 1,
+        "author": author_of(bob),
+        "key": "cd" * 64,
+        "name": "bob",
+        "text": "",
+        "created_at": 1000.0,
+        "prev": "",
+        "kind": "unvote",
+        "target": "ab" * 32,
+    }
+    record = tan_module._normalize_post(base)
+    assert record["kind"] == "unvote"
+    assert record["text"] == ""
+    assert record["target"] == "ab" * 32
+    with pytest.raises(PostError, match="unvote entries cannot carry text"):
+        tan_module._normalize_post({**base, "text": "0"})
+    with pytest.raises(PostError):
+        tan_module._normalize_post({**base, "target": ""})
+
+
+def test_cli_tan_unvote(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                "tan",
+                "poll",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                "--option",
+                "Thursday",
+                "--option",
+                "Friday",
+                "meet thursday or friday?",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    poll = payload["poll"]
+
+    assert (
+        main(
+            [
+                "tan",
+                "vote",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                poll["hash"][:16],
+                "1",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    # Withdraw the vote: the tally empties and the timeline forgets it.
+    assert (
+        main(
+            [
+                "tan",
+                "unvote",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                poll["hash"],
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["unvote"]["kind"] == "unvote"
+    assert payload["unvote"]["target"] == poll["hash"]
+    assert (
+        main(
+            ["tan", "results", "--data-dir", str(data_dir), "--json", poll["hash"]]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["counts"] == [0, 0]
+    assert payload["total"] == 0
+
+    # Voting again after unvoting counts.
+    assert (
+        main(
+            [
+                "tan",
+                "vote",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                poll["hash"],
+                "Friday",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert (
+        main(
+            ["tan", "results", "--data-dir", str(data_dir), "--json", poll["hash"]]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["counts"] == [0, 1]
+
+    # Unvoting a post that is not a poll fails before anything is stored.
+    assert (
+        main(
+            [
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                "not a poll",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    post = payload["post"]
+    assert (
+        main(
+            [
+                "tan",
+                "unvote",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                post["hash"],
+            ]
+        )
+        == 2
+    )
+    assert "is not a poll" in capsys.readouterr().err
 
 
 def test_expired_vote_does_not_supersede_live_vote(identities, tmp_path):
