@@ -270,6 +270,27 @@ def _clean_contact(value: Any) -> Optional[Dict[str, Any]]:
     return cleaned
 
 
+def _clean_reply_to(value: Any) -> Optional[str]:
+    # None stays None (a top-level message); a present value must be
+    # the parent message's full 64-hex hash, resolved at schedule
+    # time — a prefix is resolved by the caller, against the channel
+    # store, before it reaches here.  A scheduled message must not
+    # silently drop a reply the user asked for: the publish pass
+    # would then send a top-level message instead of the reply that
+    # was scheduled.
+    if value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(ch not in "0123456789abcdef" for ch in value.lower())
+    ):
+        raise ScheduledChannelError(
+            "scheduled channel message reply_to must be a message hash"
+        )
+    return value.lower()
+
+
 def _clean_expires_in(value: Any) -> Optional[float]:
     # None stays None (no explicit expiry — the publish pass falls
     # back to the channel's disappearing default, exactly like an
@@ -377,6 +398,12 @@ class ScheduledChannelMessage:
     # here means the channel's disappearing default applies at
     # publish time, exactly like an immediate send with no --expire.
     expires_in: Optional[float] = None
+    # The parent message's full hash when the queued message is a
+    # reply, like an immediate ``tau channel send --reply-to``: the
+    # publish pass attaches it when the message goes out.  Defaults
+    # to None so queue files written before replies could be
+    # scheduled load unchanged.
+    reply_to: Optional[str] = None
 
     def __post_init__(self) -> None:
         # A frozen dataclass still builds through __init__: validate
@@ -399,6 +426,7 @@ class ScheduledChannelMessage:
         object.__setattr__(self, "location", _clean_location(self.location))
         object.__setattr__(self, "contact", _clean_contact(self.contact))
         object.__setattr__(self, "expires_in", _clean_expires_in(self.expires_in))
+        object.__setattr__(self, "reply_to", _clean_reply_to(self.reply_to))
         if self.kind == "poll":
             # A poll is a top-level entry: its options are fixed at
             # schedule time.
@@ -411,6 +439,10 @@ class ScheduledChannelMessage:
             if self.contact is not None:
                 raise ScheduledChannelError(
                     "a scheduled poll cannot carry a contact card"
+                )
+            if self.reply_to is not None:
+                raise ScheduledChannelError(
+                    "a scheduled poll cannot carry a reply"
                 )
         elif self.options:
             raise ScheduledChannelError(
@@ -436,6 +468,7 @@ class ScheduledChannelMessage:
             "location": self.location,
             "contact": self.contact,
             "expires_in": self.expires_in,
+            "reply_to": self.reply_to,
         }
 
     @classmethod
@@ -460,6 +493,7 @@ class ScheduledChannelMessage:
             location=_clean_location(data.get("location")),
             contact=_clean_contact(data.get("contact")),
             expires_in=_clean_expires_in(data.get("expires_in")),
+            reply_to=_clean_reply_to(data.get("reply_to")),
         )
 
 
@@ -626,6 +660,7 @@ def _preflight_envelope(
     name: Optional[str] = None,
     location: Optional[Dict[str, Any]] = None,
     contact: Optional[Dict[str, Any]] = None,
+    reply_to: Optional[str] = None,
 ) -> None:
     """Measure *text* against the wire budget with the envelope the
     publish pass measures.
@@ -634,9 +669,10 @@ def _preflight_envelope(
     ``channels._normalize_message``, which adds ``v``, ``expires_at``
     and ``reply_to`` to the body before ``_check_wire_size`` measures
     it — so the preflight must carry those fields too, at their real
-    encoded sizes (an empty reply), or a replacement near the budget
-    would pass here and then fail the definitive check on every
-    publish attempt, leaving the entry queued for failed retries.
+    encoded sizes (a reply's full hash, or an empty reply), or a
+    replacement near the budget would pass here and then fail the
+    definitive check on every publish attempt, leaving the entry
+    queued for failed retries.
 
     The expiry is measured at its largest: publishing fills in a
     numeric expiry from the channel's disappearing-message default
@@ -675,7 +711,7 @@ def _preflight_envelope(
         "text": text,
         "created_at": created_at,
         "expires_at": created_at + MAX_CHANNEL_EXPIRE_SECONDS,
-        "reply_to": "",
+        "reply_to": reply_to or "",
     }
     if location is not None:
         envelope["location"] = location
@@ -702,6 +738,7 @@ def schedule_channel_message(
     location: Optional[Dict[str, Any]] = None,
     contact: Optional[Dict[str, Any]] = None,
     expires_in: Optional[float] = None,
+    reply_to: Optional[str] = None,
     disappearing_path: Optional[Union[str, Path]] = None,
 ) -> ScheduledChannelMessage:
     """Queue a channel message for *publish_at*; returns the stored entry.
@@ -750,6 +787,15 @@ def schedule_channel_message(
     wins in ``ChannelApp.send``.  A poll can carry one: expiry is
     not a top-level attachment like a pin or a card, and the protocol
     already allows ``expires_at`` on poll messages.
+
+    A *reply_to* makes the queued message a reply, like an immediate
+    ``tau channel send --reply-to``: it must already be the parent
+    message's full hash — the caller resolves a prefix against the
+    channel store before calling, so an unknown or ambiguous parent
+    is refused at schedule time, not on every publish pass.  It is
+    validated here, rides in the measured envelope at its real size,
+    and the publish pass attaches it when the message goes out.  A
+    poll cannot carry one.
     """
     clean_channel = _clean_channel(channel)
     clean_text = _clean_text(text)
@@ -782,6 +828,9 @@ def schedule_channel_message(
     clean_contact_value = _clean_contact(contact)
     if clean_kind == "poll" and clean_contact_value is not None:
         raise ScheduledChannelError("a scheduled poll cannot carry a contact card")
+    clean_reply_to = _clean_reply_to(reply_to)
+    if clean_kind == "poll" and clean_reply_to is not None:
+        raise ScheduledChannelError("a scheduled poll cannot carry a reply")
     clean_expires_in = _clean_expires_in(expires_in)
     clean_publish_at = _clean_timestamp(publish_at, "publish_at")
     # The publish pass stamps created_at with the send time, rounded to
@@ -810,7 +859,7 @@ def schedule_channel_message(
         "name": sanitize_name(name or "anonymous"),
         "text": clean_text,
         "created_at": wire_at,
-        "reply_to": "",
+        "reply_to": clean_reply_to or "",
     }
     default_expire = channel_default_for(disappearing_path, clean_channel)
     if clean_expires_in is not None:
@@ -840,6 +889,7 @@ def schedule_channel_message(
         location=clean_location_value,
         contact=clean_contact_value,
         expires_in=clean_expires_in,
+        reply_to=clean_reply_to,
     )
     with scheduled_channel_messages_lock(path):
         queue = load_scheduled_channel_messages(path)
@@ -983,6 +1033,7 @@ def edit_scheduled_channel_message(
             name=name,
             location=message.location,
             contact=message.contact,
+            reply_to=message.reply_to,
         )
         edited = replace(
             message,
@@ -1036,7 +1087,8 @@ def publish_due_scheduled_channel_messages(
     message with an explicit expiry publishes with ``expires_at`` that
     far past the publish time, winning over the channel's disappearing
     default; without one the default applies, exactly like an
-    immediate send.
+    immediate send.  A queued reply publishes with its stored parent
+    hash attached, exactly like an immediate reply.
 
     A failed attempt (exception or per-peer errors) keeps the entry
     queued with exponential backoff.  After ``MAX_PUBLISH_ATTEMPTS`` it
@@ -1209,6 +1261,7 @@ def publish_due_scheduled_channel_messages(
                                 if message.kind == "poll"
                                 else None
                             ),
+                            reply_to=message.reply_to,
                             location=message.location,
                             contact=message.contact,
                         )

@@ -325,6 +325,8 @@ PIN = {"lat": 34.05, "lon": -83.88, "name": "Rock Springs Park"}
 
 CARD = {"name": "carol", "destination_hash": "cc" * 16}
 
+PARENT = "ab" * 32
+
 
 def test_schedule_location_round_trip(tmp_path):
     path = tmp_path / "scheduled-channel-messages.json"
@@ -697,6 +699,132 @@ def test_schedule_fractional_expires_in_wire_preflight(tmp_path):
     )
 
 
+def test_schedule_reply_round_trip(tmp_path):
+    path = tmp_path / "scheduled-channel-messages.json"
+    entry = schedule_channel_message(
+        path,
+        channel="general",
+        text="agreed",
+        publish_at=2000.0,
+        now=1000.0,
+        reply_to=PARENT,
+    )
+    queue = load_scheduled_channel_messages(path)
+    assert len(queue) == 1
+    assert queue.messages[0] == entry
+    assert entry.reply_to == PARENT
+    assert entry.to_dict()["reply_to"] == PARENT
+
+
+def test_queue_without_reply_to_loads_with_no_reply(tmp_path):
+    # Queue files written before replies could be scheduled carry no
+    # reply_to: they load as top-level messages, exactly as before.
+    entry = _message()
+    assert entry.reply_to is None
+    loaded = ScheduledChannelMessage.from_dict(
+        {
+            "id": "a" * 16,
+            "channel": "general",
+            "text": "old hello",
+            "publish_at": 1000.0,
+            "created_at": 900.0,
+        }
+    )
+    assert loaded.reply_to is None
+
+
+def test_schedule_rejects_bad_reply_to(tmp_path):
+    path = tmp_path / "scheduled-channel-messages.json"
+    for bad in (
+        "ab" * 16,
+        "ab" * 32 + "a",
+        "zz" * 32,
+        "ab" * 31 + " ",
+        1234,
+    ):
+        with pytest.raises(ScheduledChannelError, match="reply_to must be a message hash"):
+            schedule_channel_message(
+                path,
+                channel="general",
+                text="agreed",
+                publish_at=1000.0,
+                now=900.0,
+                reply_to=bad,
+            )
+    assert load_scheduled_channel_messages(path).messages == ()
+
+
+def test_schedule_poll_rejects_reply(tmp_path):
+    path = tmp_path / "scheduled-channel-messages.json"
+    with pytest.raises(ScheduledChannelError, match="cannot carry a reply"):
+        schedule_channel_message(
+            path,
+            channel="general",
+            text="which day?",
+            publish_at=1000.0,
+            now=900.0,
+            kind="poll",
+            options=["Saturday", "Sunday"],
+            reply_to=PARENT,
+        )
+    assert load_scheduled_channel_messages(path).messages == ()
+
+
+def test_schedule_reply_wire_preflight(tmp_path):
+    # 1,920 emoji fit the 8 KiB envelope on their own but overflow
+    # once the reply hash (~64 bytes) rides along: refuse at schedule
+    # time, instead of failing every publish attempt forever.  Nothing
+    # is saved.
+    path = tmp_path / "scheduled-channel-messages.json"
+    with pytest.raises(ScheduledChannelError, match="too large"):
+        schedule_channel_message(
+            path,
+            channel="general",
+            text="😀" * 1920,
+            publish_at=1000.0,
+            now=900.0,
+            reply_to=PARENT,
+        )
+    assert load_scheduled_channel_messages(path).messages == ()
+    # And 1,900 emoji with the same reply still fit.
+    entry = schedule_channel_message(
+        path,
+        channel="general",
+        text="😀" * 1900,
+        publish_at=1000.0,
+        now=900.0,
+        reply_to=PARENT,
+    )
+    assert load_scheduled_channel_messages(path).messages[0].id == entry.id
+
+
+def test_edit_scheduled_reply_keeps_reply_to(tmp_path):
+    # Editing a queued reply changes its text and time, never its
+    # parent — and the edit preflight measures the stored reply, so
+    # a text that only fits without it is refused.
+    path = tmp_path / "scheduled-channel-messages.json"
+    entry = schedule_channel_message(
+        path,
+        channel="general",
+        text="agreed",
+        publish_at=2000.0,
+        now=1000.0,
+        reply_to=PARENT,
+    )
+    edited = edit_scheduled_channel_message(
+        path, entry.id, text="agreed, with more", now=1500.0
+    )
+    assert edited.reply_to == PARENT
+    assert edited.text == "agreed, with more"
+    with pytest.raises(ScheduledChannelError, match="too large"):
+        edit_scheduled_channel_message(
+            path, entry.id, text="😀" * 1920, now=1500.0
+        )
+    assert load_scheduled_channel_messages(path).messages[0].text == (
+        "agreed, with more"
+    )
+
+
 def test_queue_with_huge_expires_in_is_corrupt(tmp_path):
     # A hand-edited queue file carrying an expiry beyond float range
     # loads as a corrupt queue, so the publisher takes its
@@ -1034,7 +1162,7 @@ class _FakeChannelApp:
 
     def send(
         self, channel, text, *, publish=False, expires_at=None, poll_options=None,
-        location=None, contact=None,
+        reply_to=None, location=None, contact=None,
     ):
         message = {
             "hash": "c" * 64,
@@ -1048,6 +1176,8 @@ class _FakeChannelApp:
             message["expires_at"] = expires_at
         if poll_options is not None:
             message["poll_options"] = list(poll_options)
+        if reply_to is not None:
+            message["reply_to"] = reply_to
         if location is not None:
             message["location"] = location
         if contact is not None:
@@ -1164,6 +1294,31 @@ def test_publish_due_attaches_contact(tmp_path):
     assert app.published[0][0]["contact"] == CARD
     queue = load_scheduled_channel_messages(path)
     assert all(entry.id != shared.id for entry in queue.messages)
+    assert len(queue) == 0
+
+
+def test_publish_due_attaches_reply_to(tmp_path):
+    # The published message carries the queued reply, so it renders
+    # exactly like one sent immediately with the same --reply-to.
+    path = tmp_path / "scheduled-channel-messages.json"
+    queued = schedule_channel_message(
+        path,
+        channel="general",
+        text="agreed",
+        publish_at=1000.0,
+        now=900.0,
+        reply_to=PARENT,
+    )
+    app = _FakeChannelApp()
+
+    result = publish_due_scheduled_channel_messages(path, app, now=2000.0)
+    assert result == {"published": 1, "kept": 0}
+    assert len(app.created) == 1
+    assert app.created[0]["text"] == "agreed"
+    assert app.created[0]["reply_to"] == PARENT
+    assert app.published[0][0]["reply_to"] == PARENT
+    queue = load_scheduled_channel_messages(path)
+    assert all(entry.id != queued.id for entry in queue.messages)
     assert len(queue) == 0
 
 

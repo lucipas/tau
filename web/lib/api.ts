@@ -1606,8 +1606,14 @@ export async function scheduleChannelMessage(
   channel: string,
   text: string,
   sendIn: number,
+  replyTo?: string,
 ): Promise<ScheduledChannelMessage> {
-  return post("/api/channels/schedule", { channel, text, send_in: sendIn });
+  return post("/api/channels/schedule", {
+    channel,
+    text,
+    send_in: sendIn,
+    ...(replyTo ? { reply_to: replyTo } : {}),
+  });
 }
 
 /** Queue a channel poll for later: the question plus its fixed options. */

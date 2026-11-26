@@ -312,7 +312,7 @@ export default function ChannelsSection() {
     setError(null);
     try {
       if (sendIn !== undefined) {
-        await channels.schedule(body, sendIn);
+        await channels.schedule(body, sendIn, replyTo?.hash);
         setSendIn(undefined);
       } else {
         await channels.send(body, replyTo?.hash);
@@ -869,6 +869,11 @@ export default function ChannelsSection() {
                             </p>
                           )}
                           <p className="text-sm whitespace-pre-wrap text-zinc-300">{s.text}</p>
+                          {s.reply_to && (
+                            <p className="text-xs text-zinc-500">
+                              ↩ in reply to {s.reply_to.slice(0, 8)}…
+                            </p>
+                          )}
                           {s.location && <ChannelLocationLink location={s.location} />}
                           {s.contact && (
                             <ChannelContactCard contact={s.contact} own />
