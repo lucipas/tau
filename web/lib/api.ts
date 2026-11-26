@@ -1225,6 +1225,8 @@ export interface PublishTanOptions {
   expiresIn?: number;
   /** Image to attach, as a base64 data URL (top-level posts only). */
   image?: { dataUrl: string };
+  /** Contact card to attach (top-level posts only). */
+  contact?: { name: string; destination_hash: string };
 }
 
 export async function publishTanPost(
@@ -1236,6 +1238,7 @@ export async function publishTanPost(
     reply_to: opts.replyTo,
     expires_in: opts.expiresIn,
     image: opts.image?.dataUrl,
+    contact: opts.contact,
   });
 }
 
@@ -1263,6 +1266,7 @@ export async function scheduleTanPost(
     send_in: sendIn,
     expires_in: opts.expiresIn ?? 0,
     image: opts.image?.dataUrl,
+    contact: opts.contact,
   });
 }
 

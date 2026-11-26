@@ -279,9 +279,9 @@ export function useTanThread(ref: string | null): UseTanThreadResult {
 export interface UseTanComposerResult {
   publish: (
     text: string,
-    opts?: { replyTo?: string; expiresIn?: number; image?: { dataUrl: string } },
+    opts?: { replyTo?: string; expiresIn?: number; image?: { dataUrl: string }; contact?: { name: string; destination_hash: string } },
   ) => Promise<TanPost>;
-  schedule: (text: string, sendIn: number, opts?: { replyTo?: string; expiresIn?: number; image?: { dataUrl: string } }) => Promise<ScheduledTanPost>;
+  schedule: (text: string, sendIn: number, opts?: { replyTo?: string; expiresIn?: number; image?: { dataUrl: string }; contact?: { name: string; destination_hash: string } }) => Promise<ScheduledTanPost>;
   schedulePoll: (question: string, options: string[], sendIn: number, opts?: { expiresIn?: number }) => Promise<ScheduledTanPost>;
   poll: (question: string, options: string[], expiresIn?: number) => Promise<TanPost>;
   busy: boolean;
@@ -313,10 +313,11 @@ export function useTanComposer(): UseTanComposerResult {
           replyTo: opts?.replyTo,
           expiresIn: opts?.expiresIn,
           image: opts?.image,
+          contact: opts?.contact,
         }),
       ),
     schedule: (text, sendIn, opts) =>
-      run(() => scheduleTanPost(text, sendIn, { replyTo: opts?.replyTo, expiresIn: opts?.expiresIn, image: opts?.image })),
+      run(() => scheduleTanPost(text, sendIn, { replyTo: opts?.replyTo, expiresIn: opts?.expiresIn, image: opts?.image, contact: opts?.contact })),
     schedulePoll: (question, options, sendIn, opts) =>
       run(() => scheduleTanPoll(question, options, sendIn, { expiresIn: opts?.expiresIn })),
     poll: (question, options, expiresIn) => run(() => createTanPoll(question, options, expiresIn)),

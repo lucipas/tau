@@ -10,6 +10,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import Avatar from "@/components/chrome/Avatar";
 import { useTauContext } from "@/components/chrome/TauContext";
 import {
+  addPeer,
   cancelScheduledTanPost,
   editScheduledTanPost,
   getTanFollowedTags,
@@ -199,6 +200,32 @@ export default function SocialSection() {
     name: p.alias || p.name,
   }));
 
+  // Known peers for the Tan composer's contact picker, keyed the way
+  // the chat composer keys them.
+  //
+  // The card's name is the peer's ANNOUNCED name, never the owner's
+  // local alias: the alias is private to this node and signing it
+  // into a post would publish it to every reader.  The alias stays
+  // available as displayName so the picker still shows the name the
+  // owner knows the peer by.
+  const contactPeers = (tau?.peers ?? []).map((p) => ({
+    key: p.destination,
+    name: p.name,
+    displayName: p.alias || p.name,
+  }));
+
+  // Add the peer from a shared contact card on a Tan post: errors
+  // must reach the card's catch, so a failed add keeps the button
+  // for a retry instead of marking it done.
+  const handleAddPeer = useCallback(
+    async (contact: { name: string; destination_hash: string }) => {
+      await addPeer(contact.destination_hash);
+      await tau?.refresh();
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
+
   // Joined channels for the post share picker. Polled so channels joined
   // elsewhere (e.g. the CLI) appear while Social stays open. No channel is
   // selected here, so each poll only refreshes the joined-channel list.
@@ -331,6 +358,7 @@ export default function SocialSection() {
           <TanComposer
             key={loadedDraft ? `draft-${loadedDraft.id}` : "fresh"}
             composer={composer}
+            contactPeers={contactPeers}
             replyTo={replyTo?.hash ?? threadHash}
             replyToName={replyTo?.name ?? thread.root?.name}
             onCancelReply={() => setReplyTo(null)}
@@ -363,6 +391,7 @@ export default function SocialSection() {
               actions={feed}
               peers={peers}
               channels={channels}
+              onAddPeer={handleAddPeer}
               highlighted={p.hash === threadHash}
               onOpenThread={openThread}
               onReply={openReply}
@@ -457,6 +486,7 @@ export default function SocialSection() {
             <TanComposer
               key={loadedDraft ? `draft-${loadedDraft.id}` : "fresh"}
               composer={composer}
+              contactPeers={contactPeers}
               onPosted={async () => {
                 await consumeLoadedDraft();
                 await feed.refresh();
@@ -503,6 +533,7 @@ export default function SocialSection() {
                   actions={feed}
                   peers={peers}
                   channels={channels}
+                  onAddPeer={handleAddPeer}
                   onOpenThread={openThread}
                   onReply={openReply}
                   onShowReactors={showReactors}
@@ -594,6 +625,7 @@ export default function SocialSection() {
               actions={feed}
               peers={peers}
               channels={channels}
+              onAddPeer={handleAddPeer}
               onOpenThread={openThread}
               onReply={openReply}
               onShowReactors={showReactors}
@@ -608,6 +640,7 @@ export default function SocialSection() {
               actions={feed}
               peers={peers}
               channels={channels}
+              onAddPeer={handleAddPeer}
               onOpenThread={openThread}
               onReply={openReply}
               onShowReactors={showReactors}
@@ -625,6 +658,7 @@ export default function SocialSection() {
               actions={feed}
               peers={peers}
               channels={channels}
+              onAddPeer={handleAddPeer}
               onOpenThread={openThread}
               onReply={openReply}
               onShowReactors={showReactors}
@@ -1200,6 +1234,7 @@ function LibraryList({
   actions,
   peers,
   channels,
+  onAddPeer,
   onOpenThread,
   onReply,
   onShowReactors,
@@ -1212,6 +1247,7 @@ function LibraryList({
   actions: ReturnType<typeof useTanFeed>;
   peers: { destination: string; name: string }[];
   channels: string[];
+  onAddPeer?: (contact: { name: string; destination_hash: string }) => Promise<void>;
   onOpenThread: (post: TanPost) => void;
   onReply: (post: TanPost) => void;
   onShowReactors: (kind: ReactorKind, post: TanPost) => void;
@@ -1229,6 +1265,7 @@ function LibraryList({
             actions={actions}
             peers={peers}
             channels={channels}
+            onAddPeer={onAddPeer}
             onOpenThread={onOpenThread}
             onReply={onReply}
             onShowReactors={onShowReactors}

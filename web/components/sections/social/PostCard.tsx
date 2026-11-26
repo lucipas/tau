@@ -46,6 +46,8 @@ export interface PostCardProps {
   peers?: { destination: string; name: string }[];
   /** Joined channel names for the share picker. */
   channels?: string[];
+  /** Add the peer from a shared contact card to the registry. */
+  onAddPeer?: (contact: { name: string; destination_hash: string }) => Promise<void>;
   /** Open the thread view for this post. */
   onOpenThread?: (post: TanPost) => void;
   /** Start a reply to this post. */
@@ -114,6 +116,7 @@ export default function PostCard({
   actions,
   peers = [],
   channels = [],
+  onAddPeer,
   onOpenThread,
   onReply,
   onShowReactors,
@@ -145,6 +148,8 @@ export default function PostCard({
       : shareTarget;
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [peerAdded, setPeerAdded] = useState(false);
+  const [addPeerError, setAddPeerError] = useState<string | null>(null);
 
   // A repost wraps the original: show who reposted, then the original.
   const original = post.kind === "repost" && post.reposted ? post.reposted : null;
@@ -311,6 +316,36 @@ export default function PostCard({
                   `${shown.location.lat.toFixed(5)}, ${shown.location.lon.toFixed(5)}`}
               </a>
             </p>
+          )}
+
+          {shown.contact && (
+            <div className="mt-2 rounded-lg border border-zinc-600/60 bg-zinc-900/60 px-2 py-1.5 text-sm">
+              <p className="font-semibold">👤 {shown.contact.name}</p>
+              <p className="text-xs text-zinc-400">tau:{shown.contact.destination_hash.slice(0, 8)}…</p>
+              {!shown.own && onAddPeer && !peerAdded && (
+                <button
+                  type="button"
+                  onClick={async () => {
+                    setAddPeerError(null);
+                    try {
+                      await onAddPeer(shown.contact!);
+                      setPeerAdded(true);
+                    } catch (err) {
+                      setAddPeerError(err instanceof Error ? err.message : String(err));
+                    }
+                  }}
+                  className="mt-1 text-cyan-300 underline hover:text-zinc-200"
+                >
+                  Add peer
+                </button>
+              )}
+              {peerAdded && <p className="mt-1 text-xs text-zinc-400">Added — you can message them now.</p>}
+              {addPeerError && (
+                <p role="alert" className="mt-1 text-xs text-red-300">
+                  {addPeerError}
+                </p>
+              )}
+            </div>
           )}
 
           {quoted && (

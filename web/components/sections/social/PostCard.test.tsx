@@ -271,3 +271,40 @@ describe("PostCard share picker", () => {
     ).toHaveProperty("disabled", true);
   });
 });
+
+describe("PostCard contact card", () => {
+  const CARD = { name: "carol", destination_hash: "cc".repeat(16) };
+
+  it("renders the shared card with an Add peer button", async () => {
+    const actions = makeActions();
+    const onAddPeer = vi.fn().mockResolvedValue(undefined);
+    const post = { ...makePost(), contact: CARD };
+    render(<PostCard post={post} actions={actions} onAddPeer={onAddPeer} />);
+    expect(screen.getByText("👤 carol")).toBeTruthy();
+    expect(screen.getByText("tau:cccccccc…")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Add peer" }));
+    await waitFor(() => expect(onAddPeer).toHaveBeenCalledWith(CARD));
+    expect(screen.getByText(/Added — you can message them now/)).toBeTruthy();
+  });
+
+  it("hides the Add peer button on your own post", () => {
+    const actions = makeActions();
+    const onAddPeer = vi.fn();
+    const post = { ...makePost(), own: true, contact: CARD };
+    render(<PostCard post={post} actions={actions} onAddPeer={onAddPeer} />);
+    expect(screen.getByText("👤 carol")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Add peer" })).toBeNull();
+  });
+
+  it("keeps the Add peer button for a retry when adding fails", async () => {
+    const actions = makeActions();
+    const onAddPeer = vi.fn().mockRejectedValue(new Error("no route"));
+    const post = { ...makePost(), contact: CARD };
+    render(<PostCard post={post} actions={actions} onAddPeer={onAddPeer} />);
+    fireEvent.click(screen.getByRole("button", { name: "Add peer" }));
+    await waitFor(() =>
+      expect(screen.getByRole("alert").textContent).toMatch(/no route/),
+    );
+    expect(screen.getByRole("button", { name: "Add peer" })).toBeTruthy();
+  });
+});

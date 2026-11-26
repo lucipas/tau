@@ -1,18 +1,20 @@
 // TanComposer.tsx — the Social composer: text post, poll mode, schedule
-// (send later), disappearing expiry, and image attach.
+// (send later), disappearing expiry, image attach, and contact-card attach.
 //
 // An attached image is read as a base64 data URL and published with the
 // post (the bridge validates and stores it); replies and polls cannot
 // carry an image, so the picker is hidden for those and the submit
 // guards them. A scheduled post can carry one — it rides the queue
 // entry until the publish pass attaches it. Polls can be scheduled
-// like posts, but a scheduled poll cannot carry an image. Max length
+// like posts, but a scheduled poll cannot carry an image. A contact
+// card works the same way: picked from the known-peers list, top-level
+// posts only, and it rides a scheduled post's queue entry too. Max length
 // is a client-side guard only.
 
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { validatePoll } from "@/components/chat/Composer";
+import { validateContact, validatePoll } from "@/components/chat/Composer";
 import { TAN_MAX_IMAGE_BYTES, readFileAsDataUrl } from "@/lib/api";
 import type { UseTanComposerResult } from "@/lib/use-tan";
 
@@ -59,6 +61,11 @@ export interface TanComposerProps {
     text: string,
     opts: { replyTo?: string; expiresIn?: number },
   ) => Promise<void>;
+  /** Known peers for the contact picker; the Contact toggle hides when empty. */
+  // `name` is the peer's announced name — the one the signed card
+  // carries. `displayName` is the owner's local alias when one exists,
+  // shown in the picker only and never submitted.
+  contactPeers?: { key: string; name: string; displayName?: string }[];
 }
 
 export default function TanComposer({
@@ -71,6 +78,7 @@ export default function TanComposer({
   initialText = "",
   initialExpiresIn,
   onSaveDraft,
+  contactPeers,
 }: TanComposerProps) {
   const [text, setText] = useState(initialText);
   const [mode, setMode] = useState<"post" | "poll">("post");
@@ -78,6 +86,8 @@ export default function TanComposer({
   const [expiresIn, setExpiresIn] = useState<number | undefined>(initialExpiresIn);
   const [sendIn, setSendIn] = useState<number | undefined>(undefined);
   const [file, setFile] = useState<File | null>(null);
+  const [contactPeer, setContactPeer] = useState("");
+  const [showContact, setShowContact] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
@@ -87,6 +97,8 @@ export default function TanComposer({
     if (replyTo) {
       setFile(null);
       if (fileRef.current) fileRef.current.value = "";
+      setContactPeer("");
+      setShowContact(false);
     }
   }, [replyTo]);
 
@@ -97,6 +109,8 @@ export default function TanComposer({
     setExpiresIn(undefined);
     setSendIn(undefined);
     setFile(null);
+    setContactPeer("");
+    setShowContact(false);
     if (fileRef.current) fileRef.current.value = "";
   }
 
@@ -149,6 +163,18 @@ export default function TanComposer({
     if (file && file.size > TAN_MAX_IMAGE_BYTES) {
       return setError("That image is larger than the 2 MB limit.");
     }
+    // Replies and polls cannot carry a card: the picker is hidden for
+    // those, so a pick here is always a top-level post — but a picked
+    // peer that vanished from the list (or a stale state) must still
+    // fail here rather than post without the card.
+    let contact: { name: string; destination_hash: string } | undefined;
+    if (contactPeer) {
+      const contactProblem = validateContact(contactPeer);
+      if (contactProblem) return setError(contactProblem);
+      const picked = (contactPeers ?? []).find((p) => p.key === contactPeer);
+      if (!picked) return setError("Choose a peer to share.");
+      contact = { name: picked.name, destination_hash: picked.key };
+    }
     try {
       let image: { dataUrl: string } | undefined;
       if (file) {
@@ -161,12 +187,13 @@ export default function TanComposer({
         }
       }
       if (sendIn !== undefined) {
-        await composer.schedule(text.trim(), sendIn, { replyTo: replyTo ?? undefined, expiresIn, image });
+        await composer.schedule(text.trim(), sendIn, { replyTo: replyTo ?? undefined, expiresIn, image, contact });
       } else {
         await composer.publish(text.trim(), {
           replyTo: replyTo ?? undefined,
           expiresIn,
           image,
+          contact,
         });
       }
       reset();
@@ -177,6 +204,13 @@ export default function TanComposer({
   }
 
   const overLimit = text.length > TAN_MAX_CHARS;
+
+  // The picked peer, for the "Sharing:" line: the alias (when one
+  // exists) is what the owner recognizes, while the signed card
+  // carries the announced name.
+  const pickedContactPeer = contactPeer
+    ? (contactPeers ?? []).find((p) => p.key === contactPeer)
+    : undefined;
 
   return (
     <form
@@ -258,6 +292,34 @@ export default function TanComposer({
         />
       )}
 
+      {mode === "post" && !replyTo && showContact && (contactPeers ?? []).length > 0 && (
+        <div className="mt-2 flex flex-col gap-2">
+          <label className="text-xs font-semibold text-zinc-400" htmlFor="tan-contact-peer">
+            Share a contact
+          </label>
+          <select
+            id="tan-contact-peer"
+            value={contactPeer}
+            onChange={(e) => setContactPeer(e.target.value)}
+            aria-label="Peer to share"
+            disabled={composer.busy}
+            className="rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 outline-none focus:border-cyan-500"
+          >
+            <option value="">Choose a peer…</option>
+            {(contactPeers ?? []).map((p) => (
+              <option key={p.key} value={p.key}>
+                {p.displayName ?? p.name}
+              </option>
+            ))}
+          </select>
+          <p className="text-xs text-zinc-500">
+            Shares their name and destination hash on the post. Readers add
+            the peer from their own announce, so the name is only a claim
+            until then.
+          </p>
+        </div>
+      )}
+
       <div className="mt-2 flex flex-wrap items-center gap-2">
         <input
           ref={fileRef}
@@ -290,9 +352,14 @@ export default function TanComposer({
         <button
           type="button"
           onClick={() => {
-            // Polls cannot carry an image: drop a picked file rather
-            // than silently posting the poll without it.
+            // Polls cannot carry an image or a contact card: drop a
+            // picked file or peer rather than silently posting the
+            // poll without it.
             if (mode === "post") setFile(null);
+            if (mode === "post") {
+              setContactPeer("");
+              setShowContact(false);
+            }
             setMode(mode === "poll" ? "post" : "poll");
           }}
           aria-pressed={mode === "poll"}
@@ -305,6 +372,36 @@ export default function TanComposer({
         >
           📊 Poll
         </button>
+        {(contactPeers ?? []).length > 0 && (
+          <button
+            type="button"
+            onClick={() => {
+              // Opening the picker on a poll, or a reply, would offer
+              // a card the post cannot carry — keep it closed there.
+              if (mode === "poll" || replyTo) return;
+              setShowContact((prev) => {
+                if (prev) setContactPeer("");
+                return !prev;
+              });
+            }}
+            aria-pressed={showContact}
+            disabled={composer.busy || mode === "poll" || !!replyTo}
+            title={
+              replyTo
+                ? "Replies can't carry a contact card"
+                : mode === "poll"
+                  ? "Polls can't carry a contact card"
+                  : "Share a peer's contact card"
+            }
+            className={`rounded-full border px-3 py-1 text-xs font-medium ${
+              showContact
+                ? "border-cyan-500 bg-cyan-950 text-cyan-300"
+                : "border-zinc-700 text-zinc-300 hover:bg-zinc-900"
+            } disabled:opacity-50`}
+          >
+            👤 Contact
+          </button>
+        )}
         <label className="flex items-center gap-1 text-xs text-zinc-400">
           <span aria-hidden="true">⏱</span>
           <select
@@ -382,6 +479,21 @@ export default function TanComposer({
               setFile(null);
               if (fileRef.current) fileRef.current.value = "";
             }}
+            className="ml-2 text-zinc-500 hover:text-zinc-200"
+          >
+            Remove
+          </button>
+        </p>
+      )}
+      {contactPeer && (
+        <p className="mt-2 text-xs text-zinc-400">
+          Sharing:{" "}
+          <span className="text-zinc-200">
+            {pickedContactPeer?.displayName ?? pickedContactPeer?.name ?? contactPeer}
+          </span>
+          <button
+            type="button"
+            onClick={() => setContactPeer("")}
             className="ml-2 text-zinc-500 hover:text-zinc-200"
           >
             Remove

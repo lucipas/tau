@@ -3808,6 +3808,15 @@ def build_parser() -> argparse.ArgumentParser:
         "open-in-maps link",
     )
     tan_post.add_argument(
+        "--contact",
+        default=None,
+        metavar="NAME|HASH",
+        help="share a peer's contact card on the post (peer name, "
+        "alias, destination hash or hash prefix); the signed post "
+        "carries the card, and the timeline and console render it "
+        "with an add-peer action",
+    )
+    tan_post.add_argument(
         "--reply-to",
         default=None,
         metavar="POST",
@@ -6193,6 +6202,21 @@ def _print_tan_location(post: Dict[str, Any], indent: str = "  ") -> None:
     print(f"{indent}{location_maps_url(location)}")
 
 
+def _print_tan_contact(post: Dict[str, Any], indent: str = "  ") -> None:
+    """Print a post's shared contact card line, when it has one.
+
+    A hand-edited record with a bad card just shows its text: the
+    cleaner drops it instead of breaking the display, like a bad DM
+    card in :func:`cmd_messages`.
+    """
+    contact = clean_contact(post.get("contact"))
+    if contact is None:
+        return
+    print(
+        f"{indent}👤 {contact['name']} — tau:{contact['destination_hash'][:8]}…"
+    )
+
+
 def _print_tan_posts(
     posts: Sequence[Dict[str, Any]],
     *,
@@ -6269,6 +6293,7 @@ def _print_tan_posts(
             _print_poll_options(post)
         _print_tan_image(post)
         _print_tan_location(post)
+        _print_tan_contact(post)
         likes = int(post.get("likes") or 0)
         if likes or post.get("liked"):
             suffix = " (you liked this)" if post.get("liked") else ""
@@ -6327,6 +6352,7 @@ def _print_tan_thread(
         if post.get("kind") == "poll":
             _print_poll_options(post, indent=f"{indent}  ")
         _print_tan_location(post, indent=f"{indent}  ")
+        _print_tan_contact(post, indent=f"{indent}  ")
         likes = int(post.get("likes") or 0)
         if likes or post.get("liked"):
             suffix = " (you liked this)" if post.get("liked") else ""
@@ -6372,6 +6398,7 @@ def _print_saved_posts(
             _print_poll_options(post)
         _print_tan_image(post)
         _print_tan_location(post)
+        _print_tan_contact(post)
         likes = int(post.get("likes") or 0)
         if likes or post.get("liked"):
             suffix = " (you liked this)" if post.get("liked") else ""
@@ -6473,6 +6500,7 @@ def _print_pinned_posts(
             _print_poll_options(post)
         _print_tan_image(post)
         _print_tan_location(post)
+        _print_tan_contact(post)
         likes = int(post.get("likes") or 0)
         if likes or post.get("liked"):
             suffix = " (you liked this)" if post.get("liked") else ""
@@ -6920,7 +6948,7 @@ def _publish_local_post(
             raise TanError("nothing to publish")
         post = publisher.create_post(
             text, reply_to=reply_to, expires_at=expires_at, image=image,
-            location=location,
+            location=location, contact=contact,
         )
     published = publisher.publish(
         post, targets=targets, ttl=max(0, min(int(ttl), MAX_GOSSIP_TTL))
@@ -6977,6 +7005,17 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
             return 2
         location = _location_from_args(args)
 
+    contact = None
+    if getattr(args, "contact", None) is not None:
+        if reply_to is not None:
+            print(
+                "error: --contact can only be attached to a top-level post, "
+                "not a reply",
+                file=sys.stderr,
+            )
+            return 2
+        contact = _contact_from_args(args, config)
+
     delay_text = getattr(args, "delay", None)
     if delay_text is not None:
         if getattr(args, "no_publish", False):
@@ -7014,6 +7053,7 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
                 expires_in=expire_seconds,
                 image=image,
                 location=location,
+                contact=contact,
             )
         except ScheduledPostsError as exc:
             raise NodeError(str(exc)) from exc
@@ -7029,7 +7069,7 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
         app = TanApp(config, _tan_identity(config), name=config.name)
         post = app.create_post(
             text, reply_to=reply_to, expires_at=expires_at, image=image,
-            location=location,
+            location=location, contact=contact,
         )
         published = None
     else:
@@ -7054,6 +7094,8 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
                 request["image"] = image
             if location is not None:
                 request["location"] = location
+            if contact is not None:
+                request["contact"] = contact
             result = publish_running(config.data_dir, **request)
             post, published = result["post"], result["published"]
         else:
@@ -7075,6 +7117,7 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
                     expires_at=expires_at,
                     image=image,
                     location=location,
+                    contact=contact,
                 )
                 post, published = result["post"], result["published"]
             finally:
@@ -7108,6 +7151,12 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
             label = name if isinstance(name, str) and name else "Location"
             print(f"  📍 {label} — {location['lat']}, {location['lon']}")
             print(f"  {location_maps_url(location)}")
+        contact = clean_contact(post.get("contact"))
+        if contact is not None:
+            print(
+                f"  👤 Shared contact: {contact['name']} "
+                f"({contact['destination_hash'][:8]}…)"
+            )
         if published is None:
             print("  stored locally (not published)")
         else:
@@ -7636,6 +7685,10 @@ def cmd_tan_scheduled(args: argparse.Namespace) -> int:
             label = name if isinstance(name, str) and name else "Location"
             print(f"  📍 {label} — {post.location['lat']}, {post.location['lon']}")
             print(f"  {location_maps_url(post.location)}")
+        if post.contact is not None:
+            print(
+                f"  👤 {post.contact['name']} — tau:{post.contact['destination_hash'][:8]}…"
+            )
         if post.text:
             for line in post.text.splitlines() or [""]:
                 print(f"  {line}")
@@ -9018,6 +9071,7 @@ def cmd_tan_show(args: argparse.Namespace) -> int:
         _print_poll_options(post)
     _print_tan_image(post)
     _print_tan_location(post)
+    _print_tan_contact(post)
     # Engagement lines print only when their annotation survived the
     # display rules: a ruleset hiding a kind strips its count, and a
     # missing count must not read as zero activity.

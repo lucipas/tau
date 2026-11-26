@@ -47,7 +47,13 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
-from .protocol import ProtocolError, clean_location, normalize_message, sanitize_file_name
+from .protocol import (
+    ProtocolError,
+    clean_contact,
+    clean_location,
+    normalize_message,
+    sanitize_file_name,
+)
 from .util import atomic_write_json, ensure_dir
 
 log = logging.getLogger(__name__)
@@ -215,6 +221,27 @@ def _clean_location(value: Any) -> Optional[Dict[str, Any]]:
     return cleaned
 
 
+def _clean_contact(value: Any) -> Optional[Dict[str, Any]]:
+    """Validate a queued post's contact-card attachment: ``{name, destination_hash}``.
+
+    The same shape :func:`tau.protocol.clean_contact` validates for
+    an immediate post, re-checked here so a hand-edited queue file
+    cannot smuggle a bad card into the publish pass.  The card itself
+    is tiny — a name plus a hash — so it rides the queue entry, like
+    a location pin.  ``None`` means no card (and is what old queue
+    files without the field load as).
+    """
+    if value is None:
+        return None
+    cleaned = clean_contact(value)
+    if cleaned is None:
+        raise ScheduledPostsError(
+            "scheduled post contact must be an object with a name and a "
+            "32-character hex destination hash"
+        )
+    return cleaned
+
+
 def _clean_ttl(value: Any) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ScheduledPostsError(f"not a gossip TTL: {value!r}")
@@ -332,6 +359,10 @@ class ScheduledPost:
     # with ``--location``; the pin is small, so it rides the queue
     # entry itself.  ``None`` means no place.
     location: Optional[Dict[str, Any]] = None
+    # Contact-card attachment (``{name, destination_hash}``) for a
+    # post scheduled with ``--contact``; the card is small, so it
+    # rides the queue entry itself.  ``None`` means no card.
+    contact: Optional[Dict[str, Any]] = None
 
     def __post_init__(self) -> None:
         # A frozen dataclass still builds through __init__: validate
@@ -357,6 +388,7 @@ class ScheduledPost:
         object.__setattr__(self, "options", _clean_options(self.options))
         object.__setattr__(self, "image", _clean_image(self.image))
         object.__setattr__(self, "location", _clean_location(self.location))
+        object.__setattr__(self, "contact", _clean_contact(self.contact))
         if self.kind == "poll":
             # A poll is a top-level entry: it has no reply target, and
             # its options are fixed at schedule time.
@@ -368,6 +400,8 @@ class ScheduledPost:
                 raise ScheduledPostsError("a scheduled poll cannot carry an image")
             if self.location is not None:
                 raise ScheduledPostsError("a scheduled poll cannot carry a location")
+            if self.contact is not None:
+                raise ScheduledPostsError("a scheduled poll cannot carry a contact card")
             if self.target_post is not None:
                 raise ScheduledPostsError(
                     "a scheduled poll cannot carry a target post"
@@ -403,6 +437,10 @@ class ScheduledPost:
                 raise ScheduledPostsError(
                     f"a scheduled {self.kind} cannot carry a location"
                 )
+            if self.contact is not None:
+                raise ScheduledPostsError(
+                    f"a scheduled {self.kind} cannot carry a contact card"
+                )
         else:
             if self.target_post is not None:
                 raise ScheduledPostsError(
@@ -421,6 +459,10 @@ class ScheduledPost:
             if self.location is not None and self.reply_to is not None:
                 raise ScheduledPostsError(
                     "a location can only be attached to a top-level post, not a reply"
+                )
+            if self.contact is not None and self.reply_to is not None:
+                raise ScheduledPostsError(
+                    "a contact card can only be attached to a top-level post, not a reply"
                 )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -443,6 +485,7 @@ class ScheduledPost:
             "options": list(self.options),
             "image": self.image,
             "location": self.location,
+            "contact": self.contact,
         }
 
     @classmethod
@@ -469,6 +512,7 @@ class ScheduledPost:
             options=_clean_options(data.get("options")),
             image=_clean_image(data.get("image")),
             location=_clean_location(data.get("location")),
+            contact=_clean_contact(data.get("contact")),
         )
 
 
@@ -615,6 +659,7 @@ def schedule_post(
     options: Optional[Sequence[str]] = None,
     image: Optional[Dict[str, Any]] = None,
     location: Optional[Dict[str, Any]] = None,
+    contact: Optional[Dict[str, Any]] = None,
 ) -> ScheduledPost:
     """Queue a post for *publish_at*; returns the stored entry.
 
@@ -651,6 +696,13 @@ def schedule_post(
     and is signed with the post at publish time.  A location is
     top-level-only too, the same rule as an immediate post and as an
     image, so it is refused with a reply target, a poll, a repost,
+    or a quote.
+
+    When *contact* is given — the ``{name, destination_hash}`` card
+    an immediate post carries — it rides the entry itself (it is
+    small) and is signed with the post at publish time.  A card is
+    top-level-only too, the same rule as an immediate post and as a
+    location, so it is refused with a reply target, a poll, a repost,
     or a quote.
     """
     clean_kind = _clean_kind(kind)
@@ -689,6 +741,7 @@ def schedule_post(
     clean_options: Tuple[str, ...] = ()
     clean_image = _clean_image(image)
     clean_location = _clean_location(location)
+    clean_contact = _clean_contact(contact)
     if clean_kind == "poll":
         if reply_to is not None:
             raise ScheduledPostsError("a scheduled poll cannot be a reply")
@@ -696,6 +749,8 @@ def schedule_post(
             raise ScheduledPostsError("a scheduled poll cannot carry an image")
         if clean_location is not None:
             raise ScheduledPostsError("a scheduled poll cannot carry a location")
+        if clean_contact is not None:
+            raise ScheduledPostsError("a scheduled poll cannot carry a contact card")
         if clean_target is not None:
             raise ScheduledPostsError("a scheduled poll cannot carry a target post")
         from .tangents.tan import _clean_poll_options
@@ -724,6 +779,10 @@ def schedule_post(
             raise ScheduledPostsError(
                 f"a scheduled {clean_kind} cannot carry a location"
             )
+        if clean_contact is not None:
+            raise ScheduledPostsError(
+                f"a scheduled {clean_kind} cannot carry a contact card"
+            )
     else:
         if options:
             raise ScheduledPostsError("a scheduled post cannot carry poll options")
@@ -734,6 +793,10 @@ def schedule_post(
         if clean_location is not None and reply_to is not None:
             raise ScheduledPostsError(
                 "a location can only be attached to a top-level post, not a reply"
+            )
+        if clean_contact is not None and reply_to is not None:
+            raise ScheduledPostsError(
+                "a contact card can only be attached to a top-level post, not a reply"
             )
     if clean_kind != "repost" and clean_kind != "poll":
         try:
@@ -749,6 +812,9 @@ def schedule_post(
                 # short, but a borderline text plus a named place can
                 # still overflow the 8 KiB budget together.
                 location=clean_location,
+                # A card rides in the signed post too — its name can
+                # be long enough to matter on a borderline text.
+                contact=clean_contact,
             )
         except PostError as exc:
             raise ScheduledPostsError(str(exc)) from exc
@@ -766,6 +832,7 @@ def schedule_post(
         options=clean_options,
         image=clean_image,
         location=clean_location,
+        contact=clean_contact,
     )
     with scheduled_posts_lock(path):
         queue = load_scheduled_posts(path)
@@ -991,6 +1058,7 @@ def edit_scheduled_post(
                         expires=post.expires_in > 0,
                         image=post.image,
                         location=post.location,
+                        contact=post.contact,
                     )
             except PostError as exc:
                 raise ScheduledPostsError(str(exc)) from exc
@@ -1028,6 +1096,7 @@ def publish_due_scheduled_posts(
     resolve_peer: Optional[Callable[[str], Any]] = None,
     now: Optional[float] = None,
     should_stop: Optional[Callable[[], bool]] = None,
+    contact_refusal: Optional[Callable[[Dict[str, Any]], Optional[str]]] = None,
 ) -> Dict[str, int]:
     """Publish every due queued post through *app* (a ``TanApp``).
 
@@ -1053,8 +1122,13 @@ def publish_due_scheduled_posts(
     A failed attempt (exception or per-peer errors) keeps the entry
     queued with exponential backoff.  After ``MAX_PUBLISH_ATTEMPTS`` it
     is no longer retried automatically but stays queued for the user to
-    inspect or cancel.  A pass stops starting new entries once
-    ``PUBLISH_PASS_BUDGET_SECONDS`` have elapsed.  A pass that pauses
+    inspect or cancel.  When ``contact_refusal`` is given, a queued
+    card is re-checked immediately before signing: a peer blocked
+    since scheduling parks the entry the same way (never published
+    or retried automatically), instead of signing and gossiping a
+    card for a peer the owner has since blocked.  A pass stops
+    starting new entries once ``PUBLISH_PASS_BUDGET_SECONDS`` have
+    elapsed.  A pass that pauses
     on an entry remembers the pause on it, so the next pass starts
     with entries that have not paused — a post whose peers keep
     stalling cannot starve later due posts, and it is still retried
@@ -1101,6 +1175,24 @@ def publish_due_scheduled_posts(
                     break
                 if time.monotonic() > deadline:
                     break
+                if post.contact is not None and contact_refusal is not None:
+                    # Re-check the card's policy now, not only when it
+                    # was queued: the peer may have been blocked since.
+                    # A refused entry is parked (never published or
+                    # retried automatically) and stays queued for the
+                    # user to cancel — the same rule the scheduled
+                    # channel publisher applies.
+                    refusal = contact_refusal(post.contact)
+                    if refusal is not None:
+                        log.warning(
+                            "Scheduled post %s not published: %s",
+                            post.id,
+                            refusal,
+                        )
+                        post = replace(post, attempts=MAX_PUBLISH_ATTEMPTS)
+                        queue = queue.with_replaced(post)
+                        save_scheduled_posts(path, queue)
+                        continue
                 failed_peers: Optional[Tuple[str, ...]] = None
                 try:
                     targets = _resolve_publish_targets(
@@ -1147,6 +1239,7 @@ def publish_due_scheduled_posts(
                                 expires_at=expires_at,
                                 image=post.image,
                                 location=post.location,
+                                contact=post.contact,
                             )
                         # Persist the signed post's identity before sending, so
                         # a retry after a crash re-sends it rather than signing
