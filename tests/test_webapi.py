@@ -471,6 +471,7 @@ class FakeNode:
         import time as _time
 
         now = _time.time() if now is None else now
+        target_id = ""
         if group:
             self.groups.list_groups()
             record = self.groups.find(target)
@@ -487,11 +488,12 @@ class FakeNode:
             target_hash = record["name"]
             target_kind = "broadcast"
             target_name = record["name"]
+            target_id = record["id"]
         else:
             peer = self.resolve_peer(
                 target,
                 timeout=discover_timeout
-                if discover_timeout is not None
+                if discover_timeout
                 else min(timeout, 10.0),
             )
             target_hash = peer.hexhash
@@ -504,6 +506,7 @@ class FakeNode:
                     target=target_hash,
                     target_kind=target_kind,
                     target_name=target_name,
+                    target_id=target_id,
                     location=location,
                     coarse=coarse,
                     duration=duration,
@@ -537,7 +540,13 @@ class FakeNode:
                 record, text, location=location, beacon=marker, kind="location"
             )
         elif beacon.target_kind == "broadcast":
-            broadcast = self.broadcasts.find(beacon.target)
+            try:
+                if beacon.target_id:
+                    broadcast = self.broadcasts.find_by_id(beacon.target_id)
+                else:
+                    broadcast = self.broadcasts.find(beacon.target)
+            except ValueError as exc:
+                raise NodeError(str(exc)) from exc
             results = []
             for member in broadcast["members"]:
                 peer = self.resolve_peer(member)
@@ -2910,6 +2919,74 @@ def test_api_broadcasts_rename_renames_list(bridge, node, tmp_path):
         )
         assert status == 400
         assert message in payload["error"]["message"]
+
+
+def test_api_broadcasts_rename_repoints_beacon(bridge, node, tmp_path):
+    from tau.broadcasts import BroadcastStore
+
+    node.broadcasts = BroadcastStore(tmp_path / "broadcasts.json")
+    node.broadcasts.create("family", [PEER_HASH])
+    status, _, started = _json(
+        bridge,
+        "/api/beacons/start",
+        method="POST",
+        body={
+            "broadcast": "family",
+            "lat": 34.05,
+            "lon": -83.88,
+            "duration_seconds": 900,
+        },
+    )
+    assert status == 200
+    beacon_id = started["beacon"]["id"]
+    # A rename re-points the running beacon at the new name, so the
+    # console's list row keeps its banner and Stop button.
+    status, _, payload = _json(
+        bridge,
+        "/api/broadcasts/rename",
+        method="POST",
+        body={"broadcast": "family", "new_name": "Crew"},
+    )
+    assert status == 200
+    status, _, listed = _json(bridge, "/api/beacons")
+    assert status == 200
+    assert listed["count"] == 1
+    assert listed["beacons"][0]["id"] == beacon_id
+    assert listed["beacons"][0]["target"] == "Crew"
+
+
+def test_api_broadcasts_delete_stops_beacon(bridge, node, tmp_path):
+    from tau.broadcasts import BroadcastStore
+
+    node.broadcasts = BroadcastStore(tmp_path / "broadcasts.json")
+    node.broadcasts.create("family", [PEER_HASH])
+    status, _, started = _json(
+        bridge,
+        "/api/beacons/start",
+        method="POST",
+        body={
+            "broadcast": "family",
+            "lat": 34.05,
+            "lon": -83.88,
+            "duration_seconds": 900,
+        },
+    )
+    assert status == 200
+    # Deleting the list stops its beacon at once instead of leaving
+    # it due until expiry.
+    status, _, payload = _json(
+        bridge,
+        "/api/broadcasts/delete",
+        method="POST",
+        body={"broadcast": "family"},
+    )
+    assert status == 200
+    # The stopped beacon still lists (like `tau beacon list` shows
+    # ended beacons), but it is no longer active.
+    status, _, listed = _json(bridge, "/api/beacons")
+    assert status == 200
+    assert listed["count"] == 1
+    assert listed["beacons"][0]["active"] is False
 
 
 def test_api_broadcasts_send_fans_out_to_members(bridge, node, tmp_path):

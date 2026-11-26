@@ -401,7 +401,9 @@ from .beacons import (
     BeaconsError,
     beacons_lock,
     load_beacons,
+    repoint_broadcast_beacons,
     save_beacons,
+    stop_broadcast_beacons,
 )
 from .blocklist import BlockList, BlockListError, load_blocked_set, load_blocklist, save_blocklist
 from .bundle import BundleError, DEFAULT_MAX_BUNDLE_BYTES
@@ -12386,6 +12388,17 @@ class WebBridge:
         broadcast = self.node.broadcasts.find(name.strip())
         if not self.node.broadcasts.delete(broadcast["name"]):
             raise ValueError(f"unknown broadcast list: {name.strip()!r}")
+        # The tick would fail on its own once the list is gone, but
+        # the beacon would stay due until it expires: stop it now.
+        # Best effort — the list is already deleted.
+        try:
+            stop_broadcast_beacons(
+                self.node.config.beacons_path,
+                broadcast["name"],
+                list_id=broadcast.get("id"),
+            )
+        except (OSError, BeaconsError) as exc:
+            log.warning("Could not stop beacons for deleted list: %s", exc)
         return {"name": broadcast["name"]}
 
     def rename_broadcast(self, name: str, new_name: Any) -> Dict[str, Any]:
@@ -12398,6 +12411,20 @@ class WebBridge:
         renamed = self.node.broadcasts.rename(
             broadcast["name"], new_name.strip()
         )
+        # The list keeps its stable id, so ticks keep resolving —
+        # but beacons match lists by name, so re-point the stored
+        # name or the console loses track of the running beacon.
+        # Best effort: the rename already landed.
+        try:
+            repoint_broadcast_beacons(
+                self.node.config.beacons_path,
+                broadcast["name"],
+                renamed["name"],
+            )
+        except (OSError, BeaconsError) as exc:
+            log.warning(
+                "Could not re-point beacons for renamed list: %s", exc
+            )
         return {
             "broadcast": self._describe_broadcast(renamed),
             "previous_name": broadcast["name"],

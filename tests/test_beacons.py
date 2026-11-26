@@ -578,6 +578,9 @@ def test_node_start_beacon_broadcast_resolves_list(tmp_path):
     assert beacon.target == "family"
     assert beacon.target_kind == "broadcast"
     assert beacon.target_name == "family"
+    # The beacon pins the list's stable id, not just its name: a
+    # rename or a delete-and-recreate must never retarget it.
+    assert beacon.target_id == node.broadcasts.find("family")["id"]
     assert beacon.next_update_at == NOW + BEACON_UPDATE_INTERVAL
     # Name lookup is case-insensitive, like the list store itself.
     with pytest.raises(NodeError):
@@ -690,3 +693,130 @@ def test_node_broadcast_beacon_update_failed_leg_keeps_going(
     # The tick still counts as sent: the schedule advances even
     # when one leg failed, like a group fan-out with a refused leg.
     assert beacon.updates_sent == 1
+
+
+def test_node_broadcast_beacon_update_refuses_recreated_list(
+    tmp_path, monkeypatch
+):
+    # Deleting a list and recreating one under the old name must
+    # never retarget the beacon: the new list has a different
+    # stable id, so the tick fails and stays due instead of sending
+    # the owner's live location to strangers.
+    node, own_hash, peers = _make_broadcast_node(tmp_path)
+    beacon = node.start_beacon("family", PIN, broadcast=True, now=NOW)
+    calls = []
+
+    def fake_send(target, text, **kwargs):
+        calls.append(target)
+        return {"ok": True, "id": "f" * 32}
+
+    monkeypatch.setattr(node, "send_message", fake_send)
+    node.broadcasts.delete("family")
+    node.broadcasts.create("family", [peers["bob"].hexhash])
+    with pytest.raises(NodeError, match="unknown broadcast list id"):
+        node.send_beacon_update(beacon, now=NOW)
+    assert calls == []
+    assert beacon.updates_sent == 0
+    assert beacon.next_update_at == NOW + BEACON_UPDATE_INTERVAL
+
+
+def test_node_broadcast_beacon_update_survives_rename(
+    tmp_path, monkeypatch
+):
+    # A rename keeps the list's stable id, so the tick still sends
+    # to the same members — and reports the list under its new name.
+    node, own_hash, peers = _make_broadcast_node(tmp_path)
+    beacon = node.start_beacon("family", PIN, broadcast=True, now=NOW)
+    calls = []
+
+    def fake_send(target, text, **kwargs):
+        calls.append(target)
+        return {"ok": True, "id": "f" * 32}
+
+    monkeypatch.setattr(node, "send_message", fake_send)
+    node.broadcasts.rename("family", "Crew")
+    result = node.send_beacon_update(beacon, now=NOW)
+    assert len(calls) == 2
+    assert {bytes(c).hex() for c in calls} == {
+        peers["alice"].hexhash,
+        peers["bob"].hexhash,
+    }
+    assert result["broadcast"] == "Crew"
+    assert beacon.updates_sent == 1
+
+
+def test_repoint_broadcast_beacons_renames_target(tmp_path):
+    from tau.beacons import (
+        Beacons,
+        load_beacons,
+        repoint_broadcast_beacons,
+        save_beacons,
+    )
+    from tau.config import TauConfig
+
+    config = TauConfig.resolve(data_dir=tmp_path / "node", name="tester")
+    beacons = Beacons()
+    beacon = beacons.start(
+        target="family",
+        target_kind="broadcast",
+        target_name="family",
+        target_id="list-id-1",
+        location=PIN,
+        now=NOW,
+    )
+    # A DM beacon and a stopped broadcast beacon are untouched.
+    beacons.start(
+        target="ab" * 16, target_kind="dm", location=PIN, now=NOW
+    )
+    stopped = beacons.start(
+        target="other",
+        target_kind="broadcast",
+        target_name="other",
+        location=PIN,
+        now=NOW,
+    )
+    stopped.stopped = True
+    save_beacons(config.beacons_path, beacons)
+    assert repoint_broadcast_beacons(config.beacons_path, "FAMILY", "Crew") == 1
+    stored = load_beacons(config.beacons_path)
+    assert stored.get(beacon.id).target == "Crew"
+    assert stored.get(beacon.id).target_name == "Crew"
+    assert stored.get(beacon.id).target_id == "list-id-1"
+    assert stored.get(stopped.id).target == "other"
+    # Re-pointing a name with no beacon is a no-op, not an error.
+    assert repoint_broadcast_beacons(config.beacons_path, "nope", "nah") == 0
+
+
+def test_stop_broadcast_beacons_stops_active(tmp_path):
+    from tau.beacons import (
+        Beacons,
+        load_beacons,
+        save_beacons,
+        stop_broadcast_beacons,
+    )
+    from tau.config import TauConfig
+
+    config = TauConfig.resolve(data_dir=tmp_path / "node", name="tester")
+    beacons = Beacons()
+    beacon = beacons.start(
+        target="family",
+        target_kind="broadcast",
+        target_name="family",
+        target_id="list-id-1",
+        location=PIN,
+        now=NOW,
+    )
+    save_beacons(config.beacons_path, beacons)
+    # Stopping by the list's stable id works even after a rename
+    # moved the stored name elsewhere.
+    assert (
+        stop_broadcast_beacons(
+            config.beacons_path, "renamed", list_id="list-id-1"
+        )
+        == 1
+    )
+    assert load_beacons(config.beacons_path).get(beacon.id).stopped is True
+    # A second stop finds nothing active.
+    assert stop_broadcast_beacons(config.beacons_path, "family") == 0
+    # No beacons file at all means none running.
+    assert stop_broadcast_beacons(tmp_path / "missing.json", "family") == 0

@@ -197,6 +197,12 @@ class Beacon:
     target: str
     target_kind: str
     target_name: str = ""
+    # A broadcast beacon's list, pinned by stable id: the stored
+    # name can change (rename) and be reused (delete then recreate),
+    # so the tick resolves the id, never the name alone.  Empty for
+    # DM/group beacons — and for a beacon stored before lists
+    # carried ids, which keeps resolving by name as before.
+    target_id: str = ""
     started_at: float = 0.0
     expires_at: float = 0.0
     interval: float = BEACON_UPDATE_INTERVAL
@@ -247,6 +253,7 @@ class Beacon:
             "target": self.target,
             "target_kind": self.target_kind,
             "target_name": self.target_name,
+            "target_id": self.target_id,
             "started_at": self.started_at,
             "expires_at": self.expires_at,
             "interval": self.interval,
@@ -293,6 +300,9 @@ class Beacon:
             target_kind=_clean_target_kind(data.get("target_kind")),
             target_name=data.get("target_name")
             if isinstance(data.get("target_name"), str)
+            else "",
+            target_id=data.get("target_id")
+            if isinstance(data.get("target_id"), str)
             else "",
             started_at=_clean_timestamp(data.get("started_at"), "started_at"),
             expires_at=_clean_timestamp(data.get("expires_at"), "expires_at"),
@@ -375,6 +385,7 @@ class Beacons:
         target: str,
         target_kind: str,
         target_name: str = "",
+        target_id: str = "",
         location: Dict[str, Any],
         coarse: bool = False,
         duration: float = BEACON_DEFAULT_DURATION,
@@ -413,6 +424,7 @@ class Beacons:
             target=target,
             target_kind=target_kind,
             target_name=target_name,
+            target_id=target_id,
             started_at=now,
             expires_at=now + duration,
             interval=interval,
@@ -511,6 +523,75 @@ def save_beacons(path: Union[str, Path], beacons: Beacons) -> Path:
     return atomic_write_json(target, beacons.to_dict(), mode=BEACONS_FILE_MODE)
 
 
+def repoint_broadcast_beacons(
+    path: Optional[Union[str, Path]], old_name: str, new_name: str
+) -> int:
+    """Point active broadcast beacons at a renamed list.
+
+    A rename keeps the list's stable id, so ticks keep resolving —
+    but the beacon's stored target is the old name, and the CLI and
+    the console match beacons to lists by that name.  Update the
+    stored name (and display name) so ``tau beacon stop --broadcast
+    NEW`` and the console's list row still find the running beacon,
+    including after a case-only rename.  Returns how many beacons
+    were re-pointed; a missing beacons file means none running.
+    """
+    if path is None:
+        return 0
+    target = Path(path).expanduser()
+    count = 0
+    with beacons_lock(target):
+        beacons = load_beacons(target)
+        now = time.time()
+        for beacon in beacons.beacons.values():
+            if (
+                beacon.target_kind == "broadcast"
+                and beacon.is_active(now)
+                and isinstance(beacon.target, str)
+                and beacon.target.casefold() == old_name.casefold()
+            ):
+                beacon.target = new_name
+                beacon.target_name = new_name
+                count += 1
+        if count:
+            save_beacons(target, beacons)
+    return count
+
+
+def stop_broadcast_beacons(
+    path: Optional[Union[str, Path]], name: str, *, list_id: Optional[str] = None
+) -> int:
+    """Stop the active broadcast beacons for a deleted list.
+
+    The tick would fail on its own once the list is gone, but the
+    beacon would stay due until it expires; stopping it here ends
+    it at once.  Matches by stored name (case-insensitive) or, when
+    given, by the list's stable id.  Returns how many beacons were
+    stopped; a missing beacons file means none running.
+    """
+    if path is None:
+        return 0
+    target = Path(path).expanduser()
+    count = 0
+    with beacons_lock(target):
+        beacons = load_beacons(target)
+        now = time.time()
+        for beacon in beacons.beacons.values():
+            if beacon.target_kind != "broadcast" or not beacon.is_active(now):
+                continue
+            same_name = (
+                isinstance(beacon.target, str)
+                and beacon.target.casefold() == name.casefold()
+            )
+            same_id = list_id is not None and beacon.target_id == list_id
+            if same_name or same_id:
+                beacon.stopped = True
+                count += 1
+        if count:
+            save_beacons(target, beacons)
+    return count
+
+
 @contextmanager
 def beacons_lock(path: Union[str, Path]) -> Iterator[None]:
     """Serialize read-modify-write updates of the beacons file.
@@ -567,5 +648,7 @@ __all__ = [
     "load_beacons",
     "new_beacon_id",
     "read_location_file",
+    "repoint_broadcast_beacons",
     "save_beacons",
+    "stop_broadcast_beacons",
 ]

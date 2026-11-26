@@ -131,6 +131,55 @@ def test_broadcast_store_rename(tmp_path):
     )
 
 
+def test_broadcast_store_id_is_stable_across_rename_and_reload(tmp_path):
+    # The id is the list's stable identity: a beacon pins it, so it
+    # must survive a rename, member edits, and a reload — while two
+    # lists never share one.
+    path = tmp_path / "broadcasts.json"
+    store = BroadcastStore(path)
+    created = store.create("team", [ALICE_HASH])
+    other = store.create("other", [BOB_HASH])
+    assert len(created["id"]) == 16
+    assert int(created["id"], 16) >= 0
+    assert created["id"] != other["id"]
+    assert store.find_by_id(created["id"]) == created
+    assert store.find_by_id(other["id"]) == other
+    with pytest.raises(ValueError, match="unknown broadcast list id"):
+        store.find_by_id("00" * 8)
+    renamed = store.rename("team", "squad")
+    assert renamed["id"] == created["id"]
+    updated = store.add_members("squad", [BOB_HASH])
+    assert updated["id"] == created["id"]
+    assert store.remove_members("squad", [BOB_HASH])["id"] == created["id"]
+    reloaded = BroadcastStore(path)
+    assert reloaded.find("squad")["id"] == created["id"]
+    assert reloaded.find_by_id(created["id"])["name"] == "squad"
+
+
+def test_broadcast_store_load_backfills_missing_id(tmp_path):
+    # A list stored before ids existed gets one on load, and the
+    # backfill is persisted so the id is stable from here on.
+    path = tmp_path / "broadcasts.json"
+    path.write_text(
+        json.dumps(
+            {
+                "broadcasts": [
+                    {
+                        "name": "team",
+                        "members": [ALICE_HASH],
+                        "created_at": 1000.0,
+                    }
+                ]
+            }
+        )
+    )
+    store = BroadcastStore(path)
+    record = store.find("team")
+    assert len(record["id"]) == 16
+    assert BroadcastStore(path).find("team")["id"] == record["id"]
+    assert json.loads(path.read_text())["broadcasts"][0]["id"] == record["id"]
+
+
 def test_broadcast_store_persists_and_drops_corrupt_entries(tmp_path):
     path = tmp_path / "broadcasts.json"
     store = BroadcastStore(path)

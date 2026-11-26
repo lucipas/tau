@@ -95,7 +95,9 @@ from .beacons import (
     beacons_lock,
     load_beacons,
     read_location_file,
+    repoint_broadcast_beacons,
     save_beacons,
+    stop_broadcast_beacons,
 )
 from .disappearing import (
     MAX_DISAPPEARING_SECONDS,
@@ -313,6 +315,7 @@ from .protocol import (
     normalize_message,
     normalize_message_kind,
     parse_location_arg,
+    sanitize_group_name,
     sanitize_name,
     short_hash,
 )
@@ -20712,8 +20715,13 @@ def _beacon_target(config: TauConfig, args: argparse.Namespace) -> Tuple[str, st
         store = BroadcastStore(config.broadcasts_path)
         try:
             broadcast = store.find(args.broadcast)
-        except ValueError as exc:
-            raise NodeError(str(exc)) from exc
+        except ValueError:
+            # The list is gone or renamed, but a beacon for it may
+            # still run: fall back to the name itself, so the
+            # case-insensitive beacon lookup can still stop it
+            # instead of refusing to name the target at all.
+            key = sanitize_group_name(args.broadcast)
+            return key, "broadcast", f"broadcast list {key}"
         return (
             broadcast["name"],
             "broadcast",
@@ -20775,6 +20783,34 @@ def _beacon_line(beacon: Any, now: Optional[float] = None) -> str:
         f"{target} ({kind}) — {place}{coarse}: "
         f"{beacon.updates_sent} update(s) sent, {state}"
     )
+
+
+def _broadcast_beacon_outcome(update: Dict[str, Any]) -> str:
+    """The first-update wording for a broadcast beacon start.
+
+    A broadcast result carries no top-level ``queued`` flag — the
+    outcome lives on its per-member ``results`` legs — so derive
+    it from them: every leg delivered means sent, a queued leg
+    (and nothing failed) means queued, every leg failed means
+    failed, and a mix of delivered and failed is partially sent.
+    """
+    legs = update.get("results")
+    if not isinstance(legs, list) or not legs:
+        return "sent"
+    delivered = [leg for leg in legs if leg.get("delivered")]
+    queued = [leg for leg in legs if leg.get("queued")]
+    failed = [
+        leg
+        for leg in legs
+        if not leg.get("delivered") and not leg.get("queued")
+    ]
+    if len(delivered) == len(legs):
+        return "sent"
+    if queued and not failed:
+        return "queued"
+    if failed and not delivered and not queued:
+        return "failed"
+    return "partially sent"
 
 
 def cmd_beacon_start(args: argparse.Namespace) -> int:
@@ -20855,7 +20891,11 @@ def cmd_beacon_start(args: argparse.Namespace) -> int:
         else "peer"
     )
     outcome = (
-        "queued" if update.get("queued") else "sent"
+        _broadcast_beacon_outcome(update)
+        if summary.get("target_kind") == "broadcast"
+        else "queued"
+        if update.get("queued")
+        else "sent"
     )
     print(
         f"Started a live beacon for {label} ({kind}): updates every "
@@ -23691,6 +23731,18 @@ def cmd_broadcast_delete(args: argparse.Namespace) -> int:
         raise NodeError(str(exc)) from exc
     if not store.delete(broadcast["name"]):
         raise NodeError(f"unknown broadcast list: {args.broadcast!r}")
+    # The tick would fail on its own once the list is gone, but
+    # the beacon would stay due until it expires: stop it now.
+    # Best effort — the list is already deleted, so a beacons-file
+    # failure is logged, not reported as a failed delete.
+    try:
+        stop_broadcast_beacons(
+            config.beacons_path,
+            broadcast["name"],
+            list_id=broadcast.get("id"),
+        )
+    except (OSError, BeaconsError) as exc:
+        log.warning("Could not stop beacons for deleted list: %s", exc)
     if _json_mode(args):
         _emit({"deleted": broadcast["name"]}, True)
         return _EXIT_OK
@@ -23712,6 +23764,16 @@ def cmd_broadcast_rename(args: argparse.Namespace) -> int:
         renamed = store.rename(args.broadcast, args.new_name)
     except ValueError as exc:
         raise NodeError(str(exc)) from exc
+    # The list keeps its stable id, so ticks keep resolving — but
+    # beacons match lists by name, so re-point the stored name or
+    # the CLI and the console lose track of the running beacon.
+    # Best effort: the rename already landed.
+    try:
+        repoint_broadcast_beacons(
+            config.beacons_path, old["name"], renamed["name"]
+        )
+    except (OSError, BeaconsError) as exc:
+        log.warning("Could not re-point beacons for renamed list: %s", exc)
     described = _describe_broadcast(renamed, PeerRegistry(config.peers_path))
     if _json_mode(args):
         _emit({"broadcast": described, "previous_name": old["name"]}, True)

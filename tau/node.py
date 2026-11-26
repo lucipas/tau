@@ -11989,6 +11989,7 @@ class TauNode:
         now = time.time() if now is None else now
         if group and broadcast:
             raise NodeError("a beacon targets a group or a broadcast list, not both")
+        target_id = ""
         if group:
             self.groups.list_groups()  # reload: a group made by another process
             record = self.groups.find(target)
@@ -12005,6 +12006,10 @@ class TauNode:
             target_hash = record["name"]
             target_kind = "broadcast"
             target_name = record["name"]
+            # Pin the list's stable id: the name can be renamed or
+            # reused after a delete, and a tick must never retarget
+            # the beacon at a different list's members.
+            target_id = record["id"]
         else:
             peer = self.resolve_peer(
                 target,
@@ -12022,6 +12027,7 @@ class TauNode:
                     target=target_hash,
                     target_kind=target_kind,
                     target_name=target_name,
+                    target_id=target_id,
                     location=location,
                     coarse=coarse,
                     duration=duration,
@@ -12047,7 +12053,11 @@ class TauNode:
 
         Members are resolved at each tick, like ``tau broadcast
         send``: removing someone from the list stops their updates
-        at the next tick, and adding someone starts theirs.  Each
+        at the next tick, and adding someone starts theirs.  The
+        list itself is resolved by the stable id the beacon pinned
+        at start — never by name alone — so a rename keeps the tick
+        on the same list and a deleted list recreated under the old
+        name never receives the owner's position.  Each
         leg is one ordinary DM carrying the pin and the beacon
         marker, so no list metadata ever reaches a recipient — and
         a member that cannot be reached queues the update in the
@@ -12058,7 +12068,12 @@ class TauNode:
         the console records the update the same way.
         """
         try:
-            broadcast = self.broadcasts.find(beacon.target)
+            if beacon.target_id:
+                broadcast = self.broadcasts.find_by_id(beacon.target_id)
+            else:
+                # A beacon stored before lists carried stable ids
+                # resolves by name, as before.
+                broadcast = self.broadcasts.find(beacon.target)
         except ValueError as exc:
             raise NodeError(str(exc)) from exc
         own_hash = self.destination_hexhash
