@@ -316,6 +316,110 @@ describe("TanComposer drafts", () => {
     );
   });
 
+  it("posts a loaded draft's card when its peer disappears after load", async () => {
+    const composer = makeComposer();
+    const onPosted = vi.fn();
+    const card = { name: "carol", destination_hash: "cc".repeat(16) };
+    const { rerender } = render(
+      <TanComposer
+        composer={composer}
+        onPosted={onPosted}
+        initialText="for carol"
+        initialContact={card}
+        contactPeers={[{ key: "cc".repeat(16), name: "carol" }]}
+      />,
+    );
+    expect(screen.getByText(/Sharing:/).textContent).toContain("carol");
+    // The peer list refreshes and no longer includes carol — the
+    // draft's original card is still carried, not a lookup failure.
+    rerender(
+      <TanComposer
+        composer={composer}
+        onPosted={onPosted}
+        initialText="for carol"
+        initialContact={card}
+        contactPeers={[]}
+      />,
+    );
+    expect(screen.getByText(/Sharing:/).textContent).toContain("carol");
+    submit();
+    await waitFor(() =>
+      expect(composer.publish).toHaveBeenCalledWith(
+        "for carol",
+        expect.objectContaining({ contact: card }),
+      ),
+    );
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(onPosted).toHaveBeenCalled();
+  });
+
+  it("saves a loaded draft's card when its peer disappears after load", async () => {
+    const composer = makeComposer();
+    const onSaveDraft = vi.fn().mockResolvedValue(undefined);
+    const card = { name: "carol", destination_hash: "cc".repeat(16) };
+    const { rerender } = render(
+      <TanComposer
+        composer={composer}
+        onSaveDraft={onSaveDraft}
+        initialText="for carol"
+        initialContact={card}
+        contactPeers={[{ key: "cc".repeat(16), name: "carol" }]}
+      />,
+    );
+    rerender(
+      <TanComposer
+        composer={composer}
+        onSaveDraft={onSaveDraft}
+        initialText="for carol"
+        initialContact={card}
+        contactPeers={[]}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
+    await waitFor(() =>
+      expect(onSaveDraft).toHaveBeenCalledWith(
+        "for carol",
+        expect.objectContaining({ contact: card }),
+      ),
+    );
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("drops the retained card once the user picks a different peer", async () => {
+    const composer = makeComposer();
+    const card = { name: "carol", destination_hash: "cc".repeat(16) };
+    const peers = [
+      { key: "cc".repeat(16), name: "carol" },
+      { key: "dd".repeat(16), name: "dave" },
+    ];
+    const { rerender } = render(
+      <TanComposer
+        composer={composer}
+        initialText="for dave now"
+        initialContact={card}
+        contactPeers={peers}
+      />,
+    );
+    fireEvent.change(screen.getByLabelText("Peer to share"), {
+      target: { value: "dd".repeat(16) },
+    });
+    // Both peers leave the list: the fresh pick has no retained card,
+    // so posting fails instead of posting without it.
+    rerender(
+      <TanComposer
+        composer={composer}
+        initialText="for dave now"
+        initialContact={card}
+        contactPeers={[]}
+      />,
+    );
+    submit();
+    expect(
+      (await screen.findByRole("alert")).textContent,
+    ).toMatch(/Choose a peer to share/);
+    expect(composer.publish).not.toHaveBeenCalled();
+  });
+
   it("prefills text and expiry from a loaded draft", () => {
     const composer = makeComposer();
     render(
