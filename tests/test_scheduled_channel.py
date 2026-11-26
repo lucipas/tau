@@ -729,6 +729,52 @@ def test_queue_with_huge_expires_in_is_corrupt(tmp_path):
     assert app.created == []
 
 
+def test_schedule_rejects_huge_publish_at(tmp_path):
+    # A JSON integer beyond float range is the same invalid-timestamp
+    # error, not an OverflowError escaping the schedule path.
+    path = tmp_path / "scheduled-channel-messages.json"
+    with pytest.raises(ScheduledChannelError, match="not a timestamp"):
+        schedule_channel_message(
+            path,
+            channel="general",
+            text="later",
+            publish_at=10**400,
+            now=900.0,
+        )
+    assert load_scheduled_channel_messages(path).messages == ()
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["publish_at", "created_at", "next_attempt_at", "paused_at"],
+)
+def test_queue_with_huge_timestamp_is_corrupt(tmp_path, field):
+    # A hand-edited queue file carrying a timestamp beyond float range
+    # in any of the four timestamp fields loads as a corrupt queue, so
+    # the publisher takes its corrupt-queue path (logs and publishes
+    # nothing) instead of crashing the mail loop on an OverflowError.
+    import json
+
+    entry = {
+        "id": "a" * 16,
+        "channel": "general",
+        "text": "later",
+        "publish_at": 1000.0,
+        "created_at": 900.0,
+        "next_attempt_at": 0.0,
+        "paused_at": 0.0,
+    }
+    entry[field] = 10**400
+    path = tmp_path / "scheduled-channel-messages.json"
+    path.write_text(json.dumps({"messages": [entry]}))
+    with pytest.raises(ScheduledChannelError, match="not a (timestamp|retry time)"):
+        load_scheduled_channel_messages(path)
+    app = _FakeChannelApp()
+    result = publish_due_scheduled_channel_messages(path, app, now=2000.0)
+    assert result == {"published": 0, "kept": 0}
+    assert app.created == []
+
+
 def test_cancel_scheduled_channel_message_end_to_end(tmp_path):
     path = tmp_path / "scheduled-channel-messages.json"
     entry = schedule_channel_message(
