@@ -7,11 +7,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import Avatar from "@/components/chrome/Avatar";
 import UnreadChip from "@/components/chrome/UnreadChip";
+import BeaconControl from "@/components/chat/BeaconControl";
 import { useHash } from "../chrome/useHash";
 import { formatCountdown, formatDuration, formatRelative, shortHash } from "@/lib/format";
 import { addPeer, deleteDraft, getDrafts, getStatus, saveDraft } from "@/lib/api";
 import type { LocationPin, MessageDraft } from "@/lib/types";
 import { useChannels } from "@/lib/use-channels";
+import { useBeacons } from "@/lib/use-tau";
+import { useNow } from "@/lib/use-now";
 
 /** A pinned place on a channel message, linked out to a map. Shared by
  *  the history list and the pinned strip: a pin can outlive its
@@ -28,6 +31,17 @@ function ChannelLocationLink({ location }: { location: LocationPin }) {
       >
         📍 {location.name ?? `${location.lat.toFixed(5)}, ${location.lon.toFixed(5)}`}
       </a>
+    </p>
+  );
+}
+
+/** The live-location line on a beacon update — the channel twin of
+ *  the line MessageBubble renders on DMs and groups. */
+function ChannelBeaconLine({ beacon }: { beacon: { expires_at: number } }) {
+  const now = useNow(1000);
+  return (
+    <p className="mt-1 text-sm text-zinc-300">
+      📍 Live location until {formatCountdown(beacon.expires_at, now)}
     </p>
   );
 }
@@ -96,6 +110,7 @@ const EDIT_SCHEDULE_OPTIONS: { label: string; seconds: number | undefined }[] = 
 
 export default function ChannelsSection() {
   const channels = useChannels(30_000);
+  const beacons = useBeacons();
   const [joinName, setJoinName] = useState("");
   const [text, setText] = useState("");
   const [sendIn, setSendIn] = useState<number | undefined>(undefined);
@@ -694,6 +709,17 @@ export default function ChannelsSection() {
             </div>
           </div>
 
+          <BeaconControl
+            target={{
+              kind: "channel",
+              key: channels.selected,
+              name: `#${channels.selected}`,
+            }}
+            beacons={beacons.beacons}
+            onRefresh={beacons.refresh}
+            onError={(message) => setError(message)}
+          />
+
           <div className="border-b border-zinc-800 px-3 py-2 sm:px-4">
             {editingTopic ? (
               <form onSubmit={handleSaveTopic} className="flex gap-2">
@@ -947,6 +973,7 @@ export default function ChannelsSection() {
                         {m.text}
                       </p>
                       {m.location && <ChannelLocationLink location={m.location} />}
+                      {m.beacon && <ChannelBeaconLine beacon={m.beacon} />}
                       {m.contact && (
                         <ChannelContactCard
                           contact={m.contact}
@@ -1047,6 +1074,7 @@ export default function ChannelsSection() {
                     </p>
                   )}
                   {m.location && <ChannelLocationLink location={m.location} />}
+                  {m.beacon && <ChannelBeaconLine beacon={m.beacon} />}
                   {m.contact && (
                     <ChannelContactCard
                       contact={m.contact}

@@ -96,7 +96,8 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/beacons/start start a live beacon ``{"peer": "<name or hash>", "lat": ..,
                            "lon": .., "name": "..", "duration_seconds": 3600,
                            "coarse": false}`` (or ``"group"`` for a group,
-                           ``"broadcast"`` for a broadcast list);
+                           ``"broadcast"`` for a broadcast list,
+                           ``"channel"`` for a channel);
                            the browser feeds fresh positions afterwards
     POST /api/beacons/stop stop a live beacon ``{"id": "<beacon id>"}``
     POST /api/beacons/position feed a beacon a fresh position
@@ -7060,6 +7061,7 @@ class WebBridge:
         *,
         group: bool = False,
         broadcast: bool = False,
+        channel: bool = False,
         coarse: bool = False,
         duration: float = BEACON_DEFAULT_DURATION,
     ) -> Dict[str, Any]:
@@ -7074,7 +7076,9 @@ class WebBridge:
         position.  ``duration`` is seconds (60s..8h, default 1h).
         """
         if not isinstance(target, str) or not target.strip():
-            raise ValueError("target peer, group, or broadcast list is required")
+            raise ValueError(
+                "target peer, group, broadcast list, or channel is required"
+            )
         cleaned = clean_location(location)
         if cleaned is None:
             raise ValueError(
@@ -7097,6 +7101,7 @@ class WebBridge:
             cleaned,
             group=bool(group),
             broadcast=bool(broadcast),
+            channel=bool(channel),
             coarse=bool(coarse),
             duration=duration,
         )
@@ -7216,9 +7221,12 @@ class WebBridge:
         thread once per member.  A broadcast beacon instead records
         one entry per member, in that member's DM thread: the update
         was one DM per member, and there is no broadcast thread to
-        put a single entry in.  The entry carries the pin and the
-        beacon marker, so the feed renders it with its map link and
-        live countdown, exactly like a received update.
+        put a single entry in.  A channel beacon records nothing
+        here: the update is stored in the channel's own history,
+        which the Channels section reads from the channel store.
+        The entry carries the pin and the beacon marker, so the feed
+        renders it with its map link and live countdown, exactly
+        like a received update.
         """
         try:
             location = beacon.current_location()
@@ -7227,6 +7235,11 @@ class WebBridge:
             return None
         marker = beacon.wire_marker(beacon.updates_sent)
         text = location_default_text(location)
+        if beacon.target_kind == "channel":
+            # A channel update lives in the channel's own history —
+            # the Channels section reads it from the channel store —
+            # so there is no DM or group thread to record it in.
+            return None
         is_group = beacon.target_kind == "group"
         is_broadcast = beacon.target_kind == "broadcast"
         legs = result.get("results") if isinstance(result, dict) else None
@@ -19166,24 +19179,26 @@ class _WebHandler(BaseHTTPRequestHandler):
         peer = body.get("peer")
         group = body.get("group")
         broadcast = body.get("broadcast")
+        channel = body.get("channel")
         given = [name for name, value in
-                 (("peer", peer), ("group", group), ("broadcast", broadcast))
+                 (("peer", peer), ("group", group), ("broadcast", broadcast),
+                  ("channel", channel))
                  if value is not None]
         if len(given) != 1:
             self._send_json(
                 {
                     "error": {
-                        "message": "pass exactly one of 'peer', 'group', 'broadcast'"
+                        "message": "pass exactly one of 'peer', 'group', 'broadcast', 'channel'"
                     }
                 },
                 head_only,
                 400,
             )
             return
-        target = peer if peer is not None else group if group is not None else broadcast
+        target = peer if peer is not None else group if group is not None else broadcast if broadcast is not None else channel
         if not isinstance(target, str) or not target.strip():
             self._send_json(
-                {"error": {"message": "field 'peer'/'group'/'broadcast' is required"}},
+                {"error": {"message": "field 'peer'/'group'/'broadcast'/'channel' is required"}},
                 head_only,
                 400,
             )
@@ -19205,6 +19220,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                 location,
                 group=group is not None,
                 broadcast=broadcast is not None,
+                channel=channel is not None,
                 coarse=coarse,
                 duration=body.get("duration_seconds", BEACON_DEFAULT_DURATION),
             )

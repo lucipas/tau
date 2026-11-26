@@ -134,7 +134,9 @@ def _clean_target(value: Any, *, kind: str, target_kind: str) -> str:
     as before.  A broadcast target is a list name — the list itself
     is resolved (and its members read) at each tick, so the stored
     target is the name, cleaned the same way broadcast lists clean
-    theirs.
+    theirs.  A channel target is a channel name, cleaned the same
+    way channels clean theirs; the tick re-checks membership, so a
+    channel left since start fails the tick.
     """
     if target_kind == "broadcast":
         # sanitize_group_name falls back to "group" for a blank name,
@@ -145,6 +147,22 @@ def _clean_target(value: Any, *, kind: str, target_kind: str) -> str:
                 "beacon broadcast target must be a non-empty list name"
             )
         return sanitize_group_name(value)
+    if target_kind == "channel":
+        # Local import: channels imports protocol, not beacons, but
+        # keeping the import here avoids a module-level edge if that
+        # ever changes.
+        from .channels import ChannelError, clean_channel_name
+
+        if not isinstance(value, str) or not value.strip():
+            raise BeaconsError(
+                "beacon channel target must be a non-empty channel name"
+            )
+        try:
+            return clean_channel_name(value)
+        except ChannelError as exc:
+            raise BeaconsError(
+                f"beacon channel target is not a valid channel name: {exc}"
+            ) from exc
     if not isinstance(value, str):
         raise BeaconsError(f"beacon {kind} target must be a string")
     cleaned = value.strip().lower()
@@ -160,9 +178,9 @@ def _clean_target(value: Any, *, kind: str, target_kind: str) -> str:
 
 
 def _clean_target_kind(value: Any) -> str:
-    if value not in ("dm", "group", "broadcast"):
+    if value not in ("dm", "group", "broadcast", "channel"):
         raise BeaconsError(
-            'beacon target kind must be "dm", "group" or "broadcast"'
+            'beacon target kind must be "dm", "group", "broadcast" or "channel"'
         )
     return str(value)
 

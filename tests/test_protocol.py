@@ -307,6 +307,9 @@ def test_clean_beacon_rejects_malformed_markers():
     assert clean_beacon({"id": "a", "expires_at": "soon", "seq": 1}) is None
     assert clean_beacon({"id": "a", "expires_at": 1800003600, "seq": 0}) is None
     assert clean_beacon({"id": "a", "expires_at": 1800003600, "seq": 1.5}) is None
+    # A 401-digit integer overflows float(): it must drop, not abort
+    # the channel post handler before signature verification.
+    assert clean_beacon({"id": "a", "expires_at": 10**400, "seq": 1}) is None
     assert clean_beacon("beacon") is None
 
 

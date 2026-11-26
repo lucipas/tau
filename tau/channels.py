@@ -200,6 +200,7 @@ from .protocol import (
     clean_group_poll_target,
     clean_group_poll_vote,
     clean_group_topic,
+    clean_beacon,
     clean_contact,
     clean_location,
     clean_reaction,
@@ -352,6 +353,7 @@ _MESSAGE_COLUMNS = (
     "reply_to",
     "location",
     "contact",
+    "beacon",
 )
 
 # Column order for reaction rows.  A reaction is keyed by
@@ -640,6 +642,26 @@ def _normalize_message(mesg: Dict[str, Any], *, now: Optional[float] = None) -> 
                 "top-level message, not a reply or a poll"
             )
 
+    # A live-beacon marker rides as an unsigned advisory field, the
+    # same way ``expires_at`` does: it is validated and carried, but
+    # never enters the hash, so an older node verifies, stores and
+    # serves the update as an ordinary location pin and there is no
+    # interop break.  A malformed marker drops instead of breaking
+    # the message — the pin still reads — exactly like a malformed
+    # ``location`` drops.  A marker on a message without a pin, or
+    # on a reply or a poll, drops the same way: the marker is
+    # unsigned, so refusing the message would let any relay censor
+    # someone else's valid signed message by appending a marker.
+    # The strict refusal lives in ``create_message`` instead — a
+    # local send never silently drops one.
+    cleaned_beacon = clean_beacon(mesg.get("beacon"))
+    if cleaned_beacon is not None and (
+        cleaned_location is None
+        or reply_to
+        or any(mesg.get(field) is not None for field in POLL_FIELDS)
+    ):
+        cleaned_beacon = None
+
     message = {
         "v": CHANNEL_VERSION,
         "channel": channel,
@@ -661,6 +683,8 @@ def _normalize_message(mesg: Dict[str, Any], *, now: Optional[float] = None) -> 
         message["location"] = cleaned_location
     if cleaned_contact is not None:
         message["contact"] = cleaned_contact
+    if cleaned_beacon is not None:
+        message["beacon"] = cleaned_beacon
     _check_wire_size(message)
     return message
 
@@ -727,6 +751,10 @@ def _canonical_message(message: Dict[str, Any]) -> Dict[str, Any]:
         # only on messages that share one, matching how the hash
         # treats it.
         canonical["contact"] = message["contact"]
+    if message.get("beacon") is not None:
+        # The beacon marker rides the public message like the expiry:
+        # present only on live-location updates, never in the hash.
+        canonical["beacon"] = message["beacon"]
     return canonical
 
 
@@ -1419,7 +1447,8 @@ CREATE TABLE IF NOT EXISTS messages (
     poll_close TEXT,
     reply_to TEXT NOT NULL DEFAULT '',
     location TEXT,
-    contact TEXT
+    contact TEXT,
+    beacon TEXT
 );
 
 CREATE INDEX IF NOT EXISTS messages_channel_created
@@ -1565,6 +1594,11 @@ def init_db(path: Optional[Union[str, Path]] = None) -> sqlite3.Connection:
     columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
     if "contact" not in columns:
         conn.execute("ALTER TABLE messages ADD COLUMN contact TEXT")
+    # Stores written before channel beacons existed have no beacon
+    # column: add it in place, the same way.
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
+    if "beacon" not in columns:
+        conn.execute("ALTER TABLE messages ADD COLUMN beacon TEXT")
     conn.execute(
         "INSERT OR IGNORE INTO meta(key, value) VALUES('version', ?)",
         (str(CHANNEL_VERSION),),
@@ -1600,6 +1634,11 @@ def _row_to_message(row: sqlite3.Row) -> Dict[str, Any]:
         record.pop("contact", None)
     else:
         record["contact"] = json.loads(raw_contact)
+    raw_beacon = record.get("beacon")
+    if raw_beacon is None:
+        record.pop("beacon", None)
+    else:
+        record["beacon"] = json.loads(raw_beacon)
     return _canonical_message(record)
 
 
@@ -1881,8 +1920,8 @@ def store_message(
         with conn:
             conn.execute(
                 "INSERT INTO messages(v, hash, channel, author, key, name, text, "
-                "created_at, expires_at, received_at, sig, poll_options, poll_vote, poll_close, reply_to, location, contact) "
-                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "created_at, expires_at, received_at, sig, poll_options, poll_vote, poll_close, reply_to, location, contact, beacon) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     CHANNEL_VERSION,
                     digest,
@@ -1901,6 +1940,7 @@ def store_message(
                     message.get("reply_to", ""),
                     _dump_poll_field(message.get("location")),
                     _dump_poll_field(message.get("contact")),
+                    _dump_poll_field(message.get("beacon")),
                 ),
             )
             _prune_store(conn, message["channel"])
@@ -2211,6 +2251,7 @@ def create_message(
     reply_to: Optional[str] = None,
     location: Optional[Dict[str, Any]] = None,
     contact: Optional[Dict[str, Any]] = None,
+    beacon: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Create, sign and store a message owned by *identity*.
 
@@ -2230,6 +2271,13 @@ def create_message(
     (``{"name": .., "destination_hash": <32 hex>}``); it is covered
     by the hash when present, and refused on a reply or a poll, like
     a location pin.
+
+    ``beacon`` marks the message as one update of a live beacon
+    (``{"id": .., "expires_at": .., "seq": ..}``): it rides as an
+    unsigned advisory field, like ``expires_at``, so older nodes
+    verify the message exactly as before. A beacon update must
+    carry a location pin, and a malformed marker is refused here —
+    local sends never silently drop one.
 
     """
     timestamp = round(float(now if now is not None else time.time()), 3)
@@ -2262,6 +2310,31 @@ def create_message(
         body["location"] = location
     if contact is not None:
         body["contact"] = contact
+    if beacon is not None:
+        # A malformed marker is refused on a local send — see
+        # _normalize_message, which drops one on receipt instead.
+        # So is a marker without a pin, or on a reply or a poll:
+        # the receive path drops those, so the refusal has to live
+        # here for a local send to stay strict.
+        if clean_beacon(beacon) is None:
+            raise ChannelError(
+                "beacon must have an id, an expiry and a sequence number"
+            )
+        if location is None:
+            raise ChannelError(
+                "a beacon update must carry a location pin"
+            )
+        if (
+            reply_to is not None
+            or poll_options is not None
+            or poll_vote is not None
+            or poll_close is not None
+        ):
+            raise ChannelError(
+                "a beacon update can only be attached to a "
+                "top-level message, not a reply or a poll"
+            )
+        body["beacon"] = beacon
     normalized = _normalize_message(body, now=timestamp)
     digest = hash_message(normalized)
     mesg = dict(normalized)
@@ -3526,6 +3599,7 @@ class ChannelApp:
         reply_to: Optional[str] = None,
         location: Optional[Dict[str, Any]] = None,
         contact: Optional[Dict[str, Any]] = None,
+        beacon: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Create a message in a joined channel, gossiping it when asked.
 
@@ -3542,6 +3616,9 @@ class ChannelApp:
         top-level message; it is refused on a reply or a poll.
         ``contact`` shares a peer's card on a top-level message; it
         is refused on a reply or a poll, like a location pin.
+        ``beacon`` marks the message as one update of a live beacon:
+        it rides as an unsigned advisory field, and it needs a
+        location pin on the same message.
         """
         name = clean_channel_name(channel)
         if expires_at is None:
@@ -3569,6 +3646,7 @@ class ChannelApp:
                 reply_to=reply_to,
                 location=location,
                 contact=contact,
+                beacon=beacon,
             )
         finally:
             conn.close()

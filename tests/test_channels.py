@@ -151,6 +151,180 @@ def test_duplicate_message_is_idempotent(identities, tmp_path):
     assert len(channel_history(conn, "general")) == 1
 
 
+# -- live-beacon markers (issue #827) ----------------------------------------
+
+BEACON_MARKER = {"id": "aabbccdd", "expires_at": 4600.0, "seq": 1}
+BEACON_PIN = {"lat": 34.05, "lon": -83.88, "name": "Rock Springs Park"}
+
+
+def test_create_message_with_beacon_roundtrips(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    message = create_message(
+        conn, alice, "general", "Rock Springs Park",
+        name="alice", now=1000, location=BEACON_PIN, beacon=BEACON_MARKER,
+    )
+
+    assert message["beacon"] == BEACON_MARKER
+    assert message["location"] == BEACON_PIN
+    assert verify_message(message)["beacon"] == BEACON_MARKER
+    assert get_message(conn, message["hash"])["beacon"] == BEACON_MARKER
+    assert channel_history(conn, "general")[0]["beacon"] == BEACON_MARKER
+
+
+def test_beacon_marker_does_not_change_the_hash(identities, tmp_path):
+    # The marker rides as an unsigned advisory field, like
+    # expires_at: a node that drops it still verifies the same hash,
+    # so older nodes serve a beacon update as an ordinary pin.
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    marked = create_message(
+        conn, alice, "general", "Rock Springs Park",
+        name="alice", now=1000, location=BEACON_PIN, beacon=BEACON_MARKER,
+    )
+    stripped = {k: v for k, v in marked.items() if k != "beacon"}
+    assert hash_message(stripped) == marked["hash"]
+    assert verify_message(stripped)["hash"] == marked["hash"]
+    assert verify_message(dict(marked, beacon=None))["hash"] == marked["hash"]
+
+
+def test_create_message_refuses_beacon_without_location(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    with pytest.raises(ChannelError):
+        create_message(
+            conn, alice, "general", "here",
+            name="alice", now=1000, beacon=BEACON_MARKER,
+        )
+
+
+def test_create_message_refuses_malformed_beacon(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    with pytest.raises(ChannelError):
+        create_message(
+            conn, alice, "general", "Rock Springs Park",
+            name="alice", now=1000, location=BEACON_PIN, beacon={"id": "x"},
+        )
+
+
+def test_create_message_refuses_beacon_on_reply(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    parent = create_message(conn, alice, "general", "hello", name="alice", now=1000)
+    with pytest.raises(ChannelError):
+        create_message(
+            conn, alice, "general", "Rock Springs Park",
+            name="alice", now=1001, location=BEACON_PIN, beacon=BEACON_MARKER,
+            reply_to=parent["hash"],
+        )
+
+
+def test_malformed_beacon_marker_drops_on_receipt(identities, tmp_path):
+    # A peer's malformed marker never breaks the message: the pin
+    # still reads, like a malformed location drops.
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    # The envelope is built on a scratch store so store_message's own
+    # verdict is what the test sees — create_message would apply the
+    # envelope to the main store first and mask it.
+    scratch = init_db(tmp_path / "scratch.sqlite3")
+    message = create_message(
+        scratch, alice, "general", "Rock Springs Park",
+        name="alice", now=1000, location=BEACON_PIN,
+    )
+    damaged = dict(message, beacon={"id": "x"})
+    record, is_new = store_message(conn, damaged)
+    assert is_new is True
+    assert "beacon" not in record
+    assert record["location"] == BEACON_PIN
+
+
+def test_oversized_beacon_expiry_drops_on_receipt(identities, tmp_path):
+    # A 401-digit expires_at overflows float(): the marker drops
+    # instead of aborting the channel post handler before signature
+    # verification.
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    scratch = init_db(tmp_path / "scratch.sqlite3")
+    message = create_message(
+        scratch, alice, "general", "Rock Springs Park",
+        name="alice", now=1000, location=BEACON_PIN,
+    )
+    damaged = dict(
+        message,
+        beacon={"id": "aabbccdd", "expires_at": 10**400, "seq": 1},
+    )
+    record, is_new = store_message(conn, damaged)
+    assert is_new is True
+    assert "beacon" not in record
+    assert record["location"] == BEACON_PIN
+
+
+def test_stray_beacon_marker_drops_on_receipt(identities, tmp_path):
+    # A valid marker on a message without a pin drops on receipt:
+    # the marker is unsigned, so refusing the message would let any
+    # relay censor someone else's valid signed message by appending
+    # one.  A local send still refuses it (see create_message).
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    scratch = init_db(tmp_path / "scratch.sqlite3")
+    message = create_message(
+        scratch, alice, "general", "hello", name="alice", now=1000,
+    )
+    damaged = dict(message, beacon=BEACON_MARKER)
+    record, is_new = store_message(conn, damaged)
+    assert is_new is True
+    assert "beacon" not in record
+    assert record["text"] == "hello"
+
+
+def test_beacon_marker_on_reply_drops_on_receipt(identities, tmp_path):
+    # A reply carries no pin, so a marker appended to one drops on
+    # receipt instead of refusing the reply.
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    scratch = init_db(tmp_path / "scratch.sqlite3")
+    parent = create_message(
+        scratch, alice, "general", "hello", name="alice", now=1000,
+    )
+    reply = create_message(
+        scratch, alice, "general", "on my way",
+        name="alice", now=1001, reply_to=parent["hash"],
+    )
+    store_message(conn, parent)
+    damaged = dict(reply, beacon=BEACON_MARKER)
+    record, is_new = store_message(conn, damaged)
+    assert is_new is True
+    assert "beacon" not in record
+    assert record["reply_to"] == parent["hash"]
+    assert record["text"] == "on my way"
+
+
+def test_init_db_adds_beacon_column_to_old_stores(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "channels.sqlite3"
+    raw = sqlite3.connect(str(path))
+    # A store from before channel beacons: every column except the
+    # new one, so the schema's indexes still apply.
+    raw.execute(
+        "CREATE TABLE messages ("
+        "v INTEGER NOT NULL DEFAULT 1, hash TEXT PRIMARY KEY, "
+        "channel TEXT NOT NULL, author TEXT NOT NULL, key TEXT NOT NULL, "
+        "name TEXT NOT NULL DEFAULT '', text TEXT NOT NULL, "
+        "created_at REAL NOT NULL, expires_at REAL, received_at REAL NOT NULL, "
+        "sig TEXT NOT NULL, poll_options TEXT, poll_vote TEXT, poll_close TEXT, "
+        "reply_to TEXT NOT NULL DEFAULT '', location TEXT, contact TEXT)"
+    )
+    raw.commit()
+    raw.close()
+    conn = init_db(path)
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
+    assert "beacon" in columns
+    conn.close()
+
+
 # -- topics ------------------------------------------------------------------
 
 

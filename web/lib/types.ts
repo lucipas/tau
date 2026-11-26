@@ -345,9 +345,9 @@ export interface LiveBeacon {
 /** A live beacon this node is sharing, as served by GET /api/beacons. */
 export interface Beacon {
   id: string;
-  /** Destination hash of the DM peer, the group id, or the broadcast list name. */
+  /** Destination hash of the DM peer, the group id, the broadcast list name, or the channel name. */
   target: string;
-  target_kind: "dm" | "group" | "broadcast";
+  target_kind: "dm" | "group" | "broadcast" | "channel";
   target_name: string;
   started_at: number;
   expires_at: number;
@@ -917,6 +917,8 @@ export interface ChannelMessage {
   location?: LocationPin;
   /** Shared contact card on a top-level message, if any. */
   contact?: { name: string; destination_hash: string };
+  /** Live-beacon marker on a location update, if any. */
+  beacon?: LiveBeacon;
   /** Present when the author edited this message; the text shown is the latest edit. */
   edited?: boolean;
   edited_at?: number;

@@ -11967,6 +11967,7 @@ class TauNode:
         *,
         group: bool = False,
         broadcast: bool = False,
+        channel: bool = False,
         coarse: bool = False,
         duration: float = BEACON_DEFAULT_DURATION,
         interval: float = BEACON_UPDATE_INTERVAL,
@@ -11975,11 +11976,12 @@ class TauNode:
         discover_timeout: Optional[float] = None,
         now: Optional[float] = None,
     ) -> Beacon:
-        """Start a live beacon for a DM peer, a group, or a broadcast
-        list, and return it.
+        """Start a live beacon for a DM peer, a group, a broadcast
+        list, or a channel, and return it.
 
         Resolves the conversation first — a peer by name or hash, a
-        group by id, prefix or name, a broadcast list by name — so a
+        group by id, prefix or name, a broadcast list by name, a
+        channel by name (which this node must have joined) — so a
         beacon can never start for a target this node cannot name.
         The first update is the caller's job
         (:meth:`send_beacon_update`): the beacon is stored with its
@@ -11987,8 +11989,11 @@ class TauNode:
         double-send it in the same round.
         """
         now = time.time() if now is None else now
-        if group and broadcast:
-            raise NodeError("a beacon targets a group or a broadcast list, not both")
+        if sum((group, broadcast, channel)) > 1:
+            raise NodeError(
+                "a beacon targets a group, a broadcast list, or a "
+                "channel — not more than one"
+            )
         target_id = ""
         if group:
             self.groups.list_groups()  # reload: a group made by another process
@@ -12010,6 +12015,26 @@ class TauNode:
             # reused after a delete, and a tick must never retarget
             # the beacon at a different list's members.
             target_id = record["id"]
+        elif channel:
+            # Local import: the channel store is only needed here.
+            from .channels import ChannelError, clean_channel_name, init_db, is_member
+
+            try:
+                name = clean_channel_name(target)
+            except ChannelError as exc:
+                raise NodeError(str(exc)) from exc
+            conn = init_db(self.config.channels_db_path)
+            try:
+                member = is_member(conn, name)
+            finally:
+                conn.close()
+            if not member:
+                raise NodeError(
+                    f"not a member of channel {name!r}; join it first"
+                )
+            target_hash = name
+            target_kind = "channel"
+            target_name = name
         else:
             peer = self.resolve_peer(
                 target,
@@ -12134,6 +12159,62 @@ class TauNode:
             "results": results,
         }
 
+    def _send_channel_beacon_update(
+        self,
+        beacon: Beacon,
+        text: str,
+        location: Dict[str, Any],
+        marker: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Post one beacon update into a channel.
+
+        The update is one ordinary channel message carrying the pin
+        and the beacon marker, published through the channel app —
+        the attached one when this node serves with ``--channels``,
+        else a transient one, the same way ``tau channel send``
+        publishes from a one-shot node.  Membership is re-checked
+        on every tick by the send itself: a channel left since start
+        fails the tick (and stays due) instead of posting into a
+        room this node no longer belongs to.
+        """
+        from .channels import ChannelApp, ChannelError
+
+        app = getattr(self, "channel_app", None)
+        if app is None:
+            app = ChannelApp(self.config, self.identity, name=self.name)
+            app.node = self
+        try:
+            message = app.send(
+                beacon.target,
+                text,
+                location=location,
+                beacon=marker,
+                # Each tick expires with the beacon itself: without
+                # an expiry every tick stays stored until pruning,
+                # and a long beacon evicts the room's real history
+                # from the 500-message per-channel cap.
+                expires_at=marker["expires_at"],
+            )
+        except ChannelError as exc:
+            raise NodeError(str(exc)) from exc
+        try:
+            # Bound the fan-out like the gossip relays: an unbounded
+            # publish walks every registry peer in turn, 15 s each,
+            # on the mail loop.
+            published = app.publish(message, fanout=app.gossip_fanout)
+        except ChannelError as exc:
+            raise NodeError(str(exc)) from exc
+        if published.get("peers", 0) > 0 and published.get("delivered", 0) == 0:
+            # Peers were attempted but none received the update: the
+            # tick stays due instead of advancing the schedule, so
+            # the next round retries it rather than silently
+            # dropping a round of live location.
+            raise NodeError(
+                "channel beacon update reached no peers "
+                f"({published.get('peers')} attempted)"
+            )
+        return {"message": message, "published": published}
+
     def send_beacon_update(
         self, beacon: Beacon, *, now: Optional[float] = None
     ) -> Dict[str, Any]:
@@ -12168,6 +12249,10 @@ class TauNode:
                 location=location,
                 beacon=marker,
                 kind="location",
+            )
+        elif beacon.target_kind == "channel":
+            result = self._send_channel_beacon_update(
+                beacon, text, location, marker
             )
         elif beacon.target_kind == "broadcast":
             result = self._send_broadcast_beacon_update(
