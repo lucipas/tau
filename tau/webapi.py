@@ -5263,6 +5263,11 @@ class WebBridge:
                 disappearing_path=config.disappearing_path,
             )
             return entry.to_dict()
+        if resolved_reply_to is not None:
+            if location is not None:
+                raise ValueError("a scheduled reply cannot carry a location")
+            if contact is not None:
+                raise ValueError("a scheduled reply cannot carry a contact card")
         entry = schedule_channel_message(
             config.scheduled_channel_messages_path,
             channel=name,

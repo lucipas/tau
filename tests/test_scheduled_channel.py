@@ -770,6 +770,46 @@ def test_schedule_poll_rejects_reply(tmp_path):
     assert load_scheduled_channel_messages(path).messages == ()
 
 
+def test_schedule_reply_rejects_location_and_contact(tmp_path):
+    # A reply already points at its parent: a pin or a card belongs
+    # on a plain top-level message, and the publish pass would fail
+    # every attempt on an entry carrying one.  Refuse at schedule
+    # time instead of queueing an entry that can never publish.
+    path = tmp_path / "scheduled-channel-messages.json"
+    with pytest.raises(ScheduledChannelError, match="cannot carry a location"):
+        schedule_channel_message(
+            path,
+            channel="general",
+            text="agreed",
+            publish_at=1000.0,
+            now=900.0,
+            reply_to=PARENT,
+            location=PIN,
+        )
+    with pytest.raises(ScheduledChannelError, match="cannot carry a contact card"):
+        schedule_channel_message(
+            path,
+            channel="general",
+            text="agreed",
+            publish_at=1000.0,
+            now=900.0,
+            reply_to=PARENT,
+            contact=CARD,
+        )
+    assert load_scheduled_channel_messages(path).messages == ()
+
+
+def test_hand_built_reply_with_attachment_is_invalid():
+    # The invariant lives on the entry itself, not only on the
+    # scheduling path: a queue file hand-edited to carry a pin or a
+    # card on a reply loads as a corrupt queue instead of an entry
+    # the publish pass fails on forever.
+    with pytest.raises(ScheduledChannelError, match="cannot carry a location"):
+        _message(reply_to=PARENT, location=PIN)
+    with pytest.raises(ScheduledChannelError, match="cannot carry a contact card"):
+        _message(reply_to=PARENT, contact=CARD)
+
+
 def test_schedule_reply_wire_preflight(tmp_path):
     # 1,920 emoji fit the 8 KiB envelope on their own but overflow
     # once the reply hash (~64 bytes) rides along: refuse at schedule

@@ -448,6 +448,18 @@ class ScheduledChannelMessage:
             raise ScheduledChannelError(
                 "a scheduled channel message cannot carry poll options"
             )
+        if self.reply_to is not None:
+            # A reply already points at its parent: a pin or a card
+            # belongs on a plain top-level message, and the publish
+            # pass would fail every attempt on an entry carrying one.
+            if self.location is not None:
+                raise ScheduledChannelError(
+                    "a scheduled reply cannot carry a location"
+                )
+            if self.contact is not None:
+                raise ScheduledChannelError(
+                    "a scheduled reply cannot carry a contact card"
+                )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -831,6 +843,16 @@ def schedule_channel_message(
     clean_reply_to = _clean_reply_to(reply_to)
     if clean_kind == "poll" and clean_reply_to is not None:
         raise ScheduledChannelError("a scheduled poll cannot carry a reply")
+    if clean_reply_to is not None:
+        # A reply already points at its parent: a pin or a card
+        # belongs on a plain top-level message, and the publish pass
+        # would fail every attempt on an entry carrying one.
+        if clean_location_value is not None:
+            raise ScheduledChannelError("a scheduled reply cannot carry a location")
+        if clean_contact_value is not None:
+            raise ScheduledChannelError(
+                "a scheduled reply cannot carry a contact card"
+            )
     clean_expires_in = _clean_expires_in(expires_in)
     clean_publish_at = _clean_timestamp(publish_at, "publish_at")
     # The publish pass stamps created_at with the send time, rounded to

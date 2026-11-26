@@ -25277,6 +25277,37 @@ def test_channel_schedule_reply_via_api(tmp_path):
         )
         assert status == 400
         assert "cannot carry a reply" in payload["error"]["message"]
+
+        # A reply cannot carry a location pin or a contact card: the
+        # publish pass would fail every attempt on such an entry.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/schedule",
+            method="POST",
+            body={
+                "channel": "general",
+                "text": "agreed",
+                "send_in": 60,
+                "reply_to": parent["hash"],
+                "location": {"lat": 34.05, "lon": -83.88},
+            },
+        )
+        assert status == 400
+        assert "cannot carry a location" in payload["error"]["message"]
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/schedule",
+            method="POST",
+            body={
+                "channel": "general",
+                "text": "agreed",
+                "send_in": 60,
+                "reply_to": parent["hash"],
+                "contact": {"name": "carol", "destination_hash": "cc" * 16},
+            },
+        )
+        assert status == 400
+        assert "cannot carry a contact card" in payload["error"]["message"]
     finally:
         bridge.stop()
 
