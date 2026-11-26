@@ -541,6 +541,43 @@ def test_media_store_round_trip_and_prune(tmp_path):
     assert media_path(tmp_path, second_digest) is not None
 
 
+def test_image_attachment_pin_oserror_becomes_post_error(tmp_path, monkeypatch):
+    """A pin failure is a PostError, not an escaped OSError (#835).
+
+    The cached bytes are readable, but the pinned destination rejects
+    the write (or the timestamp refresh on an already-pinned copy), so
+    ``store_media`` raises OSError. Both attachment helpers must turn
+    that into a descriptive PostError chained to the original, so
+    saving, publishing, or scheduling the image stays inside the
+    request-error handling.
+    """
+    import base64
+
+    from tau.tangents.tan import (
+        image_attachment_from_data_url,
+        image_attachment_from_descriptor,
+    )
+
+    data = _png_bytes()
+    digest = hashlib.sha256(data).hexdigest()
+    store_media(tmp_path, digest, data)
+    pinned_failure = OSError("pinned directory is not writable")
+
+    def _raise_oserror(*args, **kwargs):
+        raise pinned_failure
+
+    monkeypatch.setattr(tan_module, "store_media", _raise_oserror)
+    with pytest.raises(PostError, match="could not be pinned") as excinfo:
+        image_attachment_from_descriptor(
+            {"sha256": digest, "name": "pic.png"}, tmp_path
+        )
+    assert excinfo.value.__cause__ is pinned_failure
+    data_url = "data:image/png;base64," + base64.b64encode(data).decode("ascii")
+    with pytest.raises(PostError, match="could not be pinned") as excinfo:
+        image_attachment_from_data_url(data_url, tmp_path)
+    assert excinfo.value.__cause__ is pinned_failure
+
+
 def test_concurrent_create_post_does_not_fork_the_chain(identities, tmp_path):
     # Two writers racing the head read used to append siblings with the
     # same seq — a fork.  The head read and the append are one atomic
