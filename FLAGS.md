@@ -24,9 +24,9 @@ Global options may appear before or after the command:
 | `tau send --to PEER TEXT --poll-options A B` | Ask a question with 2–8 options in a DM (the poll renders with its tally in `tau messages` and the console) |
 | `tau vote --to PEER POLL OPTION` | Vote on a DM poll (option number or exact text; one standing vote per voter, latest wins) |
 | `tau close-poll --to PEER POLL` | Close a DM poll you created (freezes the tally; only the creator can close it) |
-| `tau beacon start PEER --location "LAT,LON [PLACE]"` | Share live location with a peer or group as periodic pin updates (default every 5 min for 1 h; `--group GROUP` for a group, `--coarse` rounds each update to ~1 km and drops the place name, `--location-file PATH` re-reads a JSON position file on every update, `--duration-mins N` and `--interval-mins N` tune the schedule; updates go out from the serving node, `tau serve`, and queue in the outbox when the peer is offline) |
-| `tau beacon stop PEER` | Stop sharing live location with a peer or group (`--group GROUP` for a group) |
-| `tau beacon update PEER --location "LAT,LON [PLACE]"` | Refresh a running beacon's position or position file (`--location-file PATH` to attach a file instead) |
+| `tau beacon start PEER --location "LAT,LON [PLACE]"` | Share live location with a peer, group, or broadcast list as periodic pin updates (default every 5 min for 1 h; `--group GROUP` for a group, `--broadcast LIST` for a broadcast list — one private DM per member, resolved at each tick so removing a member stops their updates; `--coarse` rounds each update to ~1 km and drops the place name, `--location-file PATH` re-reads a JSON position file on every update, `--duration-mins N` and `--interval-mins N` tune the schedule; updates go out from the serving node, `tau serve`, and queue in the outbox when the peer is offline) |
+| `tau beacon stop PEER` | Stop sharing live location with a peer, group, or broadcast list (`--group GROUP` for a group, `--broadcast LIST` for a list) |
+| `tau beacon update PEER --location "LAT,LON [PLACE]"` | Refresh a running beacon's position or position file (`--location-file PATH` to attach a file instead; `--broadcast LIST` for a list beacon) |
 | `tau beacon list` | List running and recently ended beacons |
 | `tau away on [--message TEXT]` | Turn the away reply on: the first DM from each peer gets one automatic reply with the message (default: "I'm away right now. I'll reply when I'm back."); turning it off and on again resets who has been answered |
 | `tau away off` | Turn the away reply off |

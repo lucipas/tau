@@ -5,7 +5,9 @@
 "use client";
 
 import { useState } from "react";
+import BeaconControl from "./BeaconControl";
 import type {
+  Beacon,
   BroadcastList,
   BroadcastSendResponse,
   Peer,
@@ -23,6 +25,10 @@ export interface BroadcastsPanelProps {
   // cap); drafts and send results are re-keyed under that name.
   onRename: (name: string, newName: string) => Promise<string>;
   onSend: (name: string, text: string) => Promise<BroadcastSendResponse>;
+  /** Live beacons, so a list with a running beacon shows its banner. */
+  beacons?: Beacon[];
+  onRefreshBeacons?: () => Promise<void> | void;
+  onBeaconError?: (message: string) => void;
 }
 
 export default function BroadcastsPanel({
@@ -34,6 +40,9 @@ export default function BroadcastsPanel({
   onDelete,
   onRename,
   onSend,
+  beacons = [],
+  onRefreshBeacons,
+  onBeaconError,
 }: BroadcastsPanelProps) {
   const [showCreate, setShowCreate] = useState(false);
   const [name, setName] = useState("");
@@ -49,6 +58,11 @@ export default function BroadcastsPanel({
   const [renaming, setRenaming] = useState<string | null>(null);
   const [renameName, setRenameName] = useState("");
   const [panelError, setPanelError] = useState<string | null>(null);
+  // The list whose beacon control is open. A list with a running
+  // beacon always shows its control (so it can be stopped); other
+  // lists show it only once expanded, so fifty lists do not mount
+  // fifty ticking controls.
+  const [sharing, setSharing] = useState<string | null>(null);
 
   const count = broadcasts.length;
 
@@ -252,6 +266,13 @@ export default function BroadcastsPanel({
           {broadcasts.map((list) => {
             const result = results[list.name];
             const busy = sending.has(list.name);
+            const hasActiveBeacon = beacons.some(
+              (b) =>
+                b.active &&
+                b.target_kind === "broadcast" &&
+                b.target === list.name,
+            );
+            const showBeacon = hasActiveBeacon || sharing === list.name;
             return (
               <li
                 key={list.name}
@@ -375,6 +396,33 @@ export default function BroadcastsPanel({
                       </li>
                     ))}
                   </ul>
+                )}
+                {showBeacon ? (
+                  <div className="mt-1">
+                    <BeaconControl
+                      target={{
+                        kind: "broadcast",
+                        key: list.name,
+                        name: list.name,
+                      }}
+                      beacons={beacons}
+                      defaultOpen
+                      onRefresh={() => void onRefreshBeacons?.()}
+                      onError={(message) =>
+                        onBeaconError
+                          ? onBeaconError(message)
+                          : setPanelError(message)
+                      }
+                    />
+                  </div>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => setSharing(list.name)}
+                    className="mt-1 rounded-full border border-zinc-700 px-3 py-1 text-xs font-semibold text-zinc-200 hover:bg-zinc-800"
+                  >
+                    📍 Share live location
+                  </button>
                 )}
               </li>
             );

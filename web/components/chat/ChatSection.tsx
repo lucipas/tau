@@ -956,6 +956,9 @@ export default function ChatSection() {
             onDelete={(name) => broadcasts.remove(name)}
             onRename={(name, newName) => broadcasts.rename(name, newName)}
             onSend={(name, text) => broadcasts.send(name, text)}
+            beacons={beacons.beacons}
+            onRefreshBeacons={beacons.refresh}
+            onBeaconError={(message) => setError(message)}
           />
         )}
         {showOutbox && (

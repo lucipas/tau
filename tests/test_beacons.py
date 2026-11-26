@@ -521,3 +521,160 @@ def test_node_group_beacon_update(tmp_path, monkeypatch):
     assert kwargs["location"] == PIN
     assert kwargs["beacon"]["id"] == beacon.id
     assert kwargs["beacon"]["seq"] == 1
+
+# -- broadcast-list beacons (issue #820) -------------------------------------
+
+def test_beacons_start_broadcast_validates_name():
+    beacons = Beacons()
+    beacon = beacons.start(
+        target="  Family  ", target_kind="broadcast", location=PIN, now=NOW
+    )
+    assert beacon.target == "Family"
+    assert beacon.target_kind == "broadcast"
+    assert beacon.target_name == ""
+    # The name is cleaned, not lowercased: "Family" stays "Family".
+    with pytest.raises(BeaconsError):
+        beacons.start(target="   ", target_kind="broadcast", location=PIN, now=NOW)
+    with pytest.raises(BeaconsError):
+        beacons.start(target=123, target_kind="broadcast", location=PIN, now=NOW)
+    # A second active beacon for the same list is refused, like a
+    # second beacon for the same peer or group.
+    with pytest.raises(BeaconsError):
+        beacons.start(
+            target="family", target_kind="broadcast", location=PIN, now=NOW
+        )
+    # Round-trip: the kind and the name survive the store.
+    restored = Beacons.from_dict(beacons.to_dict())
+    assert restored.get(beacon.id).target == "Family"
+    assert restored.get(beacon.id).target_kind == "broadcast"
+
+
+def _make_broadcast_node(tmp_path, members=("alice", "bob")):
+    import types
+
+    node = make_node(tmp_path)
+    identity = RNS.Identity()
+    node.identity = identity
+    own_hash = RNS.Destination.hash(identity, APP_NAME, ASPECT).hex()
+    # A bare destination stand-in: only the hexhash is consulted, and
+    # building a live RNS destination needs a running Reticulum.
+    node.destination = types.SimpleNamespace(hexhash=own_hash)
+    peers = {}
+    for name in members:
+        peer = make_peer(name)
+        node.registry.upsert(
+            peer.destination_hash, peer.public_key, name=peer.name, now=1.0
+        )
+        peers[name] = peer
+    node.broadcasts.create(
+        "family", [peers[name].hexhash for name in members] + [own_hash]
+    )
+    return node, own_hash, peers
+
+
+def test_node_start_beacon_broadcast_resolves_list(tmp_path):
+    node, own_hash, peers = _make_broadcast_node(tmp_path)
+    beacon = node.start_beacon("family", PIN, broadcast=True, now=NOW)
+    assert beacon.target == "family"
+    assert beacon.target_kind == "broadcast"
+    assert beacon.target_name == "family"
+    assert beacon.next_update_at == NOW + BEACON_UPDATE_INTERVAL
+    # Name lookup is case-insensitive, like the list store itself.
+    with pytest.raises(NodeError):
+        node.start_beacon("Family", PIN, broadcast=True, now=NOW + 10)
+    with pytest.raises(NodeError):
+        node.start_beacon("nobody", PIN, broadcast=True, now=NOW + 10)
+    with pytest.raises(NodeError):
+        node.start_beacon("family", PIN, group=True, broadcast=True, now=NOW + 10)
+
+
+def test_node_broadcast_beacon_update_fans_out_per_member(tmp_path, monkeypatch):
+    node, own_hash, peers = _make_broadcast_node(tmp_path)
+    beacon = node.start_beacon("family", PIN, broadcast=True, now=NOW)
+    calls = []
+
+    def fake_send(target, text, **kwargs):
+        calls.append((target, text, kwargs))
+        return {"ok": True, "id": "f" * 32}
+
+    monkeypatch.setattr(node, "send_message", fake_send)
+    result = node.send_beacon_update(beacon, now=NOW)
+    # One DM per member — and never to this node itself.
+    assert len(calls) == 2
+    assert {bytes(c[0]).hex() for c in calls} == {
+        peers["alice"].hexhash,
+        peers["bob"].hexhash,
+    }
+    for _target, text, kwargs in calls:
+        assert text == "Rock Springs Park"
+        assert kwargs["kind"] == "location"
+        assert kwargs["location"] == PIN
+        assert kwargs["beacon"] == {
+            "id": beacon.id,
+            "expires_at": beacon.expires_at,
+            "seq": 1,
+        }
+    assert result["ok"] is True
+    assert result["broadcast"] == "family"
+    assert result["sent_at"] == NOW
+    assert [leg["to"] for leg in result["results"]] == [
+        peers["alice"].hexhash,
+        peers["bob"].hexhash,
+    ]
+    assert all(leg["delivered"] for leg in result["results"])
+    assert beacon.updates_sent == 1
+    assert beacon.next_update_at == NOW + BEACON_UPDATE_INTERVAL
+    stored = load_beacons(node.config.beacons_path)
+    assert stored.get(beacon.id).updates_sent == 1
+
+
+def test_node_broadcast_beacon_update_resolves_members_each_tick(
+    tmp_path, monkeypatch
+):
+    node, own_hash, peers = _make_broadcast_node(tmp_path)
+    beacon = node.start_beacon("family", PIN, broadcast=True, now=NOW)
+    calls = []
+
+    def fake_send(target, text, **kwargs):
+        calls.append(target)
+        return {"ok": True, "id": "f" * 32}
+
+    monkeypatch.setattr(node, "send_message", fake_send)
+    node.send_beacon_update(beacon, now=NOW)
+    assert len(calls) == 2
+    # Removing a member stops their updates at the next tick.
+    node.broadcasts.remove_members("family", [peers["bob"].hexhash])
+    node.send_beacon_update(beacon, now=NOW + BEACON_UPDATE_INTERVAL)
+    assert len(calls) == 3
+    assert bytes(calls[2]).hex() == peers["alice"].hexhash
+    # Deleting the list fails the tick, like an unknown group.
+    node.broadcasts.delete("family")
+    with pytest.raises(NodeError):
+        node.send_beacon_update(beacon, now=NOW + 2 * BEACON_UPDATE_INTERVAL)
+
+
+def test_node_broadcast_beacon_update_failed_leg_keeps_going(
+    tmp_path, monkeypatch
+):
+    from tau.node import NotAllowedError
+
+    node, own_hash, peers = _make_broadcast_node(tmp_path)
+    beacon = node.start_beacon("family", PIN, broadcast=True, now=NOW)
+    calls = []
+
+    def fake_send(target, text, **kwargs):
+        calls.append(target)
+        if bytes(target).hex() == peers["bob"].hexhash:
+            raise NotAllowedError("refused")
+        return {"ok": True, "id": "f" * 32}
+
+    monkeypatch.setattr(node, "send_message", fake_send)
+    result = node.send_beacon_update(beacon, now=NOW)
+    assert len(calls) == 2
+    assert result["ok"] is False
+    by_member = {leg["to"]: leg for leg in result["results"]}
+    assert by_member[peers["alice"].hexhash]["delivered"] is True
+    assert by_member[peers["bob"].hexhash]["ok"] is False
+    # The tick still counts as sent: the schedule advances even
+    # when one leg failed, like a group fan-out with a refused leg.
+    assert beacon.updates_sent == 1

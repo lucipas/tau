@@ -566,7 +566,7 @@ export interface StartBeaconOptions {
 
 /** Start a live beacon; the first update goes out at once. */
 export async function startBeacon(
-  target: { peer?: string; group?: string },
+  target: { peer?: string; group?: string; broadcast?: string },
   opts: StartBeaconOptions,
 ): Promise<{ beacon: Beacon; update: unknown }> {
   return post("/api/beacons/start", { ...target, ...opts });

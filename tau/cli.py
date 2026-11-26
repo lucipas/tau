@@ -2530,7 +2530,7 @@ def build_parser() -> argparse.ArgumentParser:
     beacon_start = beacon_sub.add_parser(
         "start",
         parents=[common],
-        help="start sharing live location with a peer or group",
+        help="start sharing live location with a peer, group, or broadcast list",
     )
     beacon_start_target = beacon_start.add_mutually_exclusive_group(required=True)
     beacon_start_target.add_argument(
@@ -2543,6 +2543,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--group",
         metavar="GROUP",
         help="group id, id prefix or name",
+    )
+    beacon_start_target.add_argument(
+        "--broadcast",
+        metavar="LIST",
+        help="broadcast list name: share with every member as a private DM each",
     )
     beacon_start.add_argument(
         "--location",
@@ -2580,7 +2585,7 @@ def build_parser() -> argparse.ArgumentParser:
     beacon_stop = beacon_sub.add_parser(
         "stop",
         parents=[common],
-        help="stop sharing live location with a peer or group",
+        help="stop sharing live location with a peer, group, or broadcast list",
     )
     beacon_stop_target = beacon_stop.add_mutually_exclusive_group(required=True)
     beacon_stop_target.add_argument(
@@ -2593,6 +2598,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--group",
         metavar="GROUP",
         help="group id, id prefix or name",
+    )
+    beacon_stop_target.add_argument(
+        "--broadcast",
+        metavar="LIST",
+        help="broadcast list name",
     )
     beacon_stop.set_defaults(func=cmd_beacon_stop)
 
@@ -2612,6 +2622,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--group",
         metavar="GROUP",
         help="group id, id prefix or name",
+    )
+    beacon_update_target.add_argument(
+        "--broadcast",
+        metavar="LIST",
+        help="broadcast list name",
     )
     beacon_update.add_argument(
         "--location",
@@ -15286,6 +15301,7 @@ def _beacon_start_local(
     *,
     target: str,
     group: bool = False,
+    broadcast: bool = False,
     location: Dict[str, Any],
     location_file: Optional[str] = None,
     coarse: bool = False,
@@ -15295,14 +15311,16 @@ def _beacon_start_local(
     """Start a beacon on the running node, for the local send server.
 
     Starts the beacon and sends its first update at once, so the
-    peer or group hears from the sender immediately instead of at
-    the next mail-loop round.  Later updates go out from the mail
-    loop, which re-reads the beacons file each round.
+    peer, group, or broadcast list hears from the sender
+    immediately instead of at the next mail-loop round.  Later
+    updates go out from the mail loop, which re-reads the beacons
+    file each round.
     """
     beacon = node.start_beacon(
         target,
         location,
         group=bool(group),
+        broadcast=bool(broadcast),
         coarse=bool(coarse),
         duration=float(duration),
         interval=float(interval),
@@ -20486,28 +20504,40 @@ def cmd_away_status(args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
-def _beacon_target(config: TauConfig, args: argparse.Namespace) -> Tuple[str, bool, str]:
-    """Resolve a beacon stop/update target locally: hash, group?, label.
+def _beacon_target(config: TauConfig, args: argparse.Namespace) -> Tuple[str, str, str]:
+    """Resolve a beacon stop/update target locally: key, kind, label.
 
     Local-only, like the mute command: a peer resolves from the
-    inbox and registry, a group from the group store.  Starting a
-    beacon resolves on the node instead, with discovery, so a peer
-    never seen before can still get one.
+    inbox and registry, a group from the group store, a broadcast
+    list from the broadcast store.  Starting a beacon resolves on
+    the node instead, with discovery, so a peer never seen before
+    can still get one.
     """
     if getattr(args, "group", None) is not None:
         store = GroupStore(config.groups_path)
         group = store.find(args.group)
         return (
             group["id"],
-            True,
+            "group",
             f"group {group['name']} ({short_hash(group['id'])})",
+        )
+    if getattr(args, "broadcast", None) is not None:
+        store = BroadcastStore(config.broadcasts_path)
+        try:
+            broadcast = store.find(args.broadcast)
+        except ValueError as exc:
+            raise NodeError(str(exc)) from exc
+        return (
+            broadcast["name"],
+            "broadcast",
+            f"broadcast list {broadcast['name']}",
         )
     inbox = Inbox(config.inbox_path)
     registry = PeerRegistry(config.peers_path)
     key = _resolve_inbox_peer(inbox, registry, args.peer, direction=None)
     peer = registry.get(key)
     name = peer.display_name if peer is not None else "unknown"
-    return key, False, f"conversation with {name} ({short_hash(key)})"
+    return key, "dm", f"conversation with {name} ({short_hash(key)})"
 
 
 def _beacon_summary(beacon: Any, now: Optional[float] = None) -> Dict[str, Any]:
@@ -20536,7 +20566,13 @@ def _beacon_line(beacon: Any, now: Optional[float] = None) -> str:
     """One human-readable line for a beacon."""
     now = time.time() if now is None else now
     target = beacon.target_name or short_hash(beacon.target)
-    kind = "group" if beacon.target_kind == "group" else "peer"
+    kind = (
+        "group"
+        if beacon.target_kind == "group"
+        else "broadcast list"
+        if beacon.target_kind == "broadcast"
+        else "peer"
+    )
     place = location_default_text(beacon.location)
     coarse = " (coarse)" if beacon.coarse else ""
     if beacon.is_active(now):
@@ -20578,7 +20614,8 @@ def cmd_beacon_start(args: argparse.Namespace) -> int:
             f"{int(BEACON_MAX_INTERVAL // 60)} minutes"
         )
     is_group = getattr(args, "group", None) is not None
-    target = args.group if is_group else args.peer
+    is_broadcast = getattr(args, "broadcast", None) is not None
+    target = args.broadcast if is_broadcast else args.group if is_group else args.peer
     coarse = bool(getattr(args, "coarse", False))
     # A serving node owns the data directory: start through it instead
     # of starting a second Reticulum instance on the same identity.
@@ -20590,6 +20627,7 @@ def cmd_beacon_start(args: argparse.Namespace) -> int:
             op="beacon_start",
             target=target,
             group=is_group,
+            broadcast=is_broadcast,
             location=location,
             location_file=location_file,
             coarse=coarse,
@@ -20606,6 +20644,7 @@ def cmd_beacon_start(args: argparse.Namespace) -> int:
                 target,
                 location,
                 group=is_group,
+                broadcast=is_broadcast,
                 coarse=coarse,
                 duration=duration,
                 interval=interval,
@@ -20621,7 +20660,13 @@ def cmd_beacon_start(args: argparse.Namespace) -> int:
     label = summary.get("target_name") or short_hash(
         str(summary.get("target") or "")
     )
-    kind = "group" if summary.get("target_kind") == "group" else "peer"
+    kind = (
+        "group"
+        if summary.get("target_kind") == "group"
+        else "broadcast list"
+        if summary.get("target_kind") == "broadcast"
+        else "peer"
+    )
     outcome = (
         "queued" if update.get("queued") else "sent"
     )
@@ -20642,21 +20687,37 @@ def cmd_beacon_start(args: argparse.Namespace) -> int:
 
 def cmd_beacon_stop(args: argparse.Namespace) -> int:
     config = _make_config(args)
-    key, is_group, label = _beacon_target(config, args)
-    kind = "group" if is_group else "dm"
+    key, kind, label = _beacon_target(config, args)
     with beacons_lock(config.beacons_path):
         beacons = load_beacons(config.beacons_path)
         stopped = beacons.stop(key, kind)
         if stopped is None:
             if _json_mode(args):
-                _emit({"target": key, "group": is_group, "stopped": False}, True)
+                _emit(
+                    {
+                        "target": key,
+                        "group": kind == "group",
+                        "broadcast": kind == "broadcast",
+                        "stopped": False,
+                    },
+                    True,
+                )
                 return _EXIT_OK
             print(f"No beacon is running for {label}.")
             return _EXIT_OK
         save_beacons(config.beacons_path, beacons)
         summary = _beacon_summary(stopped)
     if _json_mode(args):
-        _emit({"target": key, "group": is_group, "stopped": True, "beacon": summary}, True)
+        _emit(
+            {
+                "target": key,
+                "group": kind == "group",
+                "broadcast": kind == "broadcast",
+                "stopped": True,
+                "beacon": summary,
+            },
+            True,
+        )
         return _EXIT_OK
     print(
         f"Stopped the live beacon for {label} after "
@@ -20679,8 +20740,7 @@ def cmd_beacon_update(args: argparse.Namespace) -> int:
         raise NodeError(
             f"location file {location_file} has no valid position"
         )
-    key, is_group, label = _beacon_target(config, args)
-    kind = "group" if is_group else "dm"
+    key, kind, label = _beacon_target(config, args)
     with beacons_lock(config.beacons_path):
         beacons = load_beacons(config.beacons_path)
         beacon = beacons.update_location(
@@ -20689,7 +20749,15 @@ def cmd_beacon_update(args: argparse.Namespace) -> int:
         save_beacons(config.beacons_path, beacons)
         summary = _beacon_summary(beacon)
     if _json_mode(args):
-        _emit({"target": key, "group": is_group, "beacon": summary}, True)
+        _emit(
+            {
+                "target": key,
+                "group": kind == "group",
+                "broadcast": kind == "broadcast",
+                "beacon": summary,
+            },
+            True,
+        )
         return _EXIT_OK
     place = location_default_text(beacon.location)
     source = (

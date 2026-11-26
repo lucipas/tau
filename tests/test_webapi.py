@@ -458,6 +458,7 @@ class FakeNode:
         location,
         *,
         group=False,
+        broadcast=False,
         coarse=False,
         duration=BEACON_DEFAULT_DURATION,
         interval=BEACON_UPDATE_INTERVAL,
@@ -477,6 +478,14 @@ class FakeNode:
                 raise NodeError(f"unknown group: {target!r}")
             target_hash = record["id"]
             target_kind = "group"
+            target_name = record["name"]
+        elif broadcast:
+            try:
+                record = self.broadcasts.find(target)
+            except ValueError as exc:
+                raise NodeError(str(exc)) from exc
+            target_hash = record["name"]
+            target_kind = "broadcast"
             target_name = record["name"]
         else:
             peer = self.resolve_peer(
@@ -527,6 +536,30 @@ class FakeNode:
             result = self.send_group_message(
                 record, text, location=location, beacon=marker, kind="location"
             )
+        elif beacon.target_kind == "broadcast":
+            broadcast = self.broadcasts.find(beacon.target)
+            results = []
+            for member in broadcast["members"]:
+                peer = self.resolve_peer(member)
+                leg = self.send_message(
+                    peer, text, location=location, beacon=marker, kind="location"
+                )
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": peer.name,
+                        "delivered": True,
+                        "queued": False,
+                        "id": leg.get("id"),
+                    }
+                )
+            result = {
+                "ok": True,
+                "v": 1,
+                "broadcast": broadcast["name"],
+                "sent_at": 1000.0,
+                "results": results,
+            }
         else:
             peer = self.resolve_peer(beacon.target)
             result = self.send_message(
@@ -18481,6 +18514,41 @@ def test_beacon_start_records_one_entry_for_a_group(bridge, node):
     assert len(entries) == 1
     assert entries[0]["group"] == group_id
     assert entries[0]["peer"] is None
+    assert entries[0]["sent_at"] == 1000.0
+
+
+def test_beacon_start_records_one_entry_per_member_for_a_broadcast(
+    bridge, node, tmp_path
+):
+    from tau.broadcasts import BroadcastStore
+
+    node.broadcasts = BroadcastStore(tmp_path / "broadcasts.json")
+    node.broadcasts.create("family", [PEER_HASH])
+    status, _, payload = _json(
+        bridge,
+        "/api/beacons/start",
+        method="POST",
+        body={
+            "broadcast": "family",
+            "lat": 34.05,
+            "lon": -83.88,
+            "duration_seconds": 900,
+        },
+    )
+    assert status == 200
+    beacon = payload["beacon"]
+    assert beacon["target_kind"] == "broadcast"
+    assert beacon["target"] == "family"
+    assert node.last_beacon["id"] == beacon["id"]
+    # One entry per member, in that member's DM thread — the update
+    # was one DM per member, and there is no broadcast thread to put
+    # a single entry in.
+    status, _, listed = _json(bridge, "/api/messages")
+    entries = [m for m in listed["messages"] if m.get("beacon")]
+    assert len(entries) == 1
+    assert entries[0]["peer"] == PEER_HASH
+    assert entries[0].get("group") is None
+    assert entries[0]["location"] == {"lat": 34.05, "lon": -83.88}
     assert entries[0]["sent_at"] == 1000.0
 
 
