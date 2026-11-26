@@ -796,6 +796,17 @@ it("schedules a Tan repost or quote with kind and target_post", async () => {
     expect(bodyOf(0)).toEqual({ text: "text only" });
   });
 
+  it("publishes a Tan post with a location pin", async () => {
+    nextJson = { ok: true, post: {} };
+    await publishTanPost("at the park", {
+      location: { lat: 34.05, lon: -83.88, name: "Rock Springs Park" },
+    });
+    expect(bodyOf(0)).toEqual({
+      text: "at the park",
+      location: { lat: 34.05, lon: -83.88, name: "Rock Springs Park" },
+    });
+  });
+
   it("saves a Tan draft with reply and expiry", async () => {
     nextJson = { ok: true, draft: { id: 1 } };
     const draft = await saveTanDraft("half-written", {
@@ -807,6 +818,23 @@ it("schedules a Tan repost or quote with kind and target_post", async () => {
       text: "half-written",
       reply_to: "h1".padEnd(64, "0"),
       expires_in: 3600,
+    });
+    expect(draft).toEqual({ id: 1 });
+  });
+
+  it("saves a Tan draft with its attachments", async () => {
+    nextJson = { ok: true, draft: { id: 1 } };
+    const draft = await saveTanDraft("with everything", {
+      image: { dataUrl: "data:image/png;base64,aGVsbG8=" },
+      location: { lat: 34.05, lon: -83.88, name: "Rock Springs Park" },
+      contact: { name: "carol", destination_hash: "cc".repeat(16) },
+    });
+    expect(captured[0].url).toBe("/api/tan/drafts");
+    expect(bodyOf(0)).toEqual({
+      text: "with everything",
+      image: "data:image/png;base64,aGVsbG8=",
+      location: { lat: 34.05, lon: -83.88, name: "Rock Springs Park" },
+      contact: { name: "carol", destination_hash: "cc".repeat(16) },
     });
     expect(draft).toEqual({ id: 1 });
   });

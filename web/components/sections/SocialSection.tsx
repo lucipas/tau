@@ -13,7 +13,9 @@ import {
   addPeer,
   cancelScheduledTanPost,
   editScheduledTanPost,
+  fetchTanImageDataUrl,
   getTanFollowedTags,
+  type PublishTanOptions,
 } from "@/lib/api";
 import { formatDateTime, formatDuration, formatRelative, shortHash } from "@/lib/format";
 import type { TanAuthor, TanDraft, TanListMember, TanPost, TanReactors } from "@/lib/types";
@@ -79,6 +81,13 @@ export default function SocialSection() {
   /** Draft loaded into the composer; the composer remounts (via `key`)
    *  when a different draft is loaded, so its initial text applies. */
   const [loadedDraft, setLoadedDraft] = useState<TanDraft | null>(null);
+  /** A loaded draft's image, fetched as a data URL so the composer can
+   *  re-send it; cleared with the draft. */
+  const [loadedDraftImage, setLoadedDraftImage] = useState<{
+    dataUrl: string;
+    name: string;
+    size: number;
+  } | null>(null);
 
   const feed = useTanFeed({ mode: tab, tag: tagFilter ?? undefined, list: listFilter ?? undefined, pollMs: 30_000 });
   const lists = useTanLists();
@@ -106,20 +115,39 @@ export default function SocialSection() {
 
   function openThread(post: TanPost) {
     setLoadedDraft(null);
+    setLoadedDraftImage(null);
     setThreadHash(post.hash);
     setReactors(null);
   }
 
   function openReply(post: TanPost) {
     setLoadedDraft(null);
+    setLoadedDraftImage(null);
     setThreadHash(post.hash);
     setReplyTo(post);
   }
 
   /** Load a draft into the composer: a reply draft opens its thread,
    *  a top-level draft goes to the feed composer. The draft stays saved
-   *  until the composer posts it, so leaving the thread loses nothing. */
-  function loadDraft(draft: TanDraft) {
+   *  until the composer posts it, so leaving the thread loses nothing.
+   *  A draft's image is fetched as a data URL first, so the composer
+   *  can re-send it; when its bytes are no longer cached the image is
+   *  dropped and the notice says so, instead of silently losing it. */
+  async function loadDraft(draft: TanDraft) {
+    let image: { dataUrl: string; name: string; size: number } | null = null;
+    if (draft.image) {
+      const dataUrl = await fetchTanImageDataUrl(draft.image.sha256).catch(
+        () => null,
+      );
+      if (dataUrl) {
+        image = {
+          dataUrl,
+          name: draft.image.name ?? "image",
+          size: draft.image.size ?? 0,
+        };
+      }
+    }
+    setLoadedDraftImage(image);
     setLoadedDraft(draft);
     setReplyTo(null);
     if (draft.reply_to) {
@@ -128,7 +156,11 @@ export default function SocialSection() {
       setThreadHash(null);
       setView("feed");
     }
-    setNotice("Draft loaded — post it to publish, or save it again to keep editing.");
+    setNotice(
+      draft.image && !image
+        ? "Draft loaded — its image is no longer cached, so it was dropped; the text and other attachments are kept."
+        : "Draft loaded — post it to publish, or save it again to keep editing.",
+    );
   }
 
   /** A successful composer submit consumes the loaded draft, mirroring
@@ -137,6 +169,7 @@ export default function SocialSection() {
     if (!loadedDraft) return;
     const id = loadedDraft.id;
     setLoadedDraft(null);
+    setLoadedDraftImage(null);
     await lists.deleteDraft(id);
     setNotice("Draft published.");
   }
@@ -147,12 +180,13 @@ export default function SocialSection() {
    *  copies of the same post. */
   async function handleSaveDraft(
     text: string,
-    opts: { replyTo?: string; expiresIn?: number },
+    opts: PublishTanOptions,
   ) {
     const saved = await lists.saveDraft(text, opts);
     if (loadedDraft && loadedDraft.id !== saved.id) {
       const old = loadedDraft;
       setLoadedDraft(null);
+      setLoadedDraftImage(null);
       await lists.deleteDraft(old.id);
     }
     setNotice("Draft saved — find it under Drafts.");
@@ -371,6 +405,9 @@ export default function SocialSection() {
             onSaveDraft={handleSaveDraft}
             initialText={loadedDraft?.text}
             initialExpiresIn={loadedDraft?.expires_in ?? undefined}
+            initialImage={loadedDraftImage}
+            initialContact={loadedDraft?.contact ?? undefined}
+            initialLocation={loadedDraft?.location ?? undefined}
             placeholder="Reply to this post…"
           />
           {thread.loading && (
@@ -494,6 +531,9 @@ export default function SocialSection() {
               onSaveDraft={handleSaveDraft}
               initialText={loadedDraft?.text}
               initialExpiresIn={loadedDraft?.expires_in ?? undefined}
+              initialImage={loadedDraftImage}
+              initialContact={loadedDraft?.contact ?? undefined}
+              initialLocation={loadedDraft?.location ?? undefined}
             />
           )}
 
@@ -1510,6 +1550,11 @@ function DraftsView({
             {d.expires_in
               ? ` · Disappears ${formatDuration(d.expires_in)} after posting`
               : ""}
+            {d.image ? ` · Image: ${d.image.name ?? "image"}` : ""}
+            {d.location
+              ? ` · Place: ${d.location.name ?? `${d.location.lat}, ${d.location.lon}`}`
+              : ""}
+            {d.contact ? ` · Sharing ${d.contact.name}` : ""}
           </p>
           <div className="mt-2 flex gap-2">
             <button

@@ -8,14 +8,21 @@
 // entry until the publish pass attaches it. Polls can be scheduled
 // like posts, but a scheduled poll cannot carry an image. A contact
 // card works the same way: picked from the known-peers list, top-level
-// posts only, and it rides a scheduled post's queue entry too. Max length
-// is a client-side guard only.
+// posts only, and it rides a scheduled post's queue entry too. A draft
+// keeps all three attachments: saving one passes the picked image and
+// card (and a place the draft already carries) through, and loading a
+// draft prefills them, so a half-written post publishes exactly what
+// was drafted. Max length is a client-side guard only.
 
 "use client";
 
 import { useEffect, useRef, useState } from "react";
 import { validateContact, validatePoll } from "@/components/chat/Composer";
-import { TAN_MAX_IMAGE_BYTES, readFileAsDataUrl } from "@/lib/api";
+import {
+  TAN_MAX_IMAGE_BYTES,
+  readFileAsDataUrl,
+  type PublishTanOptions,
+} from "@/lib/api";
 import type { UseTanComposerResult } from "@/lib/use-tan";
 
 export const TAN_MAX_CHARS = 2000;
@@ -56,10 +63,18 @@ export interface TanComposerProps {
   initialText?: string;
   /** Expiry a loaded draft carries, in seconds. */
   initialExpiresIn?: number;
+  /** Image a loaded draft carries, as a data URL with its file name
+   *  and size — re-sent unchanged until a new file is picked. */
+  initialImage?: { dataUrl: string; name: string; size: number } | null;
+  /** Contact card a loaded draft carries. */
+  initialContact?: { name: string; destination_hash: string } | null;
+  /** Place a loaded draft carries. The composer cannot pick a place —
+   *  it only preserves one a draft already has, through save and publish. */
+  initialLocation?: { lat: number; lon: number; name?: string } | null;
   /** Park the current text as a draft instead of posting it. */
   onSaveDraft?: (
     text: string,
-    opts: { replyTo?: string; expiresIn?: number },
+    opts: PublishTanOptions,
   ) => Promise<void>;
   /** Known peers for the contact picker; the Contact toggle hides when empty. */
   // `name` is the peer's announced name — the one the signed card
@@ -77,6 +92,9 @@ export default function TanComposer({
   placeholder = "What's happening on the mesh?",
   initialText = "",
   initialExpiresIn,
+  initialImage,
+  initialContact,
+  initialLocation,
   onSaveDraft,
   contactPeers,
 }: TanComposerProps) {
@@ -86,8 +104,47 @@ export default function TanComposer({
   const [expiresIn, setExpiresIn] = useState<number | undefined>(initialExpiresIn);
   const [sendIn, setSendIn] = useState<number | undefined>(undefined);
   const [file, setFile] = useState<File | null>(null);
-  const [contactPeer, setContactPeer] = useState("");
-  const [showContact, setShowContact] = useState(false);
+  // A loaded draft's image, as a data URL: a newly picked file wins,
+  // but the draft's image survives until one is picked or it is removed.
+  const [imageDataUrl, setImageDataUrl] = useState<{
+    dataUrl: string;
+    name: string;
+    size: number;
+  } | null>(initialImage ?? null);
+  // A loaded draft's card, when its peer is still in the known list:
+  // prefilled in the picker, so it can be changed like a fresh pick.
+  const [contactPeer, setContactPeer] = useState(
+    initialContact &&
+      (contactPeers ?? []).some((p) => p.key === initialContact.destination_hash)
+      ? initialContact.destination_hash
+      : "",
+  );
+  // A loaded draft's card, when its peer is no longer listed: shown
+  // and carried through unchanged, never re-picked.
+  const [attachedContact, setAttachedContact] = useState<{
+    name: string;
+    destination_hash: string;
+  } | null>(
+    initialContact &&
+      !(contactPeers ?? []).some(
+        (p) => p.key === initialContact.destination_hash,
+      )
+      ? initialContact
+      : null,
+  );
+  // A loaded draft's place: shown and carried through unchanged.
+  const [location, setLocation] = useState<{
+    lat: number;
+    lon: number;
+    name?: string;
+  } | null>(initialLocation ?? null);
+  const [showContact, setShowContact] = useState(
+    initialContact !== null &&
+      initialContact !== undefined &&
+      (contactPeers ?? []).some(
+        (p) => p.key === initialContact.destination_hash,
+      ),
+  );
   const [error, setError] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
@@ -96,8 +153,11 @@ export default function TanComposer({
   useEffect(() => {
     if (replyTo) {
       setFile(null);
+      setImageDataUrl(null);
       if (fileRef.current) fileRef.current.value = "";
       setContactPeer("");
+      setAttachedContact(null);
+      setLocation(null);
       setShowContact(false);
     }
   }, [replyTo]);
@@ -109,9 +169,28 @@ export default function TanComposer({
     setExpiresIn(undefined);
     setSendIn(undefined);
     setFile(null);
+    setImageDataUrl(null);
     setContactPeer("");
+    setAttachedContact(null);
+    setLocation(null);
     setShowContact(false);
     if (fileRef.current) fileRef.current.value = "";
+  }
+
+  // The image to carry: a newly picked file, read as a data URL, or a
+  // loaded draft's image, re-sent as the data URL it was loaded with.
+  async function readAttachedImage(): Promise<{ dataUrl: string } | undefined> {
+    if (file) return { dataUrl: await readFileAsDataUrl(file) };
+    return imageDataUrl ? { dataUrl: imageDataUrl.dataUrl } : undefined;
+  }
+
+  // The card to carry: a newly picked peer, or a loaded draft's card,
+  // carried through unchanged when its peer is no longer listed.
+  function pickedContact(): { name: string; destination_hash: string } | undefined {
+    if (!contactPeer) return attachedContact ?? undefined;
+    const picked = (contactPeers ?? []).find((p) => p.key === contactPeer);
+    if (!picked) throw new Error("Choose a peer to share.");
+    return { name: picked.name, destination_hash: picked.key };
   }
 
   async function handleSaveDraft() {
@@ -120,9 +199,14 @@ export default function TanComposer({
     if (problem) return setError(problem);
     setError(null);
     try {
+      const image = await readAttachedImage();
+      const contact = pickedContact();
       await onSaveDraft(text.trim(), {
         replyTo: replyTo ?? undefined,
         expiresIn,
+        image,
+        location: location ?? undefined,
+        contact,
       });
       reset();
     } catch (err) {
@@ -174,6 +258,9 @@ export default function TanComposer({
       const picked = (contactPeers ?? []).find((p) => p.key === contactPeer);
       if (!picked) return setError("Choose a peer to share.");
       contact = { name: picked.name, destination_hash: picked.key };
+    } else {
+      // A loaded draft's card, carried through unchanged.
+      contact = attachedContact ?? undefined;
     }
     try {
       let image: { dataUrl: string } | undefined;
@@ -185,14 +272,17 @@ export default function TanComposer({
             err instanceof Error ? err.message : "Could not read the image file.",
           );
         }
+      } else if (imageDataUrl) {
+        image = { dataUrl: imageDataUrl.dataUrl };
       }
       if (sendIn !== undefined) {
-        await composer.schedule(text.trim(), sendIn, { replyTo: replyTo ?? undefined, expiresIn, image, contact });
+        await composer.schedule(text.trim(), sendIn, { replyTo: replyTo ?? undefined, expiresIn, image, location: location ?? undefined, contact });
       } else {
         await composer.publish(text.trim(), {
           replyTo: replyTo ?? undefined,
           expiresIn,
           image,
+          location: location ?? undefined,
           contact,
         });
       }
@@ -331,6 +421,8 @@ export default function TanComposer({
           onChange={(e) => {
             const picked = e.target.files?.[0] ?? null;
             setFile(picked);
+            // A newly picked file replaces a loaded draft's image.
+            if (picked) setImageDataUrl(null);
             if (picked) setError(null);
           }}
         />
@@ -352,12 +444,15 @@ export default function TanComposer({
         <button
           type="button"
           onClick={() => {
-            // Polls cannot carry an image or a contact card: drop a
-            // picked file or peer rather than silently posting the
-            // poll without it.
+            // Polls cannot carry an image, a place or a contact card:
+            // drop a picked file, peer or place rather than silently
+            // posting the poll without it.
             if (mode === "post") setFile(null);
+            if (mode === "post") setImageDataUrl(null);
+            if (mode === "post") setLocation(null);
             if (mode === "post") {
               setContactPeer("");
+              setAttachedContact(null);
               setShowContact(false);
             }
             setMode(mode === "poll" ? "post" : "poll");
@@ -469,14 +564,25 @@ export default function TanComposer({
         </button>
       </div>
 
-      {file && (
+      {(file || imageDataUrl) && (
         <p className="mt-2 text-xs text-zinc-400">
-          Attached: <span className="text-zinc-200">{file.name}</span>{" "}
-          <span className="text-zinc-500">({Math.max(1, Math.round(file.size / 1024))} KB)</span>
+          Attached:{" "}
+          <span className="text-zinc-200">
+            {file ? file.name : imageDataUrl?.name}
+          </span>{" "}
+          <span className="text-zinc-500">
+            (
+            {Math.max(
+              1,
+              Math.round((file?.size ?? imageDataUrl?.size ?? 0) / 1024),
+            )}{" "}
+            KB)
+          </span>
           <button
             type="button"
             onClick={() => {
               setFile(null);
+              setImageDataUrl(null);
               if (fileRef.current) fileRef.current.value = "";
             }}
             className="ml-2 text-zinc-500 hover:text-zinc-200"
@@ -485,15 +591,36 @@ export default function TanComposer({
           </button>
         </p>
       )}
-      {contactPeer && (
+      {location && (
         <p className="mt-2 text-xs text-zinc-400">
-          Sharing:{" "}
+          Place:{" "}
           <span className="text-zinc-200">
-            {pickedContactPeer?.displayName ?? pickedContactPeer?.name ?? contactPeer}
+            {location.name ?? `${location.lat}, ${location.lon}`}
           </span>
           <button
             type="button"
-            onClick={() => setContactPeer("")}
+            onClick={() => setLocation(null)}
+            className="ml-2 text-zinc-500 hover:text-zinc-200"
+          >
+            Remove
+          </button>
+        </p>
+      )}
+      {(contactPeer || attachedContact) && (
+        <p className="mt-2 text-xs text-zinc-400">
+          Sharing:{" "}
+          <span className="text-zinc-200">
+            {pickedContactPeer?.displayName ??
+              pickedContactPeer?.name ??
+              attachedContact?.name ??
+              contactPeer}
+          </span>
+          <button
+            type="button"
+            onClick={() => {
+              setContactPeer("");
+              setAttachedContact(null);
+            }}
             className="ml-2 text-zinc-500 hover:text-zinc-200"
           >
             Remove
