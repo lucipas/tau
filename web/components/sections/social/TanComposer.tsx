@@ -132,6 +132,15 @@ export default function TanComposer({
       ? initialContact
       : null,
   );
+  // The card a loaded draft carried, retained independently of the
+  // live picker list: if the selected peer disappears from the list
+  // before submit, the draft's original card is carried instead of
+  // failing the picker lookup. Cleared when the user changes or
+  // removes the selection.
+  const [loadedContact, setLoadedContact] = useState<{
+    name: string;
+    destination_hash: string;
+  } | null>(initialContact ?? null);
   // A loaded draft's place: shown and carried through unchanged.
   const [location, setLocation] = useState<{
     lat: number;
@@ -157,6 +166,7 @@ export default function TanComposer({
       if (fileRef.current) fileRef.current.value = "";
       setContactPeer("");
       setAttachedContact(null);
+      setLoadedContact(null);
       setLocation(null);
       setShowContact(false);
     }
@@ -172,6 +182,7 @@ export default function TanComposer({
     setImageDataUrl(null);
     setContactPeer("");
     setAttachedContact(null);
+    setLoadedContact(null);
     setLocation(null);
     setShowContact(false);
     if (fileRef.current) fileRef.current.value = "";
@@ -185,12 +196,16 @@ export default function TanComposer({
   }
 
   // The card to carry: a newly picked peer, or a loaded draft's card,
-  // carried through unchanged when its peer is no longer listed.
+  // carried through unchanged when its peer is no longer listed — or
+  // when its peer disappears from the live list after the draft loaded.
+  // A fresh pick has no retained card, so a vanished fresh pick still
+  // fails rather than posting without the card.
   function pickedContact(): { name: string; destination_hash: string } | undefined {
     if (!contactPeer) return attachedContact ?? undefined;
     const picked = (contactPeers ?? []).find((p) => p.key === contactPeer);
-    if (!picked) throw new Error("Choose a peer to share.");
-    return { name: picked.name, destination_hash: picked.key };
+    if (picked) return { name: picked.name, destination_hash: picked.key };
+    if (loadedContact?.destination_hash === contactPeer) return loadedContact;
+    throw new Error("Choose a peer to share.");
   }
 
   async function handleSaveDraft() {
@@ -250,14 +265,17 @@ export default function TanComposer({
     // Replies and polls cannot carry a card: the picker is hidden for
     // those, so a pick here is always a top-level post — but a picked
     // peer that vanished from the list (or a stale state) must still
-    // fail here rather than post without the card.
+    // fail here rather than post without the card, unless it is the
+    // loaded draft's card, which pickedContact() retains.
     let contact: { name: string; destination_hash: string } | undefined;
     if (contactPeer) {
       const contactProblem = validateContact(contactPeer);
       if (contactProblem) return setError(contactProblem);
-      const picked = (contactPeers ?? []).find((p) => p.key === contactPeer);
-      if (!picked) return setError("Choose a peer to share.");
-      contact = { name: picked.name, destination_hash: picked.key };
+      try {
+        contact = pickedContact();
+      } catch {
+        return setError("Choose a peer to share.");
+      }
     } else {
       // A loaded draft's card, carried through unchanged.
       contact = attachedContact ?? undefined;
@@ -390,7 +408,15 @@ export default function TanComposer({
           <select
             id="tan-contact-peer"
             value={contactPeer}
-            onChange={(e) => setContactPeer(e.target.value)}
+            onChange={(e) => {
+              const next = e.target.value;
+              setContactPeer(next);
+              // Picking a different peer drops the loaded draft's card:
+              // only the draft's own card survives its peer disappearing.
+              if (loadedContact && next !== loadedContact.destination_hash) {
+                setLoadedContact(null);
+              }
+            }}
             aria-label="Peer to share"
             disabled={composer.busy}
             className="rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 outline-none focus:border-cyan-500"
@@ -401,6 +427,17 @@ export default function TanComposer({
                 {p.displayName ?? p.name}
               </option>
             ))}
+            {loadedContact &&
+              !(contactPeers ?? []).some(
+                (p) => p.key === loadedContact.destination_hash,
+              ) && (
+                <option
+                  key={loadedContact.destination_hash}
+                  value={loadedContact.destination_hash}
+                >
+                  {loadedContact.name}
+                </option>
+              )}
           </select>
           <p className="text-xs text-zinc-500">
             Shares their name and destination hash on the post. Readers add
@@ -453,6 +490,7 @@ export default function TanComposer({
             if (mode === "post") {
               setContactPeer("");
               setAttachedContact(null);
+              setLoadedContact(null);
               setShowContact(false);
             }
             setMode(mode === "poll" ? "post" : "poll");
@@ -475,7 +513,10 @@ export default function TanComposer({
               // a card the post cannot carry — keep it closed there.
               if (mode === "poll" || replyTo) return;
               setShowContact((prev) => {
-                if (prev) setContactPeer("");
+                if (prev) {
+                  setContactPeer("");
+                  setLoadedContact(null);
+                }
                 return !prev;
               });
             }}
@@ -612,6 +653,7 @@ export default function TanComposer({
           <span className="text-zinc-200">
             {pickedContactPeer?.displayName ??
               pickedContactPeer?.name ??
+              loadedContact?.name ??
               attachedContact?.name ??
               contactPeer}
           </span>
@@ -620,6 +662,7 @@ export default function TanComposer({
             onClick={() => {
               setContactPeer("");
               setAttachedContact(null);
+              setLoadedContact(null);
             }}
             className="ml-2 text-zinc-500 hover:text-zinc-200"
           >
