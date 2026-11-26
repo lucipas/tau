@@ -3,12 +3,28 @@
 // runs inside a TauContext.Provider with a fake node.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { TauContext } from "@/components/chrome/TauContext";
 import type { ScheduledTanPost, TanDraft, TanPost } from "@/lib/types";
 import SocialSection from "./SocialSection";
 import { validateTanText } from "./social/TanComposer";
 import { fakePeer, fakeTau, mockFetch } from "./test-utils";
+
+/** Controllable stand-in for the image fetch in draft loads: the
+ *  section's fetch router has no blob responses, so the real
+ *  `fetchTanImageDataUrl` (fetch + FileReader) cannot resolve there. */
+const { fetchTanImageDataUrlMock } = vi.hoisted(() => ({
+  fetchTanImageDataUrlMock: vi.fn(),
+}));
+
+vi.mock("@/lib/api", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/api")>();
+  return {
+    ...actual,
+    fetchTanImageDataUrl: (...args: [string]) =>
+      fetchTanImageDataUrlMock(...args),
+  };
+});
 
 function makePost(hash: string, text: string, extra: Partial<TanPost> = {}): TanPost {
   return {
@@ -86,6 +102,8 @@ function makeScheduled(
 }
 
 beforeEach(() => {
+  fetchTanImageDataUrlMock.mockReset();
+  fetchTanImageDataUrlMock.mockResolvedValue(null);
   timeline = [makePost("h1".padEnd(64, "0"), "hello #mesh @bob")];
   scheduled = [];
   drafts = [
@@ -95,6 +113,9 @@ beforeEach(() => {
       image: { sha256: "ab".repeat(32), size: 108, mime: "image/png", name: "pic.png" },
       location: { lat: 34.05, lon: -83.88, name: "Rock Springs Park" },
       contact: { name: "carol", destination_hash: "cc".repeat(16) },
+    }),
+    makeDraft(4, "second image draft", {
+      image: { sha256: "cd".repeat(32), size: 204, mime: "image/png", name: "second.png" },
     }),
   ];
   lists = [];
@@ -648,6 +669,42 @@ describe("SocialSection", () => {
     fireEvent.click(screen.getByRole("button", { name: "Post" }));
     await waitFor(() => expect(calls).toContain("POST /api/tan/posts"));
     await waitFor(() => expect(calls).toContain("POST /api/tan/drafts/delete"));
+  });
+
+  it("a slower earlier draft load does not overwrite a newer selection", async () => {
+    let resolveFirst: (value: string | null) => void = () => undefined;
+    const firstFetch = new Promise<string | null>((resolve) => {
+      resolveFirst = resolve;
+    });
+    fetchTanImageDataUrlMock.mockImplementation((sha256: string) =>
+      sha256 === "ab".repeat(32)
+        ? firstFetch
+        : Promise.resolve("data:image/png;base64,second"),
+    );
+    renderSocial();
+    await screen.findByText(/hello/);
+    fireEvent.click(screen.getByRole("button", { name: "Drafts" }));
+    await screen.findByText("with everything");
+    const rows = screen.getAllByRole("button", { name: "Edit" });
+    // Start loading the first image draft, then pick the second while
+    // its image fetch is still pending.
+    fireEvent.click(rows[2]);
+    fireEvent.click(rows[3]);
+    await waitFor(() =>
+      expect(
+        (screen.getByLabelText("Compose a post") as HTMLTextAreaElement).value,
+      ).toBe("second image draft"),
+    );
+    expect(screen.getByText("second.png")).toBeTruthy();
+    // The first load's fetch finishes last: it must not commit.
+    await act(async () => {
+      resolveFirst("data:image/png;base64,first");
+    });
+    expect(
+      (screen.getByLabelText("Compose a post") as HTMLTextAreaElement).value,
+    ).toBe("second image draft");
+    expect(screen.getByText("second.png")).toBeTruthy();
+    expect(screen.queryByText("pic.png")).toBeNull();
   });
 
   it("deleting a draft discards it without posting", async () => {
