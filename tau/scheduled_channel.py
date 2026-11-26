@@ -592,6 +592,19 @@ def scheduled_channel_messages_lock(path: Union[str, Path]) -> Iterator[None]:
                 msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
 
 
+def _wire_created_at(publish_at: float) -> float:
+    """The largest ``created_at`` the publish pass can stamp.
+
+    The publish pass stamps ``created_at`` with the send time,
+    rounded to milliseconds, so its fractional digits can be longer
+    than a whole publish time.  Measuring with a full three-digit
+    fraction keeps the schedule and edit preflights from
+    undercounting the bytes the timestamp takes on the wire.  Both
+    paths share this helper so they cannot drift.
+    """
+    return math.floor(publish_at) + 0.999
+
+
 def _preflight_envelope(
     *,
     channel: str,
@@ -759,10 +772,13 @@ def schedule_channel_message(
     clean_expires_in = _clean_expires_in(expires_in)
     clean_publish_at = _clean_timestamp(publish_at, "publish_at")
     # The publish pass stamps created_at with the send time, rounded to
-    # milliseconds, so its fractional digits can be longer than a whole
-    # publish_at.  Measure with a full three-digit fraction so the
-    # preflight never undercounts the bytes the timestamps take on the wire.
-    wire_at = math.floor(clean_publish_at) + 0.999
+    # milliseconds — see _wire_created_at — and signs expires_at as
+    # that send time plus the raw expiry, unrounded: ChannelApp.send
+    # retains the unrounded expiry from a fractional expires_in or the
+    # channel's disappearing default.  Measure the expiry unrounded
+    # too, so the preflight never undercounts the bytes the
+    # timestamps take on the wire.
+    wire_at = _wire_created_at(clean_publish_at)
     envelope = {
         # Placeholder author/key at their real lengths (destination
         # hash 32 hex, RNS public key 128 hex): a shorter placeholder
@@ -785,9 +801,9 @@ def schedule_channel_message(
     }
     default_expire = channel_default_for(disappearing_path, clean_channel)
     if clean_expires_in is not None:
-        envelope["expires_at"] = round(wire_at + clean_expires_in, 3)
+        envelope["expires_at"] = wire_at + clean_expires_in
     elif default_expire is not None:
-        envelope["expires_at"] = round(wire_at + default_expire, 3)
+        envelope["expires_at"] = wire_at + default_expire
     if clean_kind == "poll":
         envelope["poll_options"] = list(clean_options)
     if clean_location_value is not None:
@@ -937,15 +953,20 @@ def edit_scheduled_channel_message(
         # against the full normalized shape too.  The entry's pin rides
         # in the measurement: a time-only edit must not bless a message
         # that only fits without it.  The entry's card rides in the
-        # measurement too, for the same reason.
+        # measurement too, for the same reason.  The measured
+        # created_at is the wire-time stamp (see _wire_created_at),
+        # not the raw publish time — the publish pass rounds the send
+        # time to milliseconds, so a whole-second publish time would
+        # undercount the timestamp bytes by two.
+        effective_publish_at = (
+            clean_publish_at
+            if clean_publish_at is not None
+            else message.publish_at
+        )
         _preflight_envelope(
             channel=message.channel,
             text=clean_text if clean_text is not None else message.text,
-            created_at=(
-                clean_publish_at
-                if clean_publish_at is not None
-                else message.publish_at
-            ),
+            created_at=_wire_created_at(effective_publish_at),
             name=name,
             location=message.location,
             contact=message.contact,
@@ -1077,9 +1098,6 @@ def publish_due_scheduled_channel_messages(
                         continue
                 failed_peers: Optional[Tuple[str, ...]] = None
                 try:
-                    targets = _resolve_publish_targets(
-                        message, resolve_peer, should_stop, deadline
-                    )
                     # The send-time clock, not the pass start: target
                     # resolution and earlier messages can use up a short
                     # lifetime before signing.  Rounded like ChannelApp.send
@@ -1100,7 +1118,18 @@ def publish_due_scheduled_channel_messages(
                         # The stored copy expired while earlier attempts
                         # backed off; recipients would discard it, so
                         # sign a fresh one instead of resending it.
+                        # Decide this before resolving targets: the
+                        # replacement is a new message for the full
+                        # intended set, not a retry for only the peers
+                        # that missed the old copy — those that got it
+                        # hold an expired one and need the replacement
+                        # too.  Clearing pending_peers makes the
+                        # resolver fall back to the entry's full list.
                         stored = None
+                        message = replace(message, pending_peers=())
+                    targets = _resolve_publish_targets(
+                        message, resolve_peer, should_stop, deadline
+                    )
                     if stored is None:
                         if message.message_hash is not None:
                             # The signed message was created on an

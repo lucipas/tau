@@ -636,6 +636,67 @@ def test_schedule_expires_in_wire_preflight(tmp_path):
     assert load_scheduled_channel_messages(path).messages[0].id == entry.id
 
 
+def test_schedule_fractional_expires_in_wire_preflight(tmp_path):
+    # A fractional expires_in serializes more digits than the
+    # three-decimal rounding the old preflight measured, so the
+    # boundary sits below the whole-second one: 1,917 emoji fit with
+    # expires_in=3600 but overflow once the expiry carries thirteen
+    # fractional digits.  Refuse at schedule time, instead of failing
+    # every publish attempt forever.  Nothing is saved.
+    path = tmp_path / "scheduled-channel-messages.json"
+    with pytest.raises(ScheduledChannelError, match="too large"):
+        schedule_channel_message(
+            path,
+            channel="general",
+            text="😀" * 1917,
+            publish_at=1000.0,
+            now=900.0,
+            expires_in=3600.123456789,
+        )
+    assert load_scheduled_channel_messages(path).messages == ()
+    # And 1,915 emoji with the same expiry still fit.
+    entry = schedule_channel_message(
+        path,
+        channel="general",
+        text="😀" * 1915,
+        publish_at=1000.0,
+        now=900.0,
+        expires_in=3600.123456789,
+    )
+    assert load_scheduled_channel_messages(path).messages[0].id == entry.id
+
+    # Same for the channel disappearing default: a fractional default
+    # serializes just as long as a fractional explicit expiry.
+    defaults_path = tmp_path / "disappearing.json"
+    save_disappearing_defaults(
+        defaults_path,
+        DisappearingDefaults(channels={"general": 3600.123456789}),
+    )
+    path_with_default = tmp_path / "scheduled-with-default.json"
+    with pytest.raises(ScheduledChannelError, match="too large"):
+        schedule_channel_message(
+            path_with_default,
+            channel="general",
+            text="😀" * 1917,
+            publish_at=1000.0,
+            now=900.0,
+            disappearing_path=defaults_path,
+        )
+    assert load_scheduled_channel_messages(path_with_default).messages == ()
+    entry = schedule_channel_message(
+        path_with_default,
+        channel="general",
+        text="😀" * 1915,
+        publish_at=1000.0,
+        now=900.0,
+        disappearing_path=defaults_path,
+    )
+    assert (
+        load_scheduled_channel_messages(path_with_default).messages[0].id
+        == entry.id
+    )
+
+
 def test_queue_with_huge_expires_in_is_corrupt(tmp_path):
     # A hand-edited queue file carrying an expiry beyond float range
     # loads as a corrupt queue, so the publisher takes its
@@ -726,6 +787,26 @@ def test_edit_scheduled_channel_message_time_only(tmp_path):
     )
     assert edited.text == "later"
     assert edited.publish_at == 3000.0
+
+
+def test_edit_uses_wire_created_at_in_preflight(tmp_path):
+    # An edit measures the publish timestamp the way the publish pass
+    # stamps it — with a full three-digit fraction — not the raw
+    # publish time.  1,916 emoji fit the edit preflight measured with
+    # a whole-second created_at but overflow it measured with the
+    # wire stamp, so the edit is refused instead of queueing a
+    # message that could never be published.  Nothing is changed.
+    path = tmp_path / "scheduled-channel-messages.json"
+    entry = schedule_channel_message(
+        path, channel="general", text="hi", publish_at=1000.0, now=900.0
+    )
+    with pytest.raises(ScheduledChannelError, match="too large"):
+        edit_scheduled_channel_message(path, entry.id, text="😀" * 1916)
+    assert load_scheduled_channel_messages(path).messages[0].text == "hi"
+    # And 1,915 emoji still fit.
+    edited = edit_scheduled_channel_message(path, entry.id, text="😀" * 1915)
+    assert len(load_scheduled_channel_messages(path).messages[0].text) == 1915
+    assert edited.id == entry.id
 
 
 def test_edit_scheduled_channel_message_text_and_time_reorders(tmp_path):
@@ -1090,6 +1171,52 @@ def test_publish_due_applies_expires_in_to_a_poll(tmp_path):
     assert all(entry.id != poll.id for entry in queue.messages)
 
 
+def test_publish_due_replacement_reaches_all_peers_after_expiry(tmp_path):
+    # Partial delivery, then the stored copy expires before the retry:
+    # the replacement is a new message for the full intended set, not
+    # a retry for only the peers that missed the old copy — the peer
+    # that got the first copy holds an expired one and needs the
+    # replacement too.
+    path = tmp_path / "scheduled-channel-messages.json"
+    entry = schedule_channel_message(
+        path,
+        channel="general",
+        text="meet soon",
+        publish_at=1000.0,
+        to=["alice", "bob"],
+        now=900.0,
+        expires_in=60.0,
+    )
+    app = _FakeChannelApp(fail_with_errors=True)
+    resolved = {
+        "alice": SimpleNamespace(hexhash="alice-hash"),
+        "bob": SimpleNamespace(hexhash="bob-hash"),
+        "deadbeef": SimpleNamespace(hexhash="deadbeef-hash"),
+    }
+    # First pass: the publish reports a failure, so the entry stays
+    # queued with that peer still owed.
+    result = publish_due_scheduled_channel_messages(
+        path, app, resolve_peer=lambda target: resolved[target], now=2000.0
+    )
+    assert result == {"published": 0, "kept": 1}
+    assert len(app.created) == 1
+    # The stored copy expires 60s after the first send; retry after it.
+    app.fail_with_errors = False
+    result = publish_due_scheduled_channel_messages(
+        path, app, resolve_peer=lambda target: resolved[target], now=3000.0
+    )
+    assert result == {"published": 1, "kept": 0}
+    assert len(app.created) == 2
+    # The replacement went to the full intended set, not only to the
+    # peer that missed the old copy.
+    assert [peer.hexhash for peer in app.published[0][1]] == [
+        "alice-hash",
+        "bob-hash",
+    ]
+    queue = load_scheduled_channel_messages(path)
+    assert all(message.id != entry.id for message in queue.messages)
+
+
 def test_publish_due_explicit_expires_in_wins_over_channel_default(tmp_path):
     # With a channel disappearing default in force, an entry carrying its
     # own expires_in keeps that expiry, while one without it takes the
@@ -1306,8 +1433,11 @@ def test_publish_due_vet_refuses_stored_message_on_retry(tmp_path):
 def test_edit_scheduled_message_keeps_location(tmp_path):
     # Editing a pinned entry's text keeps its pin, and the edit
     # preflight measures the pin: 1,910 emoji fit without one but
-    # overflow with it, so that edit is refused while a 1,900-emoji
+    # overflow with it, so that edit is refused while a 1,899-emoji
     # edit (which fits with the pin) goes through with the pin intact.
+    # (The boundary sits one emoji below the old whole-second
+    # measurement: the edit preflight stamps the publish time with a
+    # full three-digit fraction, like the schedule path.)
     path = tmp_path / "scheduled-channel-messages.json"
     entry = schedule_channel_message(
         path,
@@ -1320,7 +1450,7 @@ def test_edit_scheduled_message_keeps_location(tmp_path):
     with pytest.raises(ScheduledChannelError, match="too large"):
         edit_scheduled_channel_message(path, entry.id, text="😀" * 1910, now=1500.0)
     edited = edit_scheduled_channel_message(
-        path, entry.id, text="😀" * 1900, now=1500.0
+        path, entry.id, text="😀" * 1899, now=1500.0
     )
     assert edited.location == PIN
     assert load_scheduled_channel_messages(path).messages[0].location == PIN
