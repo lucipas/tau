@@ -228,9 +228,16 @@ curl -s -X POST http://127.0.0.1:8787/api/messages \
 
 The bridge binds to loopback by default. It can send messages as this node, so
 only pass `--http-allow-remote` together with a non-loopback `--http` address
-when you really mean to expose it. Use `--web-dir` or `TAU_WEB_DIR` to serve a
-different build, and `make web-dev` for the Next.js dev server on port 3000
-(the console automatically talks to the bridge on port 8787).
+when you really mean to expose it. Owner-only data (private peer notes,
+draft images, imports, exports, backups, pairing bundles) is gated on the
+client being loopback — and a reverse proxy forwarding to the bridge over
+loopback makes every visitor look loopback. If you put a proxy in front,
+name it with `--http-trusted-proxy <proxy-ip>` (repeatable): the gate then
+reads the real client from the proxy's `X-Forwarded-For` header instead of
+the proxy's address, and a proxy that sends no forwarding header fails
+closed. Use `--web-dir` or `TAU_WEB_DIR` to serve a different build, and
+`make web-dev` for the Next.js dev server on port 3000 (the console
+automatically talks to the bridge on port 8787).
 
 ## Social feed: Tan
 

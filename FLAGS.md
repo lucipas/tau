@@ -158,6 +158,10 @@ tau serve --http
 # Serve on a specific address (remote bind needs an explicit opt-in)
 tau serve --http 0.0.0.0:8787 --http-allow-remote
 
+# Serve behind a reverse proxy on loopback: trust its X-Forwarded-For
+# so proxied visitors stop looking like the local console
+tau serve --http --http-trusted-proxy 127.0.0.1
+
 # Enable the social feed and refresh it every minute
 tau serve --social --social-sync-interval 60
 

@@ -618,6 +618,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="allow binding the console to a non-loopback address",
     )
     serve.add_argument(
+        "--http-trusted-proxy",
+        action="append",
+        default=None,
+        metavar="IP",
+        help=(
+            "trust X-Forwarded-For from this reverse proxy address "
+            "(repeatable; the loopback gate then reads the real client "
+            "from the forwarded header instead of the proxy, so a "
+            "visitor through the proxy no longer looks like the local "
+            "console)"
+        ),
+    )
+    serve.add_argument(
         "--social",
         action="store_true",
         help="enable the Tan social feed request handlers",
@@ -12829,6 +12842,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 port=port,
                 web_dir=web_dir,
                 allow_remote=bool(getattr(args, "http_allow_remote", False)),
+                trusted_proxies=getattr(args, "http_trusted_proxy", None),
             )
         except WebBridgeError as exc:
             raise NodeError(str(exc)) from exc

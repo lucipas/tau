@@ -1587,12 +1587,25 @@ def test_parser_serve_http_options():
     assert default.http == "127.0.0.1:8787"
     assert default.web_dir is None
     assert default.http_allow_remote is False
+    assert default.http_trusted_proxy is None
 
     explicit = parser.parse_args(
         ["serve", "--http", "0.0.0.0:9000", "--http-allow-remote"]
     )
     assert explicit.http == "0.0.0.0:9000"
     assert explicit.http_allow_remote is True
+
+    trusted = parser.parse_args(
+        [
+            "serve",
+            "--http",
+            "--http-trusted-proxy",
+            "127.0.0.1",
+            "--http-trusted-proxy",
+            "203.0.113.7",
+        ]
+    )
+    assert trusted.http_trusted_proxy == ["127.0.0.1", "203.0.113.7"]
 
 
 def test_parser_requires_a_command():
