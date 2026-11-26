@@ -218,7 +218,7 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/tan/reposts  who reposted a Tan post (?target=<post hash>)
     GET  /api/tan/quotes   standing quotes of a Tan post (?target=<post hash>)
     POST /api/tan/posts    publish a Tan post (optional "image" base64 data URL or {sha256, name} descriptor — a descriptor only from a local client, optional "location" pin, optional "contact" card)
-    POST /api/tan/schedule schedule a Tan post, repost or quote — or a poll, with ``"poll_options"`` — for later (optional "image" base64 data URL or {sha256, name} descriptor — a descriptor only from a local client, optional "location" pin, optional "contact" card)
+    POST /api/tan/schedule schedule a Tan post, repost or quote — or a poll, with ``"poll_options"`` — for later (optional "image" base64 data URL or {sha256, name} descriptor — a descriptor only from a local client, optional "location" pin, optional "contact" card; a poll may carry a "close_after" deadline in seconds)
     GET  /api/tan/scheduled queued Tan posts, reposts, quotes and polls, soonest first
     POST /api/tan/cancel-scheduled cancel a queued Tan post
     POST /api/tan/edit-scheduled edit a queued Tan post's text/time
@@ -230,7 +230,7 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/tan/unlike   remove your like from a post
     POST /api/tan/vote     vote on a Tan poll (signed vote entry on your chain)
     POST /api/tan/unvote   withdraw your vote on a Tan poll (signed unvote entry on your chain)
-    POST /api/tan/poll     ask a Tan poll question (signed poll entry on your chain)
+    POST /api/tan/poll     ask a Tan poll question (signed poll entry on your chain; optional "close_after" seconds until it closes itself)
     POST /api/tan/repost   repost a post (signed repost entry on your chain)
     POST /api/tan/share    share a post with a peer, a group, a broadcast list, or a channel (sends it as a message)
     POST /api/tan/delete   delete one of your own posts
@@ -4088,6 +4088,7 @@ class WebBridge:
     def tan_schedule_post(
         self, text: str, *, reply_to: Optional[str] = None, send_in: float,
         expires_in: float = 0.0,
+        close_after: float = 0.0,
         kind: Optional[str] = None,
         target_post: Optional[str] = None,
         poll_options: Optional[List[str]] = None,
@@ -4131,7 +4132,12 @@ class WebBridge:
         With *poll_options* the entry is a poll instead: the text is
         its question, the options ride alongside it, and a reply
         target is refused — polls are top-level entries.  A poll
-        cannot carry an image or a location or a contact card.
+        cannot carry an image or a location or a contact card.  A
+        poll may carry a *close_after* deadline instead: the publish
+        pass registers the close when the poll is signed, so the
+        deadline counts from publication (see
+        :func:`tau.poll_closes.schedule_poll_close`); any other kind
+        with a close deadline is refused here.
         """
         from .scheduled_posts import (
             schedule_poll,
@@ -4170,6 +4176,10 @@ class WebBridge:
                 raise ValueError(
                     f"a scheduled {kind} cannot carry poll options"
                 )
+        if close_after and poll_options is None:
+            raise ValueError(
+                "only a scheduled poll can carry a close deadline"
+            )
         # Validate the pin's contents before decoding or pinning the
         # image: a malformed pin fails later in schedule_post, after
         # the image bytes are already pinned with nothing referencing
@@ -4246,6 +4256,7 @@ class WebBridge:
                 # (node.name, refreshed at startup), not the configured name.
                 name=getattr(self.node, "name", None),
                 expires_in=float(expires_in),
+                close_after=float(close_after),
             )
             return post.to_dict()
         post = schedule_post(
@@ -4496,16 +4507,45 @@ class WebBridge:
         options: List[str],
         *,
         expires_in: Optional[float] = None,
+        close_after: Optional[float] = None,
     ) -> Dict[str, Any]:
         app = self._tan_app()
         if app is None:
             raise WebBridgeError("the Tan social feed is not enabled; run serve --social")
+        if (
+            close_after is not None
+            and expires_in is not None
+            and close_after >= expires_in
+        ):
+            raise ValueError(
+                "field 'close_after' must be shorter than 'expires_in' — "
+                "the poll would expire before it is closed"
+            )
         expires_at = None
         if expires_in is not None:
             expires_at = time.time() + float(expires_in)
-        return app.create_poll(
+        record = app.create_poll(
             question, options, publish=True, expires_at=expires_at
         )
+        if close_after is not None:
+            # The poll exists now — its hash is the schedule's key — so
+            # the close registers after creation.  A schedule that
+            # cannot be recorded warns instead of failing the call:
+            # the poll is already created, and dropping it would lose
+            # the question, not just the deadline.
+            from .poll_closes import PollClosesError, schedule_poll_close
+
+            try:
+                close_at = schedule_poll_close(
+                    self.node.config.poll_closes_path,
+                    record["hash"],
+                    time.time() + float(close_after),
+                )
+            except PollClosesError as exc:
+                log.warning("Could not schedule the poll close: %s", exc)
+            else:
+                record = {**record, "close_at": close_at}
+        return record
 
     def tan_repost(self, target: str) -> Dict[str, Any]:
         app = self._tan_app()
@@ -17220,6 +17260,28 @@ class _WebHandler(BaseHTTPRequestHandler):
                             400,
                         )
                         return
+                close_after = body.get("close_after")
+                if close_after is not None:
+                    # A close deadline shares the 7d cap (see
+                    # schedule_poll) and only applies to a poll: the
+                    # bridge refuses it for any other kind, and the
+                    # store refuses a deadline at or past the expiry.
+                    if (
+                        not isinstance(close_after, (int, float))
+                        or isinstance(close_after, bool)
+                        or not _valid_schedule_in(close_after)
+                    ):
+                        self._send_json(
+                            {
+                                "error": {
+                                    "message": "field 'close_after' must be a number "
+                                    "of seconds (0 < close_after <= 604800)"
+                                }
+                            },
+                            head_only,
+                            400,
+                        )
+                        return
                 poll_options = body.get("poll_options")
                 if poll_options is not None:
                     # A poll is a top-level entry: it cannot be a reply,
@@ -17313,6 +17375,9 @@ class _WebHandler(BaseHTTPRequestHandler):
                         send_in=float(send_in),
                         expires_in=(
                             float(expires_in) if expires_in is not None else 0.0
+                        ),
+                        close_after=(
+                            float(close_after) if close_after is not None else 0.0
                         ),
                         kind=kind,
                         target_post=target_post,
@@ -17862,12 +17927,33 @@ class _WebHandler(BaseHTTPRequestHandler):
                             400,
                         )
                         return
+                close_after = body.get("close_after")
+                if close_after is not None:
+                    if (
+                        not isinstance(close_after, (int, float))
+                        or isinstance(close_after, bool)
+                        or not _valid_schedule_in(close_after)
+                    ):
+                        self._send_json(
+                            {
+                                "error": {
+                                    "message": "field 'close_after' must be a number "
+                                    "of seconds (0 < close_after <= 604800)"
+                                }
+                            },
+                            head_only,
+                            400,
+                        )
+                        return
                 try:
                     poll = self.bridge.tan_poll(
                         question,
                         options,
                         expires_in=(
                             float(expires_in) if expires_in is not None else None
+                        ),
+                        close_after=(
+                            float(close_after) if close_after is not None else None
                         ),
                     )
                 except WebBridgeError as exc:

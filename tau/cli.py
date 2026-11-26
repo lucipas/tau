@@ -262,6 +262,11 @@ from .profile import (
     resolve_avatar,
     save_local_profile,
 )
+from .poll_closes import (
+    MAX_POLL_CLOSE_AFTER,
+    PollClosesError,
+    schedule_poll_close,
+)
 from .scheduled_posts import (
     MAX_SCHEDULED_POST_DELAY,
     ScheduledPostsError,
@@ -4328,6 +4333,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="schedule the poll: queue it now and ask it after "
         "this long (e.g. 30s, 5m, 2h, 7d; at most 7d) — needs a node "
         "serving with --social to publish it",
+    )
+    tan_poll.add_argument(
+        "--close-after",
+        default=None,
+        metavar="DURATION",
+        help="close the poll itself after this long (e.g. 30s, 5m, 2h, "
+        "3d; at most 7d) — a node serving with --social appends the "
+        "signed close entry when the deadline arrives; counts from "
+        "when the poll goes out, so it works with --delay too",
     )
     tan_poll.add_argument("--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS")
     tan_poll.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
@@ -8605,6 +8619,26 @@ def cmd_tan_poll(args: argparse.Namespace) -> int:
             return 2
     expires_at = time.time() + expire_seconds if expire_text is not None else None
 
+    close_after_seconds = 0.0
+    close_after_text = getattr(args, "close_after", None)
+    if close_after_text is not None:
+        try:
+            close_after_seconds = _parse_duration(
+                close_after_text,
+                flag="--close-after",
+                max_seconds=MAX_POLL_CLOSE_AFTER,
+            )
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        if expire_text is not None and close_after_seconds >= expire_seconds:
+            print(
+                "error: --close-after must be shorter than --expire — the "
+                "poll would expire before it is closed",
+                file=sys.stderr,
+            )
+            return 2
+
     delay_text = getattr(args, "delay", None)
     if delay_text is not None:
         if getattr(args, "no_publish", False):
@@ -8640,6 +8674,7 @@ def cmd_tan_poll(args: argparse.Namespace) -> int:
                 ttl=int(getattr(args, "ttl", MAX_GOSSIP_TTL)),
                 name=config.name,
                 expires_in=expire_seconds,
+                close_after=close_after_seconds,
             )
         except ScheduledPostsError as exc:
             raise NodeError(str(exc)) from exc
@@ -8647,6 +8682,8 @@ def cmd_tan_poll(args: argparse.Namespace) -> int:
             _emit({"scheduled": scheduled.to_dict()}, True)
         else:
             print(f"scheduled {scheduled.id} — asks in {_ago(delay)}")
+            if close_after_text is not None:
+                print(f"  closes {_ago(close_after_seconds)} after it goes out")
             print("  list it with `tau tan scheduled`; a node serving")
             print("  with --social publishes it when the time comes.")
         return _EXIT_OK
@@ -8696,14 +8733,35 @@ def cmd_tan_poll(args: argparse.Namespace) -> int:
             finally:
                 node.stop()
 
+    # The poll exists now — its hash is the schedule's key — so the
+    # close registers after creation on every path above.  A schedule
+    # that cannot be recorded (a corrupt close file) warns instead of
+    # failing the command: the poll is already created, and dropping
+    # it would lose the question, not just the deadline.
+    close_at = None
+    if close_after_text is not None:
+        try:
+            close_at = schedule_poll_close(
+                config.poll_closes_path,
+                record["hash"],
+                time.time() + close_after_seconds,
+            )
+        except PollClosesError as exc:
+            print(f"warning: could not schedule the poll close: {exc}", file=sys.stderr)
+
     if json_output:
-        _emit({"poll": record, "published": published}, True)
+        payload: Dict[str, Any] = {"poll": record, "published": published}
+        if close_at is not None:
+            payload["close_at"] = close_at
+        _emit(payload, True)
     else:
         print(f"polled {short_hash(record['hash'])}")
         for index, option in enumerate(record.get("options") or [], start=1):
             print(f"  {index}. {option}")
         if expires_at is not None:
             print(f"  expires in {_ago(expire_seconds)}")
+        if close_at is not None:
+            print(f"  closes in {_ago(close_after_seconds)}")
         if published is None:
             print("  stored locally (not published)")
         else:

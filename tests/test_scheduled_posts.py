@@ -2233,3 +2233,202 @@ def test_publish_due_without_expiry_passes_none(tmp_path):
     result = publish_due_scheduled_posts(path, app, now=2000.0)
     assert result == {"published": 1, "kept": 0}
     assert app.created[0]["expires_at"] is None
+
+
+def test_schedule_poll_close_after_round_trip(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    poll = schedule_poll(
+        path,
+        question="pizza or tacos?",
+        options=["Pizza", "Tacos"],
+        publish_at=2000.0,
+        now=1000.0,
+        expires_in=7200.0,
+        close_after=3600.0,
+    )
+    assert poll.close_after == 3600.0
+    assert poll.expires_in == 7200.0
+    queue = load_scheduled_posts(path)
+    assert len(queue) == 1
+    assert queue.posts[0] == poll
+    assert queue.posts[0].to_dict()["close_after"] == 3600.0
+    # Queue files written before close deadlines existed load as
+    # never closing, exactly like the other optional fields.
+    old = queue.posts[0].to_dict()
+    del old["close_after"]
+    assert ScheduledPost.from_dict(old).close_after == 0.0
+
+
+def test_schedule_poll_close_after_refusals(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    with pytest.raises(
+        ScheduledPostsError, match="close-after must be at most 7d"
+    ):
+        schedule_poll(
+            path,
+            question="pizza or tacos?",
+            options=["Pizza", "Tacos"],
+            publish_at=2000.0,
+            now=1000.0,
+            close_after=8 * 24 * 60 * 60,
+        )
+    with pytest.raises(
+        ScheduledPostsError, match="must close before it expires"
+    ):
+        schedule_poll(
+            path,
+            question="pizza or tacos?",
+            options=["Pizza", "Tacos"],
+            publish_at=2000.0,
+            now=1000.0,
+            expires_in=3600.0,
+            close_after=3600.0,
+        )
+    with pytest.raises(
+        ScheduledPostsError, match="only a poll can"
+    ):
+        schedule_post(
+            path,
+            text="a plain post",
+            publish_at=2000.0,
+            now=1000.0,
+            close_after=3600.0,
+        )
+    with pytest.raises(
+        ScheduledPostsError, match="only a poll can"
+    ):
+        schedule_post(
+            path,
+            text="",
+            publish_at=2000.0,
+            now=1000.0,
+            kind="repost",
+            target_post="d" * 64,
+            close_after=3600.0,
+        )
+    assert len(load_scheduled_posts(path)) == 0
+
+
+def test_publish_due_registers_poll_close(tmp_path):
+    from tau.poll_closes import load_poll_closes
+
+    path = tmp_path / "scheduled-posts.json"
+    closes_path = tmp_path / "poll-closes.json"
+    schedule_poll(
+        path,
+        question="pizza or tacos?",
+        options=["Pizza", "Tacos"],
+        publish_at=1000.0,
+        now=900.0,
+        close_after=3600.0,
+    )
+    app = _FakeTanApp()
+
+    result = publish_due_scheduled_posts(
+        path, app, now=2000.0, poll_close_path=closes_path
+    )
+    assert result == {"published": 1, "kept": 0}
+    # The fake app's poll carries no creation time, so the deadline
+    # falls back to this pass: 2000 + 3600.
+    assert load_poll_closes(closes_path) == {"d" * 64: 5600.0}
+    assert len(load_scheduled_posts(path)) == 0
+
+
+def test_publish_due_without_close_after_registers_nothing(tmp_path):
+    from tau.poll_closes import load_poll_closes
+
+    path = tmp_path / "scheduled-posts.json"
+    closes_path = tmp_path / "poll-closes.json"
+    schedule_poll(
+        path,
+        question="pizza or tacos?",
+        options=["Pizza", "Tacos"],
+        publish_at=1000.0,
+        now=900.0,
+    )
+    app = _FakeTanApp()
+
+    result = publish_due_scheduled_posts(
+        path, app, now=2000.0, poll_close_path=closes_path
+    )
+    assert result == {"published": 1, "kept": 0}
+    assert load_poll_closes(closes_path) == {}
+
+
+def test_publish_due_keeps_poll_queued_when_close_registration_fails(
+    tmp_path,
+):
+    # A close schedule that cannot be recorded keeps the poll queued
+    # like any other failed publish: the poll never goes out without
+    # the close it was promised.
+    from tau.poll_closes import load_poll_closes
+
+    path = tmp_path / "scheduled-posts.json"
+    closes_path = tmp_path / "poll-closes.json"
+    closes_path.write_text("{not json", encoding="utf-8")
+    schedule_poll(
+        path,
+        question="pizza or tacos?",
+        options=["Pizza", "Tacos"],
+        publish_at=1000.0,
+        now=900.0,
+        close_after=3600.0,
+    )
+    app = _FakeTanApp()
+
+    result = publish_due_scheduled_posts(
+        path, app, now=2000.0, poll_close_path=closes_path
+    )
+    assert result == {"published": 0, "kept": 1}
+    assert app.published == []
+    queue = load_scheduled_posts(path)
+    assert len(queue) == 1
+    assert queue.posts[0].attempts == 1
+
+
+class _FakeTanAppWithCreatedAt(_FakeTanApp):
+    # A poll whose signed creation time is fixed: the close deadline
+    # must be computed from it, not from the pass that publishes it.
+
+    def create_poll(self, question, options, *, expires_at=None):
+        poll = {
+            "hash": "d" * 64,
+            "text": question,
+            "options": list(options),
+            "expires_at": expires_at,
+            "created_at": 1500.0,
+        }
+        self.polled.append(poll)
+        return poll
+
+
+def test_publish_due_registers_the_same_deadline_on_retry(tmp_path):
+    from tau.poll_closes import load_poll_closes
+
+    path = tmp_path / "scheduled-posts.json"
+    closes_path = tmp_path / "poll-closes.json"
+    schedule_poll(
+        path,
+        question="pizza or tacos?",
+        options=["Pizza", "Tacos"],
+        publish_at=1000.0,
+        now=900.0,
+        close_after=3600.0,
+    )
+    app = _FakeTanAppWithCreatedAt(fail_publish=True)
+    result = publish_due_scheduled_posts(
+        path, app, now=2000.0, poll_close_path=closes_path
+    )
+    assert result == {"published": 0, "kept": 1}
+    # The deadline was registered when the poll was signed, even
+    # though the publish itself failed.
+    assert load_poll_closes(closes_path) == {"d" * 64: 5100.0}
+
+    app.fail_publish = False
+    result = publish_due_scheduled_posts(
+        path, app, now=2100.0, poll_close_path=closes_path
+    )
+    assert result == {"published": 1, "kept": 0}
+    # The retry re-sends the same poll, so the deadline does not
+    # slide forward with the retry.
+    assert load_poll_closes(closes_path) == {"d" * 64: 5100.0}

@@ -52,6 +52,7 @@ DM_REQUESTS_FILE_NAME = "dm-requests.json"
 INVITES_FILE_NAME = "invites.json"
 JOIN_REQUESTS_FILE_NAME = "join-requests.json"
 SCHEDULED_POSTS_FILE_NAME = "scheduled-posts.json"
+POLL_CLOSES_FILE_NAME = "poll-closes.json"
 SCHEDULED_CHANNEL_MESSAGES_FILE_NAME = "scheduled-channel-messages.json"
 SCHEDULED_FILES_FILE_NAME = "scheduled-files.json"
 AUTO_BACKUPS_FILE_NAME = "auto-backups.json"
@@ -113,6 +114,7 @@ class TauConfig:
     invites_path: Path
     join_requests_path: Path
     scheduled_posts_path: Path
+    poll_closes_path: Path
     scheduled_channel_messages_path: Path
     scheduled_files_path: Path
     scheduled_files_dir: Path
@@ -186,6 +188,7 @@ class TauConfig:
             invites_path=base / INVITES_FILE_NAME,
             join_requests_path=base / JOIN_REQUESTS_FILE_NAME,
             scheduled_posts_path=base / SCHEDULED_POSTS_FILE_NAME,
+            poll_closes_path=base / POLL_CLOSES_FILE_NAME,
             scheduled_channel_messages_path=base
             / SCHEDULED_CHANNEL_MESSAGES_FILE_NAME,
             scheduled_files_path=base / SCHEDULED_FILES_FILE_NAME,
