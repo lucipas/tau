@@ -1096,6 +1096,7 @@ def publish_due_scheduled_posts(
     resolve_peer: Optional[Callable[[str], Any]] = None,
     now: Optional[float] = None,
     should_stop: Optional[Callable[[], bool]] = None,
+    contact_refusal: Optional[Callable[[Dict[str, Any]], Optional[str]]] = None,
 ) -> Dict[str, int]:
     """Publish every due queued post through *app* (a ``TanApp``).
 
@@ -1121,8 +1122,13 @@ def publish_due_scheduled_posts(
     A failed attempt (exception or per-peer errors) keeps the entry
     queued with exponential backoff.  After ``MAX_PUBLISH_ATTEMPTS`` it
     is no longer retried automatically but stays queued for the user to
-    inspect or cancel.  A pass stops starting new entries once
-    ``PUBLISH_PASS_BUDGET_SECONDS`` have elapsed.  A pass that pauses
+    inspect or cancel.  When ``contact_refusal`` is given, a queued
+    card is re-checked immediately before signing: a peer blocked
+    since scheduling parks the entry the same way (never published
+    or retried automatically), instead of signing and gossiping a
+    card for a peer the owner has since blocked.  A pass stops
+    starting new entries once ``PUBLISH_PASS_BUDGET_SECONDS`` have
+    elapsed.  A pass that pauses
     on an entry remembers the pause on it, so the next pass starts
     with entries that have not paused — a post whose peers keep
     stalling cannot starve later due posts, and it is still retried
@@ -1169,6 +1175,24 @@ def publish_due_scheduled_posts(
                     break
                 if time.monotonic() > deadline:
                     break
+                if post.contact is not None and contact_refusal is not None:
+                    # Re-check the card's policy now, not only when it
+                    # was queued: the peer may have been blocked since.
+                    # A refused entry is parked (never published or
+                    # retried automatically) and stays queued for the
+                    # user to cancel — the same rule the scheduled
+                    # channel publisher applies.
+                    refusal = contact_refusal(post.contact)
+                    if refusal is not None:
+                        log.warning(
+                            "Scheduled post %s not published: %s",
+                            post.id,
+                            refusal,
+                        )
+                        post = replace(post, attempts=MAX_PUBLISH_ATTEMPTS)
+                        queue = queue.with_replaced(post)
+                        save_scheduled_posts(path, queue)
+                        continue
                 failed_peers: Optional[Tuple[str, ...]] = None
                 try:
                     targets = _resolve_publish_targets(

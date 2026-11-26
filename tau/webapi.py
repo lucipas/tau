@@ -3990,12 +3990,11 @@ class WebBridge:
             image_attachment = image_attachment_from_data_url(
                 image, Path(self._tan_db_path()).parent
             )
-        cleaned_contact = clean_contact(contact) if contact is not None else None
-        if contact is not None and cleaned_contact is None:
-            raise ValueError(
-                "field 'contact' must be a card with a name and a "
-                "32-character hex destination hash"
-            )
+        # Same refusals as the channel, DM and group sends: a card for
+        # your own hash or a blocked peer is refused, and an unreadable
+        # block-list fails closed — the shape check in the route handler
+        # only proves the card is well formed.
+        cleaned_contact = self._vet_channel_contact(contact)
         if reply_to is not None:
             conn = self._tan_conn()
             try:
@@ -4108,15 +4107,13 @@ class WebBridge:
                 "-90..90 and longitude -180..180"
             )
         # Validate the card the same way, before anything is pinned:
-        # a malformed card fails later in schedule_post, after the
+        # a refused card fails later in schedule_post, after the
         # image bytes are already pinned with nothing referencing
-        # them. Cleaned once here, the same value rides on.
-        cleaned_contact = clean_contact(contact) if contact is not None else None
-        if contact is not None and cleaned_contact is None:
-            raise ValueError(
-                "field 'contact' must be a card with a name and a "
-                "32-character hex destination hash"
-            )
+        # them. Cleaned once here, the same value rides on.  The
+        # check applies the same refusals as the channel, DM and
+        # group sends: never your own card, never a blocked peer,
+        # failing closed when the block-list cannot be read.
+        cleaned_contact = self._vet_channel_contact(contact)
         # Resolve the reply and quote targets before decoding or
         # pinning the image: a refused schedule must not leave
         # unreferenced bytes in the pinned media store, which is

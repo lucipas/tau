@@ -62,7 +62,10 @@ export interface TanComposerProps {
     opts: { replyTo?: string; expiresIn?: number },
   ) => Promise<void>;
   /** Known peers for the contact picker; the Contact toggle hides when empty. */
-  contactPeers?: { key: string; name: string }[];
+  // `name` is the peer's announced name — the one the signed card
+  // carries. `displayName` is the owner's local alias when one exists,
+  // shown in the picker only and never submitted.
+  contactPeers?: { key: string; name: string; displayName?: string }[];
 }
 
 export default function TanComposer({
@@ -202,6 +205,13 @@ export default function TanComposer({
 
   const overLimit = text.length > TAN_MAX_CHARS;
 
+  // The picked peer, for the "Sharing:" line: the alias (when one
+  // exists) is what the owner recognizes, while the signed card
+  // carries the announced name.
+  const pickedContactPeer = contactPeer
+    ? (contactPeers ?? []).find((p) => p.key === contactPeer)
+    : undefined;
+
   return (
     <form
       onSubmit={handleSubmit}
@@ -298,7 +308,7 @@ export default function TanComposer({
             <option value="">Choose a peer…</option>
             {(contactPeers ?? []).map((p) => (
               <option key={p.key} value={p.key}>
-                {p.name}
+                {p.displayName ?? p.name}
               </option>
             ))}
           </select>
@@ -479,7 +489,7 @@ export default function TanComposer({
         <p className="mt-2 text-xs text-zinc-400">
           Sharing:{" "}
           <span className="text-zinc-200">
-            {(contactPeers ?? []).find((p) => p.key === contactPeer)?.name ?? contactPeer}
+            {pickedContactPeer?.displayName ?? pickedContactPeer?.name ?? contactPeer}
           </span>
           <button
             type="button"

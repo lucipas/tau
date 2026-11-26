@@ -1331,10 +1331,28 @@ def _row_to_post_with_meta(row: sqlite3.Row) -> Dict[str, Any]:
 
 
 def _fetch_post(conn: sqlite3.Connection, digest: str) -> Optional[sqlite3.Row]:
-    return conn.execute(
-        f"SELECT {', '.join(_POST_COLUMNS)} FROM posts WHERE hash = ?",
-        (digest,),
-    ).fetchone()
+    try:
+        return conn.execute(
+            f"SELECT {', '.join(_POST_COLUMNS)} FROM posts WHERE hash = ?",
+            (digest,),
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such column" not in str(exc):
+            raise
+        # A store created before the contact (or image/location)
+        # column existed has no such column: select only the columns
+        # the table actually has.  _canonical_post tolerates the
+        # missing keys — a pre-contact store holds no cards — so
+        # read-only lookups like `tau tan show` keep working without
+        # a migrating open, and the store is never written.
+        columns = [
+            column for column in _POST_COLUMNS
+            if column in _table_columns(conn, "posts")
+        ]
+        return conn.execute(
+            f"SELECT {', '.join(columns)} FROM posts WHERE hash = ?",
+            (digest,),
+        ).fetchone()
 
 
 def get_post(conn: sqlite3.Connection, digest: str) -> Optional[Dict[str, Any]]:

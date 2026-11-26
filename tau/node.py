@@ -5438,6 +5438,7 @@ class TauNode:
             return
         if not (hasattr(app, "create_post") and hasattr(app, "publish")):
             return
+        from .scheduled_channel import channel_contact_refusal
         from .scheduled_posts import publish_due_scheduled_posts
 
         try:
@@ -5446,6 +5447,11 @@ class TauNode:
                 app,
                 resolve_peer=self.resolve_peer,
                 should_stop=self._stop_event.is_set,
+                contact_refusal=lambda contact: channel_contact_refusal(
+                    contact,
+                    own_hash=self.destination_hexhash,
+                    blocklist=self.blocklist,
+                ),
             )
         except Exception:  # pragma: no cover - defensive; helper logs
             log.debug("Scheduled-post publish failed", exc_info=True)

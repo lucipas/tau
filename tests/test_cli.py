@@ -12357,6 +12357,38 @@ def test_tan_show_text_json_and_errors(tmp_path, capsys):
     assert "blocked author" in capsys.readouterr().err
 
 
+def test_tan_show_reads_pre_contact_store_without_migrating(tmp_path, capsys):
+    # A store created before the contact column existed: `tau tan
+    # show` opens it read-only without running the migration, so the
+    # lookup must not fail on the missing column — and must not add
+    # the column itself.
+    import sqlite3
+
+    _, post, _ = _seed_tan_post(tmp_path)
+    config = TauConfig.resolve(data_dir=tmp_path / "node", name="bob")
+    conn = sqlite3.connect(str(config.social_db_path))
+    try:
+        conn.execute("ALTER TABLE posts DROP COLUMN contact")
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert _run_tan_show(tmp_path, post["hash"][:12]) == 0
+    out = capsys.readouterr().out
+    assert "worth sharing" in out
+    assert post["hash"] in out
+
+    conn = sqlite3.connect(str(config.social_db_path))
+    try:
+        columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(posts)").fetchall()
+        }
+    finally:
+        conn.close()
+    assert "contact" not in columns
+
+
 def test_tan_show_poll_tally_and_own_pinned_post(tmp_path, capsys):
     from tau.tangents.tan import (
         create_post,

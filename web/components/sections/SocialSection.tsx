@@ -202,7 +202,17 @@ export default function SocialSection() {
 
   // Known peers for the Tan composer's contact picker, keyed the way
   // the chat composer keys them.
-  const contactPeers = peers.map((p) => ({ key: p.destination, name: p.name }));
+  //
+  // The card's name is the peer's ANNOUNCED name, never the owner's
+  // local alias: the alias is private to this node and signing it
+  // into a post would publish it to every reader.  The alias stays
+  // available as displayName so the picker still shows the name the
+  // owner knows the peer by.
+  const contactPeers = (tau?.peers ?? []).map((p) => ({
+    key: p.destination,
+    name: p.name,
+    displayName: p.alias || p.name,
+  }));
 
   // Add the peer from a shared contact card on a Tan post: errors
   // must reach the card's catch, so a failed add keeps the button

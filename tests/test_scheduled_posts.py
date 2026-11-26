@@ -1240,6 +1240,76 @@ def test_publish_due_attaches_scheduled_contact(tmp_path):
     assert load_scheduled_posts(path).posts == ()
 
 
+def test_publish_due_parks_refused_contact(tmp_path):
+    # A card whose peer was blocked after scheduling is never
+    # published: the entry parks at the attempt cap instead of
+    # burning retries, and stays queued for the user to cancel.
+    path = tmp_path / "scheduled-posts.json"
+    entry = schedule_post(
+        path, text="meet carol", publish_at=1000.0, now=900.0, contact=_contact()
+    )
+    app = _FakeTanApp()
+    vetted = []
+
+    def refuse(card):
+        vetted.append(card)
+        return "cannot share a contact for a blocked peer"
+
+    result = publish_due_scheduled_posts(
+        path, app, contact_refusal=refuse, now=2000.0
+    )
+    assert result == {"published": 0, "kept": 1}
+    assert vetted == [_contact()]
+    assert app.created == []
+    assert app.published == []
+    queue = load_scheduled_posts(path)
+    assert len(queue) == 1
+    assert queue.posts[0].id == entry.id
+    assert queue.posts[0].attempts == MAX_PUBLISH_ATTEMPTS
+    # A parked entry is never retried: a later pass leaves it alone.
+    result = publish_due_scheduled_posts(
+        path, app, contact_refusal=refuse, now=3000.0
+    )
+    assert result == {"published": 0, "kept": 0}
+    assert app.created == []
+
+
+def test_publish_due_vet_refuses_stored_post_on_retry(tmp_path):
+    # The vet runs before a stored post is re-published too: a first
+    # attempt that fails to deliver, followed by the peer being
+    # blocked, must not send the stored copy on the retry.
+    path = tmp_path / "scheduled-posts.json"
+    schedule_post(
+        path, text="meet carol", publish_at=1000.0, now=900.0, contact=_contact()
+    )
+    app = _FakeTanApp(fail_publish=True)
+
+    def allow(card):
+        return None
+
+    result = publish_due_scheduled_posts(
+        path, app, contact_refusal=allow, now=2000.0
+    )
+    assert result == {"published": 0, "kept": 1}
+    assert len(app.created) == 1
+    assert app.published == []
+    queued = load_scheduled_posts(path).posts[0]
+    assert queued.post_hash == "c" * 64
+    assert queued.attempts == 1
+
+    def refuse(card):
+        return "cannot share a contact for a blocked peer"
+
+    result = publish_due_scheduled_posts(
+        path, app, contact_refusal=refuse, now=3000.0
+    )
+    assert result == {"published": 0, "kept": 1}
+    assert app.published == []
+    queued = load_scheduled_posts(path).posts[0]
+    assert queued.post_hash == "c" * 64
+    assert queued.attempts == MAX_PUBLISH_ATTEMPTS
+
+
 def test_publish_due_keeps_failed_posts_queued(tmp_path):
     path = tmp_path / "scheduled-posts.json"
     schedule_post(path, text="now", publish_at=1000.0, now=900.0)

@@ -15655,6 +15655,7 @@ def test_tan_post_via_api_accepts_contact(tmp_path):
 
     node = FakeNode()
     node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    node.blocklist = BlockList()
     identity = RNS.Identity()
     conn = init_db(node.config.social_db_path)
     try:
@@ -15725,6 +15726,51 @@ def test_tan_post_via_api_accepts_contact(tmp_path):
         )
         assert status == 400
         assert "not a reply" in payload["error"]["message"]
+
+        # The contact-sharing policy applies here too, like the
+        # channel, DM and group sends: a blocked peer's card and
+        # your own card are refused, and an unreadable block-list
+        # fails closed.
+        node.blocklist = BlockList(blocked=frozenset({"cc" * 16}))
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/posts",
+            method="POST",
+            body={
+                "text": "meet carol",
+                "contact": {"name": "carol", "destination_hash": "cc" * 16},
+            },
+        )
+        assert status == 400
+        assert "blocked peer" in payload["error"]["message"]
+        node.blocklist = BlockList()
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/posts",
+            method="POST",
+            body={
+                "text": "meet me",
+                "contact": {
+                    "name": "tester",
+                    "destination_hash": node.destination_hexhash,
+                },
+            },
+        )
+        assert status == 400
+        assert "cannot share your own contact" in payload["error"]["message"]
+        node.blocklist = None
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/posts",
+            method="POST",
+            body={
+                "text": "meet carol",
+                "contact": {"name": "carol", "destination_hash": "cc" * 16},
+            },
+        )
+        assert status == 400
+        assert "block-list could not be read" in payload["error"]["message"]
+        node.blocklist = BlockList()
 
         # Only the one good post was stored.
         status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
@@ -16177,6 +16223,7 @@ def test_tan_schedule_post_with_contact_via_api(tmp_path):
 
     node = FakeNode()
     node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    node.blocklist = BlockList()
 
     bridge = WebBridge(node, host="127.0.0.1", port=0)
     bridge.start()
@@ -16219,6 +16266,56 @@ def test_tan_schedule_post_with_contact_via_api(tmp_path):
         )
         assert status == 400
         assert "contact" in payload["error"]["message"]
+        status, _, payload = _json(bridge, "/api/tan/scheduled")
+        assert payload["count"] == 1
+
+        # The contact-sharing policy applies to scheduling too: a
+        # blocked peer's card and your own card are refused, and an
+        # unreadable block-list fails closed — before anything is
+        # queued.
+        node.blocklist = BlockList(blocked=frozenset({"cc" * 16}))
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/schedule",
+            method="POST",
+            body={
+                "text": "meet carol",
+                "send_in": 3600,
+                "contact": {"name": "carol", "destination_hash": "cc" * 16},
+            },
+        )
+        assert status == 400
+        assert "blocked peer" in payload["error"]["message"]
+        node.blocklist = BlockList()
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/schedule",
+            method="POST",
+            body={
+                "text": "meet me",
+                "send_in": 3600,
+                "contact": {
+                    "name": "tester",
+                    "destination_hash": node.destination_hexhash,
+                },
+            },
+        )
+        assert status == 400
+        assert "cannot share your own contact" in payload["error"]["message"]
+        node.blocklist = None
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/schedule",
+            method="POST",
+            body={
+                "text": "meet carol",
+                "send_in": 3600,
+                "contact": {"name": "carol", "destination_hash": "cc" * 16},
+            },
+        )
+        assert status == 400
+        assert "block-list could not be read" in payload["error"]["message"]
+        node.blocklist = BlockList()
         status, _, payload = _json(bridge, "/api/tan/scheduled")
         assert payload["count"] == 1
 

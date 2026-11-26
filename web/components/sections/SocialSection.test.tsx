@@ -8,7 +8,7 @@ import { TauContext } from "@/components/chrome/TauContext";
 import type { ScheduledTanPost, TanDraft, TanPost } from "@/lib/types";
 import SocialSection from "./SocialSection";
 import { validateTanText } from "./social/TanComposer";
-import { fakeTau, mockFetch } from "./test-utils";
+import { fakePeer, fakeTau, mockFetch } from "./test-utils";
 
 function makePost(hash: string, text: string, extra: Partial<TanPost> = {}): TanPost {
   return {
@@ -160,9 +160,9 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-function renderSocial() {
+function renderSocial(tauOverrides: Parameters<typeof fakeTau>[0] = {}) {
   return render(
-    <TauContext.Provider value={fakeTau()}>
+    <TauContext.Provider value={fakeTau(tauOverrides)}>
       <SocialSection />
     </TauContext.Provider>,
   );
@@ -375,6 +375,23 @@ describe("SocialSection", () => {
     await waitFor(() =>
       expect((screen.getByLabelText("Compose a post") as HTMLTextAreaElement).value).toBe(""),
     );
+  });
+
+  it("shows an aliased peer by alias in the contact picker", async () => {
+    // A peer announced as "carol" that the owner nicknamed "Caz":
+    // the picker shows the name the owner knows. The signed card
+    // carries the announced name — covered at the composer level.
+    const carol = fakePeer({
+      destination: "cc".repeat(16),
+      name: "carol",
+      alias: "Caz",
+    });
+    renderSocial({ peers: [carol] });
+    await screen.findByText(/hello/);
+    fireEvent.click(screen.getByRole("button", { name: "👤 Contact" }));
+    const select = screen.getByLabelText("Peer to share");
+    expect(select.textContent).toContain("Caz");
+    expect(select.textContent).not.toContain("carol");
   });
 
   it("validates polls before posting", async () => {

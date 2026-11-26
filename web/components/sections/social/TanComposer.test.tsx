@@ -295,6 +295,29 @@ describe("TanComposer contact attach", () => {
     expect(onPosted).toHaveBeenCalled();
   });
 
+  it("shows the local alias in the picker but signs the announced name", async () => {
+    // A peer the owner nicknamed "Caz" is announced as "carol": the
+    // picker shows the name the owner knows, but the signed card must
+    // carry the announced name — the alias is private to this node.
+    const aliased = [{ key: "cc".repeat(16), name: "carol", displayName: "Caz" }];
+    const composer = makeComposer();
+    render(<TanComposer composer={composer} contactPeers={aliased} />);
+    fireEvent.click(screen.getByRole("button", { name: "👤 Contact" }));
+    const select = screen.getByLabelText("Peer to share");
+    expect(select.textContent).toContain("Caz");
+    expect(select.textContent).not.toContain("carol");
+    fireEvent.change(select, { target: { value: "cc".repeat(16) } });
+    expect(screen.getByText(/Sharing:/).textContent).toContain("Caz");
+    typePost("talk to carol about this");
+    submit();
+    await waitFor(() =>
+      expect(composer.publish).toHaveBeenCalledWith(
+        "talk to carol about this",
+        expect.objectContaining({ contact: CARD }),
+      ),
+    );
+  });
+
   it("posts text-only once the picked peer is removed", async () => {
     const composer = makeComposer();
     render(<TanComposer composer={composer} contactPeers={PEERS} />);
