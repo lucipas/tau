@@ -10567,10 +10567,21 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 2
         # Refuse to queue for a channel we have not joined: the
-        # publish pass would fail every attempt the same way.
+        # publish pass would fail every attempt the same way.  A
+        # reply's parent resolves here too, against the same
+        # connection: an unknown or ambiguous parent is refused up
+        # front, and the entry stores the full hash, so the publish
+        # pass attaches the reply it was scheduled as.
+        reply_to = getattr(args, "reply_to", None)
         conn = init_channel_db(config.channels_db_path)
         try:
             member = is_channel_member(conn, name)
+            if member and reply_to:
+                try:
+                    reply_to = resolve_message_digest(conn, name, reply_to)
+                except ChannelError as exc:
+                    print(f"error: {exc}", file=sys.stderr)
+                    return 2
         finally:
             conn.close()
         if not member:
@@ -10591,6 +10602,7 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
                 location=location,
                 contact=contact,
                 expires_in=expire_seconds,
+                reply_to=reply_to,
                 disappearing_path=config.disappearing_path,
             )
         except ScheduledChannelError as exc:
@@ -11404,6 +11416,11 @@ def cmd_channel_scheduled(args: argparse.Namespace) -> int:
             print(f"  to {', '.join(entry.to)}")
         for line in entry.text.splitlines() or [""]:
             print(f"  {line}")
+        if entry.reply_to is not None:
+            # A queued reply prints its parent under the text, so a
+            # scheduled reply reads in the terminal the way it renders
+            # in the console once published.
+            print(f"  ↩ in reply to {entry.reply_to[:8]}…")
         pin = clean_location(entry.location)
         if pin is not None:
             # A queued pin prints under the text with its map link, so

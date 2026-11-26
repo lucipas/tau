@@ -944,6 +944,8 @@ export interface ScheduledChannelMessage {
   contact?: { name: string; destination_hash: string };
   /** Seconds from publish until the message expires, if it is a disappearing message. */
   expires_in?: number;
+  /** Parent message's hash when the queued message is a reply, if any. */
+  reply_to?: string;
   [key: string]: unknown;
 }
 
