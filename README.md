@@ -235,7 +235,10 @@ loopback makes every visitor look loopback. If you put a proxy in front,
 name it with `--http-trusted-proxy <proxy-ip>` (repeatable): the gate then
 reads the real client from the proxy's `X-Forwarded-For` header instead of
 the proxy's address, and a proxy that sends no forwarding header fails
-closed. Use `--web-dir` or `TAU_WEB_DIR` to serve a different build, and
+closed. Because the proxy's own address is then not treated as the owner,
+a loopback proxy also means direct requests to the bridge from loopback (no
+forwarding header) lose owner-only access; use the proxy path to reach the
+console in that setup. Use `--web-dir` or `TAU_WEB_DIR` to serve a different build, and
 `make web-dev` for the Next.js dev server on port 3000 (the console
 automatically talks to the bridge on port 8787).
 
