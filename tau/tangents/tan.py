@@ -1574,7 +1574,8 @@ def image_attachment_from_data_url(
     except TanError as exc:
         raise PostError(str(exc)) from exc
     except OSError as exc:
-        raise PostError(f"post image could not be pinned: {exc}") from exc
+        log.exception("post image could not be pinned")
+        raise PostError("post image could not be pinned") from exc
     ext = {
         "image/jpeg": "jpg",
         "image/png": "png",
@@ -1644,7 +1645,8 @@ def image_attachment_from_descriptor(
     except TanError as exc:
         raise PostError(str(exc)) from exc
     except OSError as exc:
-        raise PostError(f"post image could not be pinned: {exc}") from exc
+        log.exception("post image could not be pinned")
+        raise PostError("post image could not be pinned") from exc
     return {"sha256": digest, "size": len(data), "mime": mime, "name": name}
 
 
