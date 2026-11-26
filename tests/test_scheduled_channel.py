@@ -1217,6 +1217,101 @@ def test_publish_due_replacement_reaches_all_peers_after_expiry(tmp_path):
     assert all(message.id != entry.id for message in queue.messages)
 
 
+def test_publish_due_replacement_reaches_all_peers_when_copy_is_gone(tmp_path):
+    # Same partial delivery, but the stored copy was already deleted
+    # by the time of the retry (retention cleanup of the expired row):
+    # the publisher still signs a replacement for the full intended
+    # set, because it cannot tell a cleaned-up expired copy from an
+    # evicted one — and the peers that got the first copy may hold
+    # an expired one.
+    path = tmp_path / "scheduled-channel-messages.json"
+    entry = schedule_channel_message(
+        path,
+        channel="general",
+        text="meet soon",
+        publish_at=1000.0,
+        to=["alice", "bob"],
+        now=900.0,
+        expires_in=60.0,
+    )
+    app = _FakeChannelApp(fail_with_errors=True)
+    resolved = {
+        "alice": SimpleNamespace(hexhash="alice-hash"),
+        "bob": SimpleNamespace(hexhash="bob-hash"),
+        "deadbeef": SimpleNamespace(hexhash="deadbeef-hash"),
+    }
+    result = publish_due_scheduled_channel_messages(
+        path, app, resolve_peer=lambda target: resolved[target], now=2000.0
+    )
+    assert result == {"published": 0, "kept": 1}
+    assert len(app.created) == 1
+    # The expired row is cleaned up before the retry.
+    app.stored.clear()
+    app.fail_with_errors = False
+    result = publish_due_scheduled_channel_messages(
+        path, app, resolve_peer=lambda target: resolved[target], now=3000.0
+    )
+    assert result == {"published": 1, "kept": 0}
+    assert len(app.created) == 2
+    assert [peer.hexhash for peer in app.published[0][1]] == [
+        "alice-hash",
+        "bob-hash",
+    ]
+    queue = load_scheduled_channel_messages(path)
+    assert all(message.id != entry.id for message in queue.messages)
+
+
+def test_publish_due_rechecks_expiry_after_resolution(tmp_path, monkeypatch):
+    # The stored copy is still alive when the pass starts, but peer
+    # resolution outlasts its remaining lifetime: the pass must not
+    # publish it as delivered.  It signs a fresh copy for the full
+    # intended set, with the new expiry measured from a clock reading
+    # taken immediately before sending.
+    path = tmp_path / "scheduled-channel-messages.json"
+    entry = schedule_channel_message(
+        path,
+        channel="general",
+        text="meet soon",
+        publish_at=1000.0,
+        to=["alice", "bob"],
+        now=900.0,
+        expires_in=60.0,
+    )
+    app = _FakeChannelApp(fail_with_errors=True)
+    resolved = {
+        "alice": SimpleNamespace(hexhash="alice-hash"),
+        "bob": SimpleNamespace(hexhash="bob-hash"),
+        "deadbeef": SimpleNamespace(hexhash="deadbeef-hash"),
+    }
+    result = publish_due_scheduled_channel_messages(
+        path, app, resolve_peer=lambda target: resolved[target], now=2000.0
+    )
+    assert result == {"published": 0, "kept": 1}
+    assert len(app.created) == 1
+    # Second pass with a live clock: the pass reads the clock three
+    # times (pass start, before resolution, after resolution) plus
+    # once more before signing the replacement.  The copy (expiring
+    # at 2060) is alive at the pre-resolution reading (2059) and
+    # expired by the post-resolution one (3000).  Extra readings
+    # (e.g. the logging module's own clock calls) get the same
+    # post-resolution value, so they cannot change the outcome.
+    readings = iter([3000.0, 2059.0, 3000.0, 3000.0])
+    monkeypatch.setattr(time, "time", lambda: next(readings, 3000.0))
+    app.fail_with_errors = False
+    result = publish_due_scheduled_channel_messages(
+        path, app, resolve_peer=lambda target: resolved[target]
+    )
+    assert result == {"published": 1, "kept": 0}
+    assert len(app.created) == 2
+    assert app.created[1]["expires_at"] == 3000.0 + 60.0
+    assert [peer.hexhash for peer in app.published[0][1]] == [
+        "alice-hash",
+        "bob-hash",
+    ]
+    queue = load_scheduled_channel_messages(path)
+    assert all(message.id != entry.id for message in queue.messages)
+
+
 def test_publish_due_explicit_expires_in_wins_over_channel_default(tmp_path):
     # With a channel disappearing default in force, an entry carrying its
     # own expires_in keeps that expiry, while one without it takes the

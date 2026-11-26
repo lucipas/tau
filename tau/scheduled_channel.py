@@ -1098,12 +1098,12 @@ def publish_due_scheduled_channel_messages(
                         continue
                 failed_peers: Optional[Tuple[str, ...]] = None
                 try:
-                    # The send-time clock, not the pass start: target
-                    # resolution and earlier messages can use up a short
-                    # lifetime before signing.  Rounded like ChannelApp.send
-                    # rounds created_at, so the lifetime never grows past
-                    # what was asked for.
-                    sent_at = round(now if now is not None else time.time(), 3)
+                    # First reading, before resolution: a stored copy
+                    # that already expired gets a fresh replacement for
+                    # the full intended set (see below), so the
+                    # replacement is resolved for everyone, not only
+                    # the peers that missed the old copy.
+                    checked_at = round(now if now is not None else time.time(), 3)
                     stored = (
                         app.get_message(message.message_hash)
                         if message.message_hash
@@ -1112,24 +1112,57 @@ def publish_due_scheduled_channel_messages(
                     expired_copy = (
                         stored is not None
                         and stored.get("expires_at") is not None
-                        and float(stored["expires_at"]) <= sent_at
+                        and float(stored["expires_at"]) <= checked_at
                     )
                     if expired_copy:
                         # The stored copy expired while earlier attempts
                         # backed off; recipients would discard it, so
                         # sign a fresh one instead of resending it.
-                        # Decide this before resolving targets: the
-                        # replacement is a new message for the full
-                        # intended set, not a retry for only the peers
-                        # that missed the old copy — those that got it
-                        # hold an expired one and need the replacement
-                        # too.  Clearing pending_peers makes the
-                        # resolver fall back to the entry's full list.
                         stored = None
+                    if stored is None and message.message_hash is not None:
+                        # A fresh copy will be signed for an entry that
+                        # already has one.  The stored copy is gone —
+                        # expired and cleaned up, or evicted — and peers
+                        # that received the first copy may hold an
+                        # expired one, so the replacement goes to the
+                        # full intended set.  Clearing pending_peers
+                        # makes the resolver fall back to the entry's
+                        # full list.  Decide this before resolving
+                        # targets: a replacement resolved for only the
+                        # retry peers would leave the others with the
+                        # expired copy.
                         message = replace(message, pending_peers=())
                     targets = _resolve_publish_targets(
                         message, resolve_peer, should_stop, deadline
                     )
+                    # Second reading, after resolution: peer resolution
+                    # can outlast the remaining lifetime.  The send-time
+                    # clock, not the pass start: target resolution and
+                    # earlier messages can use up a short lifetime
+                    # before signing.  Rounded like ChannelApp.send
+                    # rounds created_at, so the lifetime never grows
+                    # past what was asked for.
+                    sent_at = round(now if now is not None else time.time(), 3)
+                    if (
+                        stored is not None
+                        and stored.get("expires_at") is not None
+                        and float(stored["expires_at"]) <= sent_at
+                    ):
+                        # The copy expired while resolving: publishing
+                        # it would look delivered while recipients
+                        # discard it.  Sign a fresh copy for the full
+                        # set instead, and take a fresh reading
+                        # immediately before sending so the new copy's
+                        # lifetime is not spent resolving.
+                        expired_copy = True
+                        stored = None
+                        message = replace(message, pending_peers=())
+                        targets = _resolve_publish_targets(
+                            message, resolve_peer, should_stop, deadline
+                        )
+                        sent_at = round(
+                            now if now is not None else time.time(), 3
+                        )
                     if stored is None:
                         if message.message_hash is not None:
                             # The signed message was created on an
