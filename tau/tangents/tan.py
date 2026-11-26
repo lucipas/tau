@@ -1635,6 +1635,12 @@ def image_attachment_from_descriptor(
     mime = detect_image_mime(data)
     if mime is None:
         raise PostError("post image must be a JPEG, PNG, GIF or WebP file")
+    # Pin the bytes: a cached copy is prunable, and a saved draft or
+    # scheduled post must not lose its image later.
+    try:
+        store_media(data_dir, digest, data, pinned=True)
+    except TanError as exc:
+        raise PostError(str(exc)) from exc
     return {"sha256": digest, "size": len(data), "mime": mime, "name": name}
 
 
