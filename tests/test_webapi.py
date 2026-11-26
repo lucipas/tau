@@ -25087,6 +25087,98 @@ def test_tan_media_draft_image_is_loopback_only(bridge, node, tmp_path):
     assert found[0] == png
 
 
+def test_tan_save_draft_reattaches_image_by_descriptor(bridge, node, tmp_path):
+    """A draft re-saved by descriptor keeps its image (#822).
+
+    A remote console cannot fetch the draft image's bytes (the media
+    endpoint serves an unpublished draft's bytes to loopback clients
+    only), so it re-sends the ``{sha256, name}`` descriptor; the
+    server re-attaches the pinned bytes by digest instead of dropping
+    the image.  When the bytes are genuinely gone the save is refused
+    loudly, so the stored draft — image included — survives.
+    """
+    import base64
+    import hashlib
+
+    import pytest
+
+    from tau.tangents.tan import (
+        PostError,
+        image_attachment_from_data_url,
+        image_attachment_from_descriptor,
+        init_db,
+        save_draft,
+    )
+
+    _with_config(node, tmp_path)
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+    digest = hashlib.sha256(png).hexdigest()
+    data_url = "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+    conn = init_db(node.config.social_db_path)
+    try:
+        attachment = image_attachment_from_data_url(data_url, tmp_path)
+        save_draft(conn, "draft pic", image=attachment)
+    finally:
+        conn.close()
+
+    # The descriptor helper re-derives size and mime from the stored
+    # bytes; the name rides the descriptor.
+    rebuilt = image_attachment_from_descriptor(
+        {"sha256": digest, "name": "pic.png"}, tmp_path
+    )
+    assert rebuilt == {
+        "sha256": digest,
+        "size": len(png),
+        "mime": "image/png",
+        "name": "pic.png",
+    }
+    # A descriptor for bytes that were never stored is refused.
+    with pytest.raises(PostError, match="no longer cached"):
+        image_attachment_from_descriptor(
+            {"sha256": "cd" * 32, "name": "gone.png"}, tmp_path
+        )
+    # A malformed digest is refused, not looked up.
+    with pytest.raises(PostError, match="64 character hex digest"):
+        image_attachment_from_descriptor({"sha256": "zz", "name": "x.png"}, tmp_path)
+
+    # The bridge re-saves the draft from the descriptor alone.
+    saved = bridge.tan_save_draft(
+        "re-saved pic", image={"sha256": digest, "name": "pic.png"}
+    )
+    assert saved["image"]["sha256"] == digest
+    assert saved["image"]["mime"] == "image/png"
+    assert saved["image"]["name"] == "pic.png"
+    # ...and the HTTP route accepts the descriptor form too, and
+    # refuses genuinely missing bytes instead of dropping the image.
+    status, _, payload = _json(
+        bridge,
+        "/api/tan/drafts",
+        method="POST",
+        body={"text": "via http", "image": {"sha256": digest, "name": "pic.png"}},
+    )
+    assert status == 200
+    assert payload["draft"]["image"]["sha256"] == digest
+    status, _, payload = _json(
+        bridge,
+        "/api/tan/drafts",
+        method="POST",
+        body={
+            "text": "gone bytes",
+            "image": {"sha256": "cd" * 32, "name": "gone.png"},
+        },
+    )
+    assert status == 400
+    assert "no longer cached" in payload["error"]["message"]
+    # A non-string, non-object image is still a 400 at the route.
+    status, _, payload = _json(
+        bridge,
+        "/api/tan/drafts",
+        method="POST",
+        body={"text": "bad image", "image": 42},
+    )
+    assert status == 400
+
+
 def test_tan_media_fetch_accepts_and_validates(bridge, node, tmp_path):
     _with_config(node, tmp_path)
     digest = "ab" * 32

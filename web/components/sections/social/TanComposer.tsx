@@ -63,9 +63,16 @@ export interface TanComposerProps {
   initialText?: string;
   /** Expiry a loaded draft carries, in seconds. */
   initialExpiresIn?: number;
-  /** Image a loaded draft carries, as a data URL with its file name
-   *  and size — re-sent unchanged until a new file is picked. */
-  initialImage?: { dataUrl: string; name: string; size: number } | null;
+  /** Image a loaded draft carries — as a data URL with its file name
+   *  and size, re-sent unchanged until a new file is picked — or, when
+   *  the bytes could not be fetched, as the descriptor of bytes pinned
+   *  in the node's media store, re-attached server-side by digest. */
+  initialImage?: {
+    dataUrl?: string;
+    sha256?: string;
+    name: string;
+    size: number;
+  } | null;
   /** Contact card a loaded draft carries. */
   initialContact?: { name: string; destination_hash: string } | null;
   /** Place a loaded draft carries. The composer cannot pick a place —
@@ -104,10 +111,13 @@ export default function TanComposer({
   const [expiresIn, setExpiresIn] = useState<number | undefined>(initialExpiresIn);
   const [sendIn, setSendIn] = useState<number | undefined>(undefined);
   const [file, setFile] = useState<File | null>(null);
-  // A loaded draft's image, as a data URL: a newly picked file wins,
-  // but the draft's image survives until one is picked or it is removed.
+  // A loaded draft's image: bytes as a data URL, or — when the bytes
+  // could not be fetched — the descriptor, kept by reference. A newly
+  // picked file wins, but the draft's image survives until one is
+  // picked or it is removed.
   const [imageDataUrl, setImageDataUrl] = useState<{
-    dataUrl: string;
+    dataUrl?: string;
+    sha256?: string;
     name: string;
     size: number;
   } | null>(initialImage ?? null);
@@ -189,10 +199,16 @@ export default function TanComposer({
   }
 
   // The image to carry: a newly picked file, read as a data URL, or a
-  // loaded draft's image, re-sent as the data URL it was loaded with.
-  async function readAttachedImage(): Promise<{ dataUrl: string } | undefined> {
+  // loaded draft's image — re-sent as the data URL it was loaded with,
+  // or by descriptor when the bytes could not be fetched.
+  async function readAttachedImage(): Promise<
+    { dataUrl?: string; sha256?: string; name?: string } | undefined
+  > {
     if (file) return { dataUrl: await readFileAsDataUrl(file) };
-    return imageDataUrl ? { dataUrl: imageDataUrl.dataUrl } : undefined;
+    if (imageDataUrl?.dataUrl) return { dataUrl: imageDataUrl.dataUrl };
+    if (imageDataUrl?.sha256)
+      return { sha256: imageDataUrl.sha256, name: imageDataUrl.name };
+    return undefined;
   }
 
   // The card to carry: a newly picked peer, or a loaded draft's card,
@@ -281,7 +297,7 @@ export default function TanComposer({
       contact = attachedContact ?? undefined;
     }
     try {
-      let image: { dataUrl: string } | undefined;
+      let image: { dataUrl?: string; sha256?: string } | undefined;
       if (file) {
         try {
           image = { dataUrl: await readFileAsDataUrl(file) };
@@ -290,8 +306,10 @@ export default function TanComposer({
             err instanceof Error ? err.message : "Could not read the image file.",
           );
         }
-      } else if (imageDataUrl) {
+      } else if (imageDataUrl?.dataUrl) {
         image = { dataUrl: imageDataUrl.dataUrl };
+      } else if (imageDataUrl?.sha256) {
+        image = { sha256: imageDataUrl.sha256 };
       }
       if (sendIn !== undefined) {
         await composer.schedule(text.trim(), sendIn, { replyTo: replyTo ?? undefined, expiresIn, image, location: location ?? undefined, contact });
@@ -619,6 +637,12 @@ export default function TanComposer({
             )}{" "}
             KB)
           </span>
+          {!file && imageDataUrl && !imageDataUrl.dataUrl && (
+            <span className="text-zinc-500">
+              {" "}
+              — preview unavailable, kept by reference
+            </span>
+          )}
           <button
             type="button"
             onClick={() => {

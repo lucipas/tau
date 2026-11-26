@@ -707,6 +707,47 @@ describe("SocialSection", () => {
     expect(screen.queryByText("pic.png")).toBeNull();
   });
 
+  it("a draft whose image cannot be fetched keeps its image on re-save", async () => {
+    // The default fetchTanImageDataUrlMock resolves null: the bytes
+    // are unreachable from this console (loopback-gated media).
+    renderSocial();
+    await screen.findByText(/hello/);
+    fireEvent.click(screen.getByRole("button", { name: "Drafts" }));
+    await screen.findByText("with everything");
+    const rows = screen.getAllByRole("button", { name: "Edit" });
+    fireEvent.click(rows[2]);
+    await waitFor(() =>
+      expect(
+        (screen.getByLabelText("Compose a post") as HTMLTextAreaElement).value,
+      ).toBe("with everything"),
+    );
+    // The image stays attached by reference, with no preview.
+    expect(screen.getByText("pic.png")).toBeTruthy();
+    expect(screen.getByText(/preview unavailable, kept by reference/)).toBeTruthy();
+    expect(
+      screen.getByText(/its image could not be fetched from this console/),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
+    await waitFor(() => expect(calls).toContain("POST /api/tan/drafts"));
+    // The re-save carries the descriptor, not a dropped image.
+    const fetchMock = fetch as unknown as {
+      mock: { calls: [string, RequestInit?][] };
+    };
+    const saves = fetchMock.mock.calls.filter(
+      ([url, init]) =>
+        url.includes("/api/tan/drafts") &&
+        init?.method === "POST" &&
+        !url.includes("/delete"),
+    );
+    expect(saves).toHaveLength(1);
+    expect(JSON.parse(String(saves[0][1]?.body))).toEqual({
+      text: "with everything",
+      image: { sha256: "ab".repeat(32), name: "pic.png" },
+      location: { lat: 34.05, lon: -83.88, name: "Rock Springs Park" },
+      contact: { name: "carol", destination_hash: "cc".repeat(16) },
+    });
+  });
+
   it("deleting a draft discards it without posting", async () => {
     renderSocial();
     await screen.findByText(/hello/);
