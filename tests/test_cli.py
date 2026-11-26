@@ -15666,6 +15666,73 @@ def test_channel_send_delay_with_expires_in_schedules_and_lists(tmp_path, capsys
     assert payload["scheduled"][0]["expires_in"] == 7200.0
 
 
+def test_channel_send_delay_with_reply_to_schedules_and_lists(tmp_path, capsys):
+    from tau.channels import channel_history, init_db
+
+    _init_node(tmp_path, "node", "alice")
+    assert _run_channel(tmp_path, "join", "general") == 0
+    capsys.readouterr()
+
+    # The parent is a stored message, sent without publishing.
+    code = _run_channel(
+        tmp_path, "send", "general", "meet at the park", "--no-publish"
+    )
+    assert code == 0
+    capsys.readouterr()
+    conn = init_db(tmp_path / "node" / "channels.sqlite3")
+    try:
+        parent = channel_history(conn, "general")[0]
+    finally:
+        conn.close()
+
+    # A reply can be scheduled: the prefix resolves at schedule time
+    # and the entry stores the parent's full hash.
+    code = _run_channel(
+        tmp_path,
+        "send",
+        "general",
+        "see you there",
+        "--reply-to",
+        parent["hash"][:8],
+        "--delay",
+        "5m",
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "scheduled" in out
+    assert "publishes in 5m" in out
+
+    code = _run_channel(tmp_path, "scheduled")
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "#general" in out
+    assert "see you there" in out
+    assert f"↩ in reply to {parent['hash'][:8]}…" in out
+
+    # The JSON form carries the full parent hash.
+    code = cli.main(
+        ["channel", "--data-dir", str(tmp_path / "node"), "--json", "scheduled"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["scheduled"][0]["reply_to"] == parent["hash"]
+
+    # An unknown parent is refused up front, not queued to fail
+    # every publish attempt.
+    code = _run_channel(
+        tmp_path,
+        "send",
+        "general",
+        "nowhere",
+        "--reply-to",
+        "00" * 32,
+        "--delay",
+        "5m",
+    )
+    assert code == 2
+    assert "unknown message" in capsys.readouterr().err
+
+
 def test_channel_send_delay_rejects_bad_combinations(tmp_path, capsys):
     _init_node(tmp_path, "node", "alice")
     assert _run_channel(tmp_path, "join", "general") == 0

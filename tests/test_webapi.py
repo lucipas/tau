@@ -25352,6 +25352,129 @@ def test_channel_schedule_via_api(tmp_path):
         bridge.stop()
 
 
+def test_channel_schedule_reply_via_api(tmp_path):
+    import RNS
+
+    from tau.channels import (
+        create_message,
+        init_db as init_channel_db,
+        join_channel,
+    )
+    from tau.config import TauConfig
+
+    assert cli.main(["init", "--data-dir", str(tmp_path), "--name", "tester"]) == 0
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    bob = RNS.Identity()
+    conn = init_channel_db(node.config.channels_db_path)
+    try:
+        join_channel(conn, "general")
+        parent = create_message(
+            conn, bob, "general", "meet at the park", name="bob", now=1000
+        )
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # A reply schedules with its parent's hash attached, so it
+        # publishes as a reply, not a top-level message.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/schedule",
+            method="POST",
+            body={
+                "channel": "general",
+                "text": "see you there",
+                "send_in": 3600,
+                "reply_to": parent["hash"],
+            },
+        )
+        assert status == 200
+        assert payload["scheduled"]["reply_to"] == parent["hash"]
+
+        # A unique prefix resolves to the same full hash.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/schedule",
+            method="POST",
+            body={
+                "channel": "general",
+                "text": "me too",
+                "send_in": 60,
+                "reply_to": parent["hash"][:8],
+            },
+        )
+        assert status == 200
+        assert payload["scheduled"]["reply_to"] == parent["hash"]
+
+        # An unknown parent is a bad request, not a queued message
+        # that fails every publish attempt.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/schedule",
+            method="POST",
+            body={
+                "channel": "general",
+                "text": "nowhere",
+                "send_in": 60,
+                "reply_to": "00" * 32,
+            },
+        )
+        assert status == 400
+        assert "unknown message" in payload["error"]["message"]
+
+        # A poll cannot carry a reply.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/schedule",
+            method="POST",
+            body={
+                "channel": "general",
+                "text": "which day?",
+                "send_in": 60,
+                "poll_options": ["Saturday", "Sunday"],
+                "reply_to": parent["hash"],
+            },
+        )
+        assert status == 400
+        assert "cannot carry a reply" in payload["error"]["message"]
+
+        # A reply cannot carry a location pin or a contact card: the
+        # publish pass would fail every attempt on such an entry.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/schedule",
+            method="POST",
+            body={
+                "channel": "general",
+                "text": "agreed",
+                "send_in": 60,
+                "reply_to": parent["hash"],
+                "location": {"lat": 34.05, "lon": -83.88},
+            },
+        )
+        assert status == 400
+        assert "cannot carry a location" in payload["error"]["message"]
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/schedule",
+            method="POST",
+            body={
+                "channel": "general",
+                "text": "agreed",
+                "send_in": 60,
+                "reply_to": parent["hash"],
+                "contact": {"name": "carol", "destination_hash": "cc" * 16},
+            },
+        )
+        assert status == 400
+        assert "cannot carry a contact card" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
 def test_channel_schedule_poll_via_api(tmp_path):
     from tau.channels import init_db as init_channel_db, join_channel
     from tau.config import TauConfig

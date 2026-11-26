@@ -74,7 +74,11 @@ export interface UseChannelsResult {
   leave: (channel: string) => Promise<void>;
   pinConversation: (channel: string, pinned?: boolean) => Promise<void>;
   send: (text: string, replyTo?: string) => Promise<ChannelMessage>;
-  schedule: (text: string, sendIn: number) => Promise<ScheduledChannelMessage>;
+  schedule: (
+    text: string,
+    sendIn: number,
+    replyTo?: string,
+  ) => Promise<ScheduledChannelMessage>;
   schedulePoll: (
     question: string,
     options: string[],
@@ -262,9 +266,9 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
       await refreshMessages(selected);
       return sent;
     },
-    schedule: async (text, sendIn) => {
+    schedule: async (text, sendIn, replyTo) => {
       if (!selected) throw new Error("no channel selected");
-      const entry = await scheduleChannelMessage(selected, text, sendIn);
+      const entry = await scheduleChannelMessage(selected, text, sendIn, replyTo);
       await refreshMessages(selected);
       return entry;
     },

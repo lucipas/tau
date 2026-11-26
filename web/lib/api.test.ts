@@ -515,6 +515,19 @@ describe("POST endpoints", () => {
     expect(bodyOf(0)).toEqual({ channel: "general", text: "later", send_in: 300 });
   });
 
+  it("schedules a channel reply with its parent hash", async () => {
+    nextJson = { ok: true, scheduled: {} };
+    await scheduleChannelMessage("general", "agreed", 300, "ab".repeat(32));
+    expect(captured[0].url).toBe("/api/channels/schedule");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({
+      channel: "general",
+      text: "agreed",
+      send_in: 300,
+      reply_to: "ab".repeat(32),
+    });
+  });
+
   it("schedules a channel poll with its options", async () => {
     nextJson = { ok: true, scheduled: {} };
     await scheduleChannelPoll("general", "which day?", ["Saturday", "Sunday"], 300);

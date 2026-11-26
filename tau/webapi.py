@@ -262,7 +262,7 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/channels/join  join a channel (``{"channel": "<name>"}``)
     POST /api/channels/leave leave a channel (``{"channel": "<name>"}``)
     POST /api/channels/send  send a message to a joined channel (``{"channel", "text", "reply_to"?, "expires_in"?, "location"?, "contact"?}``; ``expires_in`` seconds, at most 30d; ``location`` is ``{"lat", "lon", "name"?}`` and is refused on a reply; ``contact`` is ``{"name", "destination_hash"}`` and is refused on a reply)
-    POST /api/channels/schedule  schedule a channel message — or a poll, with ``"poll_options"`` — for later (optional ``"expires_in"`` seconds from publish until it expires)
+    POST /api/channels/schedule  schedule a channel message — or a poll, with ``"poll_options"`` — for later (optional ``"expires_in"`` seconds from publish until it expires; optional ``"reply_to"`` parent message hash or prefix, refused on a poll)
     GET  /api/channels/scheduled  queued channel messages and polls, soonest first
     POST /api/channels/cancel-scheduled  cancel a queued channel message or poll
     POST /api/channels/edit-scheduled  edit a queued channel message's text/time
@@ -5240,6 +5240,7 @@ class WebBridge:
         location: Optional[Dict[str, Any]] = None,
         contact: Optional[Dict[str, Any]] = None,
         expires_in: Optional[float] = None,
+        reply_to: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Queue a channel message for later, like ``tau channel send --delay``.
 
@@ -5257,14 +5258,24 @@ class WebBridge:
         carry one either.  An *expires_in* makes the queued message a
         disappearing one, seconds from publish until it expires, like
         an immediate send's ``expires_in`` — and a poll can carry one.
+        A *reply_to* makes the queued message a reply, like an
+        immediate send's ``reply_to``: a hash or unique prefix of the
+        parent message, resolved here against the channel store, so
+        an unknown or ambiguous parent is refused up front; a poll
+        cannot carry one.
         """
-        from .channels import clean_channel_name, is_member
+        from .channels import clean_channel_name, is_member, resolve_message_digest
         from .scheduled_channel import schedule_channel_message, schedule_channel_poll
 
         name = clean_channel_name(channel)
         conn = self._channel_conn()
         try:
             member = is_member(conn, name)
+            resolved_reply_to: Optional[str] = None
+            if member and reply_to is not None:
+                if not isinstance(reply_to, str):
+                    raise ValueError("field 'reply_to' must be a message hash")
+                resolved_reply_to = resolve_message_digest(conn, name, reply_to)
         finally:
             conn.close()
         if not member:
@@ -5275,6 +5286,8 @@ class WebBridge:
                 raise ValueError("a scheduled poll cannot carry a location")
             if contact is not None:
                 raise ValueError("a scheduled poll cannot carry a contact card")
+            if resolved_reply_to is not None:
+                raise ValueError("a scheduled poll cannot carry a reply")
             entry = schedule_channel_poll(
                 config.scheduled_channel_messages_path,
                 channel=name,
@@ -5286,6 +5299,11 @@ class WebBridge:
                 disappearing_path=config.disappearing_path,
             )
             return entry.to_dict()
+        if resolved_reply_to is not None:
+            if location is not None:
+                raise ValueError("a scheduled reply cannot carry a location")
+            if contact is not None:
+                raise ValueError("a scheduled reply cannot carry a contact card")
         entry = schedule_channel_message(
             config.scheduled_channel_messages_path,
             channel=name,
@@ -5295,6 +5313,7 @@ class WebBridge:
             location=location,
             contact=self._vet_channel_contact(contact),
             expires_in=expires_in,
+            reply_to=resolved_reply_to,
             disappearing_path=config.disappearing_path,
         )
         return entry.to_dict()
@@ -17892,6 +17911,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                             if expires_in is not None
                             else None
                         ),
+                        reply_to=body.get("reply_to"),
                     )
                 except (ValueError, ProtocolError) as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
