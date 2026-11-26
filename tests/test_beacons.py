@@ -923,9 +923,9 @@ def test_node_channel_beacon_update_posts_with_marker(tmp_path, monkeypatch):
         "expires_at": beacon.expires_at,
         "seq": 1,
     }
-    # Each tick expires with the beacon, so it never lingers in the
-    # channel's 500-message cap after it goes stale.
-    assert kwargs["expires_at"] == beacon.expires_at
+    # Each tick expires once it is stale — two intervals out — so
+    # ticks never pile up against the channel's stored-message cap.
+    assert kwargs["expires_at"] == NOW + 2 * BEACON_UPDATE_INTERVAL
     assert len(published) == 1
     # The fan-out is bounded like the gossip relays, not every
     # registry peer in turn on the mail loop.
