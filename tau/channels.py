@@ -2321,9 +2321,14 @@ def create_message(
         # So is a marker without a pin, or on a reply or a poll:
         # the receive path drops those, so the refusal has to live
         # here for a local send to stay strict.
-        if clean_beacon(beacon) is None:
+        cleaned_beacon = clean_beacon(beacon)
+        if cleaned_beacon is None:
             raise ChannelError(
                 "beacon must have an id, an expiry and a sequence number"
+            )
+        if cleaned_beacon["expires_at"] > timestamp + BEACON_MAX_DURATION:
+            raise ChannelError(
+                "beacon expiry is longer than the maximum beacon duration"
             )
         if (
             clean_location(location) is None
