@@ -7507,6 +7507,17 @@ def _parse_pending_peers(raw: Any) -> List[str]:
     return [str(peer) for peer in peers if peer and str(peer) != "?"]
 
 
+def _attachment_invalid(raw: Any, decode: Any) -> bool:
+    """True when a stored attachment column is present but undecodable.
+
+    SQL NULL means "no attachment"; a non-NULL value that fails to
+    decode is a damaged or hand-edited row, not an absent attachment.
+    Display reads stay tolerant (the attachment reads as None), but
+    the publish path must refuse rather than silently drop it.
+    """
+    return raw is not None and decode(raw) is None
+
+
 def _draft_dict(row: sqlite3.Row) -> Dict[str, Any]:
     return {
         "id": int(row["id"]),
@@ -7516,8 +7527,15 @@ def _draft_dict(row: sqlite3.Row) -> Dict[str, Any]:
             float(row["expires_in"]) if row["expires_in"] is not None else None
         ),
         "image": _decode_image(row["image"]),
+        "image_invalid": _attachment_invalid(row["image"], _decode_image),
         "location": _decode_location(row["location"]),
+        "location_invalid": _attachment_invalid(
+            row["location"], _decode_location
+        ),
         "contact": _decode_contact(row["contact"]),
+        "contact_invalid": _attachment_invalid(
+            row["contact"], _decode_contact
+        ),
         "post_hash": str(row["post_hash"] or ""),
         "pending_peers": _parse_pending_peers(row["pending_peers"]),
         "claimed_at": (

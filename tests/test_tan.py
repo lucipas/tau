@@ -10769,6 +10769,59 @@ def test_drafts_carry_attachments(tmp_path):
         conn.close()
 
 
+def test_drafts_flag_damaged_attachments_but_stay_listable(tmp_path):
+    conn = init_db(tmp_path / "tan.sqlite3")
+    try:
+        image = _image_for(_png_bytes())
+        location = {"lat": 34.05, "lon": -83.88, "name": "Rock Springs Park"}
+        contact = {"name": "carol", "destination_hash": "cc" * 16}
+        draft = save_draft(
+            conn,
+            "with everything",
+            image=image,
+            location=location,
+            contact=contact,
+            now=1000,
+        )
+        assert draft["image_invalid"] is False
+        assert draft["location_invalid"] is False
+        assert draft["contact_invalid"] is False
+
+        # Hand-edit the stored columns into damaged values: not JSON,
+        # a JSON object that fails validation, and a JSON object
+        # missing a required field.
+        with conn:
+            conn.execute(
+                "UPDATE drafts SET image = ? WHERE id = ?",
+                ("not json", draft["id"]),
+            )
+            conn.execute(
+                "UPDATE drafts SET location = ? WHERE id = ?",
+                (json.dumps({"lat": 91.0, "lon": 0.0}), draft["id"]),
+            )
+            conn.execute(
+                "UPDATE drafts SET contact = ? WHERE id = ?",
+                (json.dumps({"name": "carol"}), draft["id"]),
+            )
+        damaged = get_draft(conn, draft["id"])
+        assert damaged["image"] is None
+        assert damaged["image_invalid"] is True
+        assert damaged["location"] is None
+        assert damaged["location_invalid"] is True
+        assert damaged["contact"] is None
+        assert damaged["contact_invalid"] is True
+        # Display reads stay tolerant: the damaged draft still lists.
+        assert [d["id"] for d in list_drafts(conn)] == [draft["id"]]
+
+        # A plain draft's NULL columns are absent, not damaged.
+        plain = save_draft(conn, "plain", now=1001)
+        assert plain["image_invalid"] is False
+        assert plain["location_invalid"] is False
+        assert plain["contact_invalid"] is False
+    finally:
+        conn.close()
+
+
 def test_drafts_cap(tmp_path):
     conn = init_db(tmp_path / "tan.sqlite3")
     try:
@@ -11076,6 +11129,91 @@ def test_cli_tan_publish_draft_refuses_missing_image_bytes(tmp_path, capsys):
         assert [d["id"] for d in list_drafts(conn)] == [draft["id"]]
     finally:
         conn.close()
+
+
+def test_cli_tan_publish_draft_refuses_damaged_attachment(
+    tmp_path, capsys
+):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    capsys.readouterr()
+    _seed_tan_contact_peer(data_dir)
+    photo = tmp_path / "photo.png"
+    photo.write_bytes(_png_bytes())
+    assert (
+        main(
+            [
+                "tan",
+                "draft",
+                "--data-dir",
+                str(data_dir),
+                "--image",
+                str(photo),
+                "--location",
+                "34.05,-83.88 Rock Springs Park",
+                "--contact",
+                "carol",
+                "--json",
+                "with everything",
+            ]
+        )
+        == 0
+    )
+    draft = json.loads(capsys.readouterr().out)["draft"]
+    # Damage one stored attachment column at a time, exactly as a
+    # hand-edited store would: each publish must refuse and keep the
+    # draft instead of signing a post without that attachment.
+    damaged = (
+        ("image", "not json"),
+        ("location", json.dumps({"lat": 91.0, "lon": 0.0})),
+        ("contact", json.dumps({"name": "carol"})),
+    )
+    for column, bad_value in damaged:
+        conn = init_db(data_dir / "tan.sqlite3")
+        try:
+            with conn:
+                conn.execute(
+                    f"UPDATE drafts SET {column} = ? WHERE id = ?",
+                    (bad_value, draft["id"]),
+                )
+        finally:
+            conn.close()
+        assert (
+            main(
+                [
+                    "tan",
+                    "publish-draft",
+                    "--data-dir",
+                    str(data_dir),
+                    "--no-publish",
+                    str(draft["id"]),
+                ]
+            )
+            == 1
+        )
+        err = capsys.readouterr().err
+        assert "kept" in err
+        assert "unusable" in err
+        assert column in err
+        conn = init_db(data_dir / "tan.sqlite3")
+        try:
+            assert [d["id"] for d in list_drafts(conn)] == [draft["id"]]
+        finally:
+            conn.close()
+        # Restore the column so the next iteration damages only its
+        # own attachment.
+        conn = init_db(data_dir / "tan.sqlite3")
+        try:
+            with conn:
+                conn.execute(
+                    f"UPDATE drafts SET {column} = ? WHERE id = ?",
+                    (
+                        json.dumps(draft[column]),
+                        draft["id"],
+                    ),
+                )
+        finally:
+            conn.close()
 
 
 def test_cli_tan_draft_expiry_starts_at_publish(tmp_path, capsys):
