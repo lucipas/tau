@@ -7685,6 +7685,26 @@ def _publish_draft_claimed(
         str(draft["expires_in"]) if draft["expires_in"] is not None else None
     )
     args.delay = None
+    # A stored attachment that fails to decode is damaged, not
+    # absent: refuse to publish rather than sign a post without it.
+    # The draft dict still reads the attachment as None so display
+    # stays tolerant of damaged rows; only the publish path refuses.
+    invalid = [
+        name
+        for name, flag in (
+            ("image", draft.get("image_invalid")),
+            ("location", draft.get("location_invalid")),
+            ("contact", draft.get("contact_invalid")),
+        )
+        if flag
+    ]
+    if invalid:
+        print(
+            f"error: draft {draft['id']} kept — its stored attachment is "
+            f"unusable: {', '.join(invalid)} attachment(s) failed to decode",
+            file=sys.stderr,
+        )
+        return _EXIT_ERROR
     # A draft's stored attachments ride into the post: hand the
     # validated descriptors to cmd_tan_post, which takes them the same
     # way it takes --image/--location/--contact.  A hand-edited store
