@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -3167,6 +3168,80 @@ def test_unvote_after_close_via_sync_does_not_withdraw(identities, tmp_path):
         "closed": True,
         "voted": 0,
     }
+
+
+def test_unvote_racing_close_is_refused(identities, tmp_path, monkeypatch):
+    alice, bob = identities
+    path = tmp_path / "tan.sqlite3"
+    conn = init_db(path)
+    poll = create_poll(
+        conn, alice, "which day?", ["Thursday", "Friday"],
+        name="alice", now=1000,
+    )
+    create_vote(conn, bob, poll["hash"], 0, name="bob", now=1001)
+    conn_close = init_db(path)
+
+    real_chain_write = tan_module._chain_write
+    closed = {"done": False}
+
+    @contextmanager
+    def _chain_write_with_close(inner_conn):
+        if not closed["done"]:
+            closed["done"] = True
+            # The close commits while the unvote waits for the write
+            # lock. Its timestamp is later than the unvote's, so a
+            # pre-lock closed check would miss it and the unvote
+            # would withdraw a vote from the frozen tally.
+            create_close_poll(
+                conn_close, alice, poll["hash"], name="alice", now=1004
+            )
+        with real_chain_write(inner_conn):
+            yield
+
+    monkeypatch.setattr(tan_module, "_chain_write", _chain_write_with_close)
+    with pytest.raises(TanError, match="poll is closed"):
+        create_unvote(conn, bob, poll["hash"], name="bob", now=1003)
+    assert closed["done"] is True
+    result = poll_results(conn, poll["hash"])
+    assert result["counts"] == [1, 0]
+    assert result["total"] == 1
+    assert result["voters"][0]["option"] == 0
+
+
+def test_vote_racing_close_is_refused(identities, tmp_path, monkeypatch):
+    alice, bob = identities
+    path = tmp_path / "tan.sqlite3"
+    conn = init_db(path)
+    poll = create_poll(
+        conn, alice, "which day?", ["Thursday", "Friday"],
+        name="alice", now=1000,
+    )
+    conn_close = init_db(path)
+
+    real_chain_write = tan_module._chain_write
+    closed = {"done": False}
+
+    @contextmanager
+    def _chain_write_with_close(inner_conn):
+        if not closed["done"]:
+            closed["done"] = True
+            # The close commits while the vote waits for the write
+            # lock. Its timestamp is later than the vote's, so a
+            # pre-lock closed check would miss it and the vote would
+            # land in the frozen tally.
+            create_close_poll(
+                conn_close, alice, poll["hash"], name="alice", now=1004
+            )
+        with real_chain_write(inner_conn):
+            yield
+
+    monkeypatch.setattr(tan_module, "_chain_write", _chain_write_with_close)
+    with pytest.raises(TanError, match="poll is closed"):
+        create_vote(conn, bob, poll["hash"], 0, name="bob", now=1003)
+    assert closed["done"] is True
+    result = poll_results(conn, poll["hash"])
+    assert result["counts"] == [0, 0]
+    assert result["total"] == 0
 
 
 def test_unvote_entry_is_textless_and_targeted(identities, tmp_path):

@@ -2673,8 +2673,6 @@ def create_vote(
         raise TanError("poll has been deleted")
     if is_expired(existing, now=timestamp):
         raise TanError("poll has expired")
-    if is_poll_closed(conn, existing):
-        raise TanError("poll is closed")
     options = _decode_options(existing.get("options")) or []
     if not isinstance(option, int) or isinstance(option, bool):
         raise TanError("vote option must be an option index")
@@ -2683,6 +2681,12 @@ def create_vote(
     # The head read and the append must be one atomic step: see
     # _chain_write — two writers racing this window would fork the chain.
     with _chain_write(conn):
+        # Checked under the write lock so a concurrent close that
+        # committed first is seen here rather than appended after it:
+        # a vote stamped no later than the close would otherwise land
+        # in the frozen tally.
+        if is_poll_closed(conn, existing):
+            raise TanError("poll is closed")
         prev = previous
         if prev is None:
             prev = head(conn, author) or ""
@@ -2752,8 +2756,10 @@ def create_unvote(
     # The head read and the append must be one atomic step: see
     # _chain_write — two writers racing this window would fork the chain.
     with _chain_write(conn):
-        # Checked under the write lock so a close that committed after
-        # the checks above but before this point is seen here.
+        # Checked under the write lock so a concurrent close that
+        # committed first is seen here rather than appended after it:
+        # an unvote stamped no later than the close would otherwise
+        # withdraw a vote from the frozen tally.
         if is_poll_closed(conn, existing):
             raise TanError("poll is closed")
         prev = previous
