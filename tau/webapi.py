@@ -14417,10 +14417,15 @@ class _WebHandler(BaseHTTPRequestHandler):
         except ValueError:
             return False
         if peer_ip in self.bridge.trusted_proxies:
-            forwarded = self.headers.get("X-Forwarded-For")
-            if forwarded is None:
+            # A proxy may append a new X-Forwarded-For field rather than
+            # extending the first one, so the hop it appended is the last
+            # value of the last field, in wire order.
+            fields = self.headers.get_all("X-Forwarded-For") or []
+            if not fields:
                 return False
-            client = forwarded.split(",")[-1].strip()
+            client = fields[-1].split(",")[-1].strip()
+            if not client:
+                return False
             return _is_loopback_client(client)
         return _is_loopback_client(peer)
 
