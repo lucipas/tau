@@ -842,12 +842,12 @@ it("schedules a Tan repost or quote with kind and target_post", async () => {
   it("saves a Tan draft by image descriptor when the bytes were not fetched", async () => {
     nextJson = { ok: true, draft: { id: 1 } };
     const draft = await saveTanDraft("with everything", {
-      image: { sha256: "ab".repeat(32) },
+      image: { sha256: "ab".repeat(32), name: "pic.png" },
     });
     expect(captured[0].url).toBe("/api/tan/drafts");
     expect(bodyOf(0)).toEqual({
       text: "with everything",
-      image: { sha256: "ab".repeat(32) },
+      image: { sha256: "ab".repeat(32), name: "pic.png" },
     });
     expect(draft).toEqual({ id: 1 });
   });
@@ -855,12 +855,12 @@ it("schedules a Tan repost or quote with kind and target_post", async () => {
   it("publishes a Tan post by image descriptor", async () => {
     nextJson = { ok: true, post: {} };
     await publishTanPost("at the park", {
-      image: { sha256: "ab".repeat(32) },
+      image: { sha256: "ab".repeat(32), name: "pic.png" },
     });
     expect(captured[0].url).toBe("/api/tan/posts");
     expect(bodyOf(0)).toEqual({
       text: "at the park",
-      image: { sha256: "ab".repeat(32) },
+      image: { sha256: "ab".repeat(32), name: "pic.png" },
     });
   });
 

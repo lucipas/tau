@@ -742,7 +742,7 @@ describe("SocialSection", () => {
     expect(saves).toHaveLength(1);
     expect(JSON.parse(String(saves[0][1]?.body))).toEqual({
       text: "with everything",
-      image: { sha256: "ab".repeat(32) },
+      image: { sha256: "ab".repeat(32), name: "pic.png" },
       location: { lat: 34.05, lon: -83.88, name: "Rock Springs Park" },
       contact: { name: "carol", destination_hash: "cc".repeat(16) },
     });
