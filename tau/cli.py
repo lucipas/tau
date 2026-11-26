@@ -2537,7 +2537,7 @@ def build_parser() -> argparse.ArgumentParser:
     beacon_start = beacon_sub.add_parser(
         "start",
         parents=[common],
-        help="start sharing live location with a peer, group, or broadcast list",
+        help="start sharing live location with a peer, group, broadcast list, or channel",
     )
     beacon_start_target = beacon_start.add_mutually_exclusive_group(required=True)
     beacon_start_target.add_argument(
@@ -2555,6 +2555,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--broadcast",
         metavar="LIST",
         help="broadcast list name: share with every member as a private DM each",
+    )
+    beacon_start_target.add_argument(
+        "--channel",
+        metavar="CHANNEL",
+        help="channel name: share with the room as a channel message",
     )
     beacon_start.add_argument(
         "--location",
@@ -2592,7 +2597,7 @@ def build_parser() -> argparse.ArgumentParser:
     beacon_stop = beacon_sub.add_parser(
         "stop",
         parents=[common],
-        help="stop sharing live location with a peer, group, or broadcast list",
+        help="stop sharing live location with a peer, group, broadcast list, or channel",
     )
     beacon_stop_target = beacon_stop.add_mutually_exclusive_group(required=True)
     beacon_stop_target.add_argument(
@@ -2610,6 +2615,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--broadcast",
         metavar="LIST",
         help="broadcast list name",
+    )
+    beacon_stop_target.add_argument(
+        "--channel",
+        metavar="CHANNEL",
+        help="channel name",
     )
     beacon_stop.set_defaults(func=cmd_beacon_stop)
 
@@ -2634,6 +2644,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--broadcast",
         metavar="LIST",
         help="broadcast list name",
+    )
+    beacon_update_target.add_argument(
+        "--channel",
+        metavar="CHANNEL",
+        help="channel name",
     )
     beacon_update.add_argument(
         "--location",
@@ -15492,6 +15507,7 @@ def _beacon_start_local(
     target: str,
     group: bool = False,
     broadcast: bool = False,
+    channel: bool = False,
     location: Dict[str, Any],
     location_file: Optional[str] = None,
     coarse: bool = False,
@@ -15501,7 +15517,7 @@ def _beacon_start_local(
     """Start a beacon on the running node, for the local send server.
 
     Starts the beacon and sends its first update at once, so the
-    peer, group, or broadcast list hears from the sender
+    peer, group, broadcast list, or channel hears from the sender
     immediately instead of at the next mail-loop round.  Later
     updates go out from the mail loop, which re-reads the beacons
     file each round.
@@ -15511,6 +15527,7 @@ def _beacon_start_local(
         location,
         group=bool(group),
         broadcast=bool(broadcast),
+        channel=bool(channel),
         coarse=bool(coarse),
         duration=float(duration),
         interval=float(interval),
@@ -20699,9 +20716,9 @@ def _beacon_target(config: TauConfig, args: argparse.Namespace) -> Tuple[str, st
 
     Local-only, like the mute command: a peer resolves from the
     inbox and registry, a group from the group store, a broadcast
-    list from the broadcast store.  Starting a beacon resolves on
-    the node instead, with discovery, so a peer never seen before
-    can still get one.
+    list from the broadcast store, a channel from its cleaned name.
+    Starting a beacon resolves on the node instead, with discovery,
+    so a peer never seen before can still get one.
     """
     if getattr(args, "group", None) is not None:
         store = GroupStore(config.groups_path)
@@ -20727,6 +20744,17 @@ def _beacon_target(config: TauConfig, args: argparse.Namespace) -> Tuple[str, st
             "broadcast",
             f"broadcast list {broadcast['name']}",
         )
+    if getattr(args, "channel", None) is not None:
+        # A channel left since start still names its beacon: the
+        # cleaned name is the beacon key, so stopping never needs
+        # membership — only starting does.
+        from .channels import ChannelError, clean_channel_name
+
+        try:
+            name = clean_channel_name(args.channel)
+        except ChannelError as exc:
+            raise NodeError(str(exc)) from exc
+        return name, "channel", f"channel #{name}"
     inbox = Inbox(config.inbox_path)
     registry = PeerRegistry(config.peers_path)
     key = _resolve_inbox_peer(inbox, registry, args.peer, direction=None)
@@ -20766,6 +20794,8 @@ def _beacon_line(beacon: Any, now: Optional[float] = None) -> str:
         if beacon.target_kind == "group"
         else "broadcast list"
         if beacon.target_kind == "broadcast"
+        else "channel"
+        if beacon.target_kind == "channel"
         else "peer"
     )
     place = location_default_text(beacon.location)
@@ -20838,7 +20868,16 @@ def cmd_beacon_start(args: argparse.Namespace) -> int:
         )
     is_group = getattr(args, "group", None) is not None
     is_broadcast = getattr(args, "broadcast", None) is not None
-    target = args.broadcast if is_broadcast else args.group if is_group else args.peer
+    is_channel = getattr(args, "channel", None) is not None
+    target = (
+        args.broadcast
+        if is_broadcast
+        else args.group
+        if is_group
+        else args.channel
+        if is_channel
+        else args.peer
+    )
     coarse = bool(getattr(args, "coarse", False))
     # A serving node owns the data directory: start through it instead
     # of starting a second Reticulum instance on the same identity.
@@ -20851,6 +20890,7 @@ def cmd_beacon_start(args: argparse.Namespace) -> int:
             target=target,
             group=is_group,
             broadcast=is_broadcast,
+            channel=is_channel,
             location=location,
             location_file=location_file,
             coarse=coarse,
@@ -20868,6 +20908,7 @@ def cmd_beacon_start(args: argparse.Namespace) -> int:
                 location,
                 group=is_group,
                 broadcast=is_broadcast,
+                channel=is_channel,
                 coarse=coarse,
                 duration=duration,
                 interval=interval,
@@ -20888,6 +20929,8 @@ def cmd_beacon_start(args: argparse.Namespace) -> int:
         if summary.get("target_kind") == "group"
         else "broadcast list"
         if summary.get("target_kind") == "broadcast"
+        else "channel"
+        if summary.get("target_kind") == "channel"
         else "peer"
     )
     outcome = (
@@ -20925,6 +20968,7 @@ def cmd_beacon_stop(args: argparse.Namespace) -> int:
                         "target": key,
                         "group": kind == "group",
                         "broadcast": kind == "broadcast",
+                        "channel": kind == "channel",
                         "stopped": False,
                     },
                     True,
@@ -20940,6 +20984,7 @@ def cmd_beacon_stop(args: argparse.Namespace) -> int:
                 "target": key,
                 "group": kind == "group",
                 "broadcast": kind == "broadcast",
+                "channel": kind == "channel",
                 "stopped": True,
                 "beacon": summary,
             },
@@ -20981,6 +21026,7 @@ def cmd_beacon_update(args: argparse.Namespace) -> int:
                 "target": key,
                 "group": kind == "group",
                 "broadcast": kind == "broadcast",
+                "channel": kind == "channel",
                 "beacon": summary,
             },
             True,

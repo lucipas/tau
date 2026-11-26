@@ -190,6 +190,7 @@ class FakeNode:
             blocklist_path=data_dir / "blocklist.json",
             ignored_groups_path=data_dir / "ignored-groups.json",
             beacons_path=data_dir / "beacons.json",
+            channels_db_path=data_dir / "channels.sqlite3",
             files_dir=data_dir / "files",
         )
         self._allowlist = AllowList()
@@ -459,6 +460,7 @@ class FakeNode:
         *,
         group=False,
         broadcast=False,
+        channel=False,
         coarse=False,
         duration=BEACON_DEFAULT_DURATION,
         interval=BEACON_UPDATE_INTERVAL,
@@ -489,6 +491,25 @@ class FakeNode:
             target_kind = "broadcast"
             target_name = record["name"]
             target_id = record["id"]
+        elif channel:
+            from tau.channels import ChannelError, clean_channel_name, init_db, is_member
+
+            try:
+                name = clean_channel_name(target)
+            except ChannelError as exc:
+                raise NodeError(str(exc)) from exc
+            conn = init_db(self.config.channels_db_path)
+            try:
+                member = is_member(conn, name)
+            finally:
+                conn.close()
+            if not member:
+                raise NodeError(
+                    f"not a member of channel {name!r}; join it first"
+                )
+            target_hash = name
+            target_kind = "channel"
+            target_name = name
         else:
             peer = self.resolve_peer(
                 target,
@@ -539,6 +560,21 @@ class FakeNode:
             result = self.send_group_message(
                 record, text, location=location, beacon=marker, kind="location"
             )
+        elif beacon.target_kind == "channel":
+            # No gossip in the fake: the update is stored in the
+            # channel's own history, which is what the console reads.
+            from tau.channels import ChannelApp
+
+            app = ChannelApp(
+                self.config, self.identity, name=getattr(self, "name", None)
+            )
+            message = app.send(
+                beacon.target, text, location=location, beacon=marker
+            )
+            result = {
+                "message": message,
+                "published": {"delivered": 0, "peers": 0, "errors": []},
+            }
         elif beacon.target_kind == "broadcast":
             try:
                 if beacon.target_id:
@@ -18868,6 +18904,63 @@ def test_beacon_start_records_one_entry_per_member_for_a_broadcast(
     assert entries[0].get("group") is None
     assert entries[0]["location"] == {"lat": 34.05, "lon": -83.88}
     assert entries[0]["sent_at"] == 1000.0
+
+
+def test_beacon_start_posts_the_update_into_the_channel(bridge, node):
+    from tau.channels import init_db, join_channel
+
+    conn = init_db(node.config.channels_db_path)
+    try:
+        join_channel(conn, "mesh-meetup")
+    finally:
+        conn.close()
+    status, _, payload = _json(
+        bridge,
+        "/api/beacons/start",
+        method="POST",
+        body={
+            "channel": "mesh-meetup",
+            "lat": 34.05,
+            "lon": -83.88,
+            "name": "Rock Springs Park",
+            "duration_seconds": 900,
+        },
+    )
+    assert status == 200
+    beacon = payload["beacon"]
+    assert beacon["target_kind"] == "channel"
+    assert beacon["target"] == "mesh-meetup"
+    # The update is a channel message with the pin and the marker —
+    # and nothing is recorded in the DM threads: the channel's own
+    # history is where the update lives.
+    status, _, history = _json(
+        bridge, "/api/channels/messages?channel=mesh-meetup"
+    )
+    assert status == 200
+    assert len(history["messages"]) == 1
+    entry = history["messages"][0]
+    assert entry["text"] == "Rock Springs Park"
+    assert entry["location"] == BEACON_PIN
+    assert entry["beacon"] == {
+        "id": beacon["id"],
+        "expires_at": beacon["expires_at"],
+        "seq": 1,
+    }
+    status, _, listed = _json(bridge, "/api/messages")
+    assert [m for m in listed["messages"] if m.get("beacon")] == []
+    # A channel this node has not joined refuses the beacon.
+    status, _, payload = _json(
+        bridge,
+        "/api/beacons/start",
+        method="POST",
+        body={
+            "channel": "other-room",
+            "lat": 34.05,
+            "lon": -83.88,
+            "duration_seconds": 900,
+        },
+    )
+    assert status == 502
 
 
 def test_beacon_start_rejects_bad_requests(bridge, node):

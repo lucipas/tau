@@ -820,3 +820,120 @@ def test_stop_broadcast_beacons_stops_active(tmp_path):
     assert stop_broadcast_beacons(config.beacons_path, "family") == 0
     # No beacons file at all means none running.
     assert stop_broadcast_beacons(tmp_path / "missing.json", "family") == 0
+
+
+# -- channel beacons (issue #827) --------------------------------------------
+
+
+def test_beacons_start_channel_validates_name():
+    beacons = Beacons()
+    beacon = beacons.start(
+        target="  Mesh-Meetup  ", target_kind="channel", location=PIN, now=NOW
+    )
+    assert beacon.target == "Mesh-Meetup"
+    assert beacon.target_kind == "channel"
+    with pytest.raises(BeaconsError):
+        beacons.start(
+            target="has space", target_kind="channel", location=PIN, now=NOW
+        )
+    with pytest.raises(BeaconsError):
+        beacons.start(target="", target_kind="channel", location=PIN, now=NOW)
+    with pytest.raises(BeaconsError):
+        beacons.start(target="x", target_kind="party", location=PIN, now=NOW)
+
+
+def _make_channel_node(tmp_path):
+    import types
+
+    from tau.channels import init_db, join_channel
+
+    node = make_node(tmp_path)
+    identity = RNS.Identity()
+    node.identity = identity
+    own_hash = RNS.Destination.hash(identity, APP_NAME, ASPECT).hex()
+    # A bare destination stand-in: only the hexhash is consulted, and
+    # building a live RNS destination needs a running Reticulum.
+    node.destination = types.SimpleNamespace(hexhash=own_hash)
+    conn = init_db(node.config.channels_db_path)
+    try:
+        join_channel(conn, "mesh-meetup")
+    finally:
+        conn.close()
+    return node, own_hash
+
+
+def test_node_start_beacon_channel_resolves_joined(tmp_path):
+    node, own_hash = _make_channel_node(tmp_path)
+    beacon = node.start_beacon("mesh-meetup", PIN, channel=True, now=NOW)
+    assert beacon.target == "mesh-meetup"
+    assert beacon.target_kind == "channel"
+    assert beacon.target_name == "mesh-meetup"
+    assert beacon.next_update_at == NOW + BEACON_UPDATE_INTERVAL
+    with pytest.raises(NodeError):
+        node.start_beacon("mesh-meetup", PIN, channel=True, now=NOW + 10)
+    with pytest.raises(NodeError):
+        node.start_beacon("other-room", PIN, channel=True, now=NOW + 10)
+    with pytest.raises(NodeError):
+        node.start_beacon(
+            "mesh-meetup", PIN, group=True, channel=True, now=NOW + 10
+        )
+
+
+def test_node_channel_beacon_update_posts_with_marker(tmp_path, monkeypatch):
+    import tau.channels as channels_mod
+
+    node, own_hash = _make_channel_node(tmp_path)
+    beacon = node.start_beacon("mesh-meetup", PIN, channel=True, now=NOW)
+    calls = []
+    published = []
+
+    class FakeApp:
+        def __init__(self, config, identity, name=None):
+            self.node = None
+
+        def send(self, channel, text, **kwargs):
+            calls.append((channel, text, kwargs))
+            return {
+                "hash": "aa" * 32,
+                "channel": channel,
+                "text": text,
+                "location": kwargs.get("location"),
+                "beacon": kwargs.get("beacon"),
+            }
+
+        def publish(self, message, **kwargs):
+            published.append(message)
+            return {"delivered": 1, "peers": 1, "errors": []}
+
+    monkeypatch.setattr(channels_mod, "ChannelApp", FakeApp)
+    result = node.send_beacon_update(beacon, now=NOW)
+    assert len(calls) == 1
+    channel, text, kwargs = calls[0]
+    assert channel == "mesh-meetup"
+    assert text == "Rock Springs Park"
+    assert kwargs["location"] == PIN
+    assert kwargs["beacon"] == {
+        "id": beacon.id,
+        "expires_at": beacon.expires_at,
+        "seq": 1,
+    }
+    assert len(published) == 1
+    assert result["published"] == {"delivered": 1, "peers": 1, "errors": []}
+    assert beacon.updates_sent == 1
+    assert beacon.next_update_at == NOW + BEACON_UPDATE_INTERVAL
+
+
+def test_node_channel_beacon_update_left_channel_fails_tick(tmp_path):
+    from tau.channels import init_db, leave_channel
+
+    node, own_hash = _make_channel_node(tmp_path)
+    beacon = node.start_beacon("mesh-meetup", PIN, channel=True, now=NOW)
+    # Leaving the channel fails the tick instead of posting into a
+    # room this node no longer belongs to.
+    conn = init_db(node.config.channels_db_path)
+    try:
+        leave_channel(conn, "mesh-meetup")
+    finally:
+        conn.close()
+    with pytest.raises(NodeError):
+        node.send_beacon_update(beacon, now=NOW)

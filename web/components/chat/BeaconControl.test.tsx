@@ -174,6 +174,52 @@ describe("BeaconControl", () => {
     expect(onRefresh).toHaveBeenCalled();
   });
 
+  it("starts a channel beacon with the channel name", async () => {
+    const onRefresh = vi.fn();
+    render(
+      <BeaconControl
+        target={{ kind: "channel", key: "mesh-meetup", name: "#mesh-meetup" }}
+        beacons={[]}
+        onRefresh={onRefresh}
+        onError={() => undefined}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /Share live location/ }));
+    expect(screen.getByText(/everyone in the channel/)).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("Latitude"), { target: { value: "34.05" } });
+    fireEvent.change(screen.getByLabelText("Longitude"), { target: { value: "-83.88" } });
+    fireEvent.click(screen.getByText("Start sharing"));
+    await waitFor(() =>
+      expect(mockedStart).toHaveBeenCalledWith(
+        { channel: "mesh-meetup" },
+        expect.objectContaining({ lat: 34.05, lon: -83.88, durationSeconds: 3600 }),
+      ),
+    );
+    expect(onRefresh).toHaveBeenCalled();
+  });
+
+  it("shows the active channel beacon and stops it", async () => {
+    const onRefresh = vi.fn();
+    render(
+      <BeaconControl
+        target={{ kind: "channel", key: "mesh-meetup", name: "#mesh-meetup" }}
+        beacons={[
+          makeBeacon({
+            target: "mesh-meetup",
+            target_kind: "channel",
+            target_name: "mesh-meetup",
+          }),
+        ]}
+        onRefresh={onRefresh}
+        onError={() => undefined}
+      />,
+    );
+    expect(screen.getByText(/Sharing live location with #mesh-meetup/)).toBeTruthy();
+    fireEvent.click(screen.getByText("Stop sharing"));
+    await waitFor(() => expect(mockedStop).toHaveBeenCalledWith("aabbccdd"));
+    await waitFor(() => expect(onRefresh).toHaveBeenCalled());
+  });
+
   it("shows the active broadcast beacon and stops it", async () => {
     const onRefresh = vi.fn();
     render(
