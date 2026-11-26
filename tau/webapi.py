@@ -3976,7 +3976,22 @@ class WebBridge:
         image: Optional[Any] = None,
         location: Optional[Dict[str, Any]] = None,
         contact: Optional[Dict[str, Any]] = None,
+        allow_descriptor: bool = False,
     ) -> Dict[str, Any]:
+        """Publish a Tan post, like ``tau tan post``.
+
+        An *image* data URL carries fresh bytes; a ``{sha256, name}``
+        descriptor re-attaches bytes already pinned in the local media
+        store — a draft image the console could not fetch.  A
+        descriptor is accepted only from the local console
+        (*allow_descriptor*): the drafts listing is readable by any
+        client that can reach the bridge, so a remote caller must not
+        be able to publish a private draft photo by digest alone —
+        draft-only bytes stay private until published.  A remote
+        console publishes by attaching the bytes; a descriptor-only
+        draft keeps its image in the draft and is refused loudly here
+        instead of publishing without it.
+        """
         app = self._tan_app()
         if app is None:
             raise WebBridgeError("the Tan social feed is not enabled; run serve --social")
@@ -3991,6 +4006,12 @@ class WebBridge:
         if contact is not None and reply_to is not None:
             raise ValueError(
                 "a contact card can only be attached to a top-level post, not a reply"
+            )
+        if isinstance(image, dict) and not allow_descriptor:
+            raise ValueError(
+                "an image descriptor can only be published from the local"
+                " console; attach the image bytes to publish from a remote"
+                " console"
             )
         image_attachment: Optional[Dict[str, Any]] = None
         if image is not None:
@@ -4047,6 +4068,7 @@ class WebBridge:
         image: Optional[Any] = None,
         location: Optional[Dict[str, Any]] = None,
         contact: Optional[Dict[str, Any]] = None,
+        allow_descriptor: bool = False,
     ) -> Dict[str, Any]:
         """Queue a Tan post for later, like ``tau tan post --delay``.
 
@@ -4059,7 +4081,11 @@ class WebBridge:
         store at schedule time — and rides the queue entry until the
         publish pass attaches it; a ``{sha256, name}`` descriptor
         re-attaches bytes already pinned there instead (a draft image
-        the console could not fetch).  A *location* pin rides the queue
+        the console could not fetch).  Like :meth:`tan_post`, a
+        descriptor is accepted only from the local console
+        (*allow_descriptor*): scheduling publishes the bytes later,
+        so a remote caller must not be able to queue a private draft
+        photo by digest alone.  A *location* pin rides the queue
         entry itself the same way, and the publish pass attaches it.
         A *contact* card rides the queue entry itself the same way,
         and the publish pass attaches it.
@@ -4155,6 +4181,12 @@ class WebBridge:
                 target_post = resolve_post(conn, target_post)["hash"]
             finally:
                 conn.close()
+        if isinstance(image, dict) and not allow_descriptor:
+            raise ValueError(
+                "an image descriptor can only be scheduled from the local"
+                " console; attach the image bytes to schedule from a remote"
+                " console"
+            )
         image_attachment: Optional[Dict[str, Any]] = None
         if image is not None:
             from .tangents.tan import image_attachment_from_upload
@@ -4332,7 +4364,11 @@ class WebBridge:
         already pinned there, so a draft whose image the console
         could not fetch (loopback-gated media over a remote address)
         re-saves with its image kept by reference instead of losing
-        it.  A *location* pin and a *contact* card ride the draft the
+        it.  Unlike :meth:`tan_post` and :meth:`tan_schedule_post`,
+        a descriptor here needs no loopback gate: re-saving a draft
+        never publishes its bytes, so it cannot leak a private draft
+        photo — the publish and schedule gates are what keep
+        draft-only bytes private.  A *location* pin and a *contact* card ride the draft the
         same way they ride a post.  All three are refused on a reply
         draft, like on a post, and the card is vetted against the
         sharing policy now, like :meth:`tan_post` vets it; the publish
@@ -16941,6 +16977,12 @@ class _WebHandler(BaseHTTPRequestHandler):
                         image=image,
                         location=location,
                         contact=contact,
+                        # A descriptor re-attaches a private draft
+                        # photo by digest: only the local console may
+                        # publish one (see tan_post).
+                        allow_descriptor=_is_loopback_client(
+                            self.client_address[0]
+                        ),
                     )
                 except (ValueError, ProtocolError) as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
@@ -17209,6 +17251,11 @@ class _WebHandler(BaseHTTPRequestHandler):
                         image=image,
                         location=location,
                         contact=contact,
+                        # Scheduling publishes the bytes later, so the
+                        # same local-console rule as tan_post applies.
+                        allow_descriptor=_is_loopback_client(
+                            self.client_address[0]
+                        ),
                     )
                 except (ValueError, ProtocolError) as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)

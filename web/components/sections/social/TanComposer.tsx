@@ -297,7 +297,7 @@ export default function TanComposer({
       contact = attachedContact ?? undefined;
     }
     try {
-      let image: { dataUrl?: string; sha256?: string } | undefined;
+      let image: { dataUrl?: string; sha256?: string; name?: string } | undefined;
       if (file) {
         try {
           image = { dataUrl: await readFileAsDataUrl(file) };
@@ -309,7 +309,9 @@ export default function TanComposer({
       } else if (imageDataUrl?.dataUrl) {
         image = { dataUrl: imageDataUrl.dataUrl };
       } else if (imageDataUrl?.sha256) {
-        image = { sha256: imageDataUrl.sha256 };
+        // The descriptor carries the retained name: the server
+        // requires it to rebuild the attachment.
+        image = { sha256: imageDataUrl.sha256, name: imageDataUrl.name };
       }
       if (sendIn !== undefined) {
         await composer.schedule(text.trim(), sendIn, { replyTo: replyTo ?? undefined, expiresIn, image, location: location ?? undefined, contact });

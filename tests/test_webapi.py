@@ -25179,6 +25179,117 @@ def test_tan_save_draft_reattaches_image_by_descriptor(bridge, node, tmp_path):
     assert status == 400
 
 
+def test_tan_post_descriptor_needs_loopback(tmp_path, monkeypatch):
+    """A descriptor image publishes only from the local console (#822).
+
+    The drafts listing is readable by any client that can reach the
+    bridge, so a remote caller must not be able to publish a private
+    draft photo by digest alone (Qodo Warning on #834): the digest
+    and name are right there in the listing.  The local console may
+    publish and schedule by descriptor; a remote caller gets a 400
+    and must attach the bytes instead.  Re-saving a draft by
+    descriptor stays open to any client: it never publishes bytes.
+    """
+    import base64
+    import hashlib
+
+    import pytest
+    import RNS
+
+    import tau.webapi
+    from tau.config import TauConfig
+    from tau.tangents.tan import (
+        TanApp,
+        image_attachment_from_data_url,
+        init_db,
+        save_draft,
+    )
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+    digest = hashlib.sha256(png).hexdigest()
+    data_url = "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+    conn = init_db(node.config.social_db_path)
+    try:
+        attachment = image_attachment_from_data_url(data_url, tmp_path)
+        save_draft(conn, "draft pic", image=attachment)
+    finally:
+        conn.close()
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        descriptor = {"sha256": digest, "name": "pic.png"}
+        expected = {
+            "sha256": digest,
+            "size": len(png),
+            "mime": "image/png",
+            "name": "pic.png",
+        }
+        # The local console (loopback) may publish by descriptor...
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/posts",
+            method="POST",
+            body={"text": "from home", "image": descriptor},
+        )
+        assert status == 200
+        assert payload["post"]["image"] == expected
+        # ...and schedule by descriptor.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/schedule",
+            method="POST",
+            body={"text": "later", "send_in": 60, "image": descriptor},
+        )
+        assert status == 200
+        assert payload["scheduled"]["image"] == expected
+        # A remote client is refused loudly on both, and must attach
+        # the bytes instead.
+        monkeypatch.setattr(
+            tau.webapi, "_is_loopback_client", lambda client: False
+        )
+        for path, body in [
+            ("/api/tan/posts", {"text": "remote post", "image": descriptor}),
+            (
+                "/api/tan/schedule",
+                {"text": "remote later", "send_in": 60, "image": descriptor},
+            ),
+        ]:
+            status, _, payload = _json(bridge, path, method="POST", body=body)
+            assert status == 400, path
+            assert "local console" in payload["error"]["message"], path
+        # Fresh bytes still publish from anywhere: only the digest
+        # shortcut is gated.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/posts",
+            method="POST",
+            body={"text": "remote bytes", "image": data_url},
+        )
+        assert status == 200
+        # ...and a remote re-save by descriptor still works: it never
+        # publishes the bytes.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/drafts",
+            method="POST",
+            body={"text": "remote re-save", "image": descriptor},
+        )
+        assert status == 200
+        assert payload["draft"]["image"] == expected
+        # The bridge itself defaults to refusing descriptors.
+        with pytest.raises(ValueError, match="local console"):
+            bridge.tan_post("direct", image=descriptor)
+        with pytest.raises(ValueError, match="local console"):
+            bridge.tan_schedule_post("direct", send_in=60, image=descriptor)
+    finally:
+        bridge.stop()
+
+
 def test_tan_media_fetch_accepts_and_validates(bridge, node, tmp_path):
     _with_config(node, tmp_path)
     digest = "ab" * 32
