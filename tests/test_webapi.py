@@ -25239,6 +25239,28 @@ def test_trusted_proxy_forwarded_for_gates_owner_data(bridge, proxied_bridge):
     assert status == 403
 
 
+def test_trusted_proxy_appended_forwarded_field_wins(proxied_bridge):
+    """A visitor's first X-Forwarded-For field cannot spoof loopback.
+
+    The proxy appends a second X-Forwarded-For field instead of
+    extending the first; the last value of the last field is the real
+    client, so a remote visitor stays remote (#821).
+    """
+    import http.client
+
+    conn = http.client.HTTPConnection("127.0.0.1", proxied_bridge.port, timeout=5)
+    try:
+        conn.putrequest("GET", "/api/messages/export")
+        conn.putheader("X-Forwarded-For", "127.0.0.1")
+        conn.putheader("X-Forwarded-For", "203.0.113.7")
+        conn.endheaders()
+        response = conn.getresponse()
+        response.read()
+        assert response.status == 403
+    finally:
+        conn.close()
+
+
 def test_trusted_proxy_draft_media(proxied_bridge, bridge, node, tmp_path):
     """A draft's image stays private behind a trusted proxy (#821).
 
