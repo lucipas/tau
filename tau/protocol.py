@@ -1937,11 +1937,16 @@ def clean_beacon(value: Any) -> Optional[Dict[str, Any]]:
     ):
         return None
     expires_at = value.get("expires_at")
-    if (
-        isinstance(expires_at, bool)
-        or not isinstance(expires_at, (int, float))
-        or not math.isfinite(float(expires_at))
-    ):
+    if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
+        return None
+    try:
+        expires_at = float(expires_at)
+    except (OverflowError, ValueError):
+        # A 401-digit integer overflows float(): a remote peer must
+        # not be able to abort the channel post handler before
+        # signature verification with an oversized expiry.
+        return None
+    if not math.isfinite(expires_at):
         return None
     seq = value.get("seq")
     if (
@@ -1952,7 +1957,7 @@ def clean_beacon(value: Any) -> Optional[Dict[str, Any]]:
         return None
     return {
         "id": beacon_id,
-        "expires_at": float(expires_at),
+        "expires_at": expires_at,
         "seq": seq,
     }
 

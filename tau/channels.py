@@ -648,22 +648,19 @@ def _normalize_message(mesg: Dict[str, Any], *, now: Optional[float] = None) -> 
     # serves the update as an ordinary location pin and there is no
     # interop break.  A malformed marker drops instead of breaking
     # the message — the pin still reads — exactly like a malformed
-    # ``location`` drops.  A marker without a pin is refused: a
-    # beacon update must carry a location, and it belongs on a plain
-    # top-level message like the pin it rides with.
+    # ``location`` drops.  A marker on a message without a pin, or
+    # on a reply or a poll, drops the same way: the marker is
+    # unsigned, so refusing the message would let any relay censor
+    # someone else's valid signed message by appending a marker.
+    # The strict refusal lives in ``create_message`` instead — a
+    # local send never silently drops one.
     cleaned_beacon = clean_beacon(mesg.get("beacon"))
-    if cleaned_beacon is not None:
-        if cleaned_location is None:
-            raise ChannelError(
-                "a beacon update must carry a location pin"
-            )
-        if reply_to or any(
-            mesg.get(field) is not None for field in POLL_FIELDS
-        ):
-            raise ChannelError(
-                "a beacon update can only be attached to a "
-                "top-level message, not a reply or a poll"
-            )
+    if cleaned_beacon is not None and (
+        cleaned_location is None
+        or reply_to
+        or any(mesg.get(field) is not None for field in POLL_FIELDS)
+    ):
+        cleaned_beacon = None
 
     message = {
         "v": CHANNEL_VERSION,
@@ -2316,9 +2313,26 @@ def create_message(
     if beacon is not None:
         # A malformed marker is refused on a local send — see
         # _normalize_message, which drops one on receipt instead.
+        # So is a marker without a pin, or on a reply or a poll:
+        # the receive path drops those, so the refusal has to live
+        # here for a local send to stay strict.
         if clean_beacon(beacon) is None:
             raise ChannelError(
                 "beacon must have an id, an expiry and a sequence number"
+            )
+        if location is None:
+            raise ChannelError(
+                "a beacon update must carry a location pin"
+            )
+        if (
+            reply_to is not None
+            or poll_options is not None
+            or poll_vote is not None
+            or poll_close is not None
+        ):
+            raise ChannelError(
+                "a beacon update can only be attached to a "
+                "top-level message, not a reply or a poll"
             )
         body["beacon"] = beacon
     normalized = _normalize_message(body, now=timestamp)

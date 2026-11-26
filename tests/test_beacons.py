@@ -61,6 +61,9 @@ def test_clean_beacon_rejects_malformed_markers():
     assert clean_beacon({"id": "a", "expires_at": NOW + 3600, "seq": 0}) is None
     assert clean_beacon({"id": "a", "expires_at": NOW + 3600, "seq": 1.5}) is None
     assert clean_beacon({"id": "a", "expires_at": NOW + 3600, "seq": True}) is None
+    # A 401-digit integer overflows float(): it must drop, not abort
+    # the channel post handler before signature verification.
+    assert clean_beacon({"id": "a", "expires_at": 10**400, "seq": 1}) is None
     assert clean_beacon("beacon") is None
 
 
@@ -886,10 +889,12 @@ def test_node_channel_beacon_update_posts_with_marker(tmp_path, monkeypatch):
     beacon = node.start_beacon("mesh-meetup", PIN, channel=True, now=NOW)
     calls = []
     published = []
+    publish_kwargs = []
 
     class FakeApp:
         def __init__(self, config, identity, name=None):
             self.node = None
+            self.gossip_fanout = channels_mod.GOSSIP_FANOUT
 
         def send(self, channel, text, **kwargs):
             calls.append((channel, text, kwargs))
@@ -903,6 +908,7 @@ def test_node_channel_beacon_update_posts_with_marker(tmp_path, monkeypatch):
 
         def publish(self, message, **kwargs):
             published.append(message)
+            publish_kwargs.append(kwargs)
             return {"delivered": 1, "peers": 1, "errors": []}
 
     monkeypatch.setattr(channels_mod, "ChannelApp", FakeApp)
@@ -917,8 +923,75 @@ def test_node_channel_beacon_update_posts_with_marker(tmp_path, monkeypatch):
         "expires_at": beacon.expires_at,
         "seq": 1,
     }
+    # Each tick expires with the beacon, so it never lingers in the
+    # channel's 500-message cap after it goes stale.
+    assert kwargs["expires_at"] == beacon.expires_at
     assert len(published) == 1
+    # The fan-out is bounded like the gossip relays, not every
+    # registry peer in turn on the mail loop.
+    assert publish_kwargs[0].get("fanout") == channels_mod.GOSSIP_FANOUT
     assert result["published"] == {"delivered": 1, "peers": 1, "errors": []}
+    assert beacon.updates_sent == 1
+    assert beacon.next_update_at == NOW + BEACON_UPDATE_INTERVAL
+
+
+def test_node_channel_beacon_update_all_peers_fail_stays_due(
+    tmp_path, monkeypatch
+):
+    import tau.channels as channels_mod
+
+    node, own_hash = _make_channel_node(tmp_path)
+    beacon = node.start_beacon("mesh-meetup", PIN, channel=True, now=NOW)
+
+    class FakeApp:
+        def __init__(self, config, identity, name=None):
+            self.node = None
+            self.gossip_fanout = channels_mod.GOSSIP_FANOUT
+
+        def send(self, channel, text, **kwargs):
+            return {"hash": "aa" * 32, "channel": channel, "text": text}
+
+        def publish(self, message, **kwargs):
+            return {
+                "delivered": 0,
+                "peers": 2,
+                "errors": [
+                    {"peer": "aa" * 32, "error": "timeout"},
+                    {"peer": "bb" * 32, "error": "timeout"},
+                ],
+            }
+
+    monkeypatch.setattr(channels_mod, "ChannelApp", FakeApp)
+    # The tick is overdue: a failed tick must leave it due, not push
+    # the next update a full interval out.
+    beacon.next_update_at = NOW - 60
+    with pytest.raises(NodeError):
+        node.send_beacon_update(beacon, now=NOW)
+    # The schedule does not advance: the next round retries this
+    # tick instead of silently dropping a round of live location.
+    assert beacon.updates_sent == 0
+    assert beacon.next_update_at == NOW - 60
+
+
+def test_node_channel_beacon_update_no_peers_advances(tmp_path, monkeypatch):
+    import tau.channels as channels_mod
+
+    node, own_hash = _make_channel_node(tmp_path)
+    beacon = node.start_beacon("mesh-meetup", PIN, channel=True, now=NOW)
+
+    class FakeApp:
+        def __init__(self, config, identity, name=None):
+            self.node = None
+            self.gossip_fanout = channels_mod.GOSSIP_FANOUT
+
+        def send(self, channel, text, **kwargs):
+            return {"hash": "aa" * 32, "channel": channel, "text": text}
+
+        def publish(self, message, **kwargs):
+            return {"delivered": 0, "peers": 0, "errors": []}
+
+    monkeypatch.setattr(channels_mod, "ChannelApp", FakeApp)
+    node.send_beacon_update(beacon, now=NOW)
     assert beacon.updates_sent == 1
     assert beacon.next_update_at == NOW + BEACON_UPDATE_INTERVAL
 

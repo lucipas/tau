@@ -240,6 +240,67 @@ def test_malformed_beacon_marker_drops_on_receipt(identities, tmp_path):
     assert record["location"] == BEACON_PIN
 
 
+def test_oversized_beacon_expiry_drops_on_receipt(identities, tmp_path):
+    # A 401-digit expires_at overflows float(): the marker drops
+    # instead of aborting the channel post handler before signature
+    # verification.
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    scratch = init_db(tmp_path / "scratch.sqlite3")
+    message = create_message(
+        scratch, alice, "general", "Rock Springs Park",
+        name="alice", now=1000, location=BEACON_PIN,
+    )
+    damaged = dict(
+        message,
+        beacon={"id": "aabbccdd", "expires_at": 10**400, "seq": 1},
+    )
+    record, is_new = store_message(conn, damaged)
+    assert is_new is True
+    assert "beacon" not in record
+    assert record["location"] == BEACON_PIN
+
+
+def test_stray_beacon_marker_drops_on_receipt(identities, tmp_path):
+    # A valid marker on a message without a pin drops on receipt:
+    # the marker is unsigned, so refusing the message would let any
+    # relay censor someone else's valid signed message by appending
+    # one.  A local send still refuses it (see create_message).
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    scratch = init_db(tmp_path / "scratch.sqlite3")
+    message = create_message(
+        scratch, alice, "general", "hello", name="alice", now=1000,
+    )
+    damaged = dict(message, beacon=BEACON_MARKER)
+    record, is_new = store_message(conn, damaged)
+    assert is_new is True
+    assert "beacon" not in record
+    assert record["text"] == "hello"
+
+
+def test_beacon_marker_on_reply_drops_on_receipt(identities, tmp_path):
+    # A reply carries no pin, so a marker appended to one drops on
+    # receipt instead of refusing the reply.
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    scratch = init_db(tmp_path / "scratch.sqlite3")
+    parent = create_message(
+        scratch, alice, "general", "hello", name="alice", now=1000,
+    )
+    reply = create_message(
+        scratch, alice, "general", "on my way",
+        name="alice", now=1001, reply_to=parent["hash"],
+    )
+    store_message(conn, parent)
+    damaged = dict(reply, beacon=BEACON_MARKER)
+    record, is_new = store_message(conn, damaged)
+    assert is_new is True
+    assert "beacon" not in record
+    assert record["reply_to"] == parent["hash"]
+    assert record["text"] == "on my way"
+
+
 def test_init_db_adds_beacon_column_to_old_stores(tmp_path):
     import sqlite3
 

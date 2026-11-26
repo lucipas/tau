@@ -12185,14 +12185,34 @@ class TauNode:
             app.node = self
         try:
             message = app.send(
-                beacon.target, text, location=location, beacon=marker
+                beacon.target,
+                text,
+                location=location,
+                beacon=marker,
+                # Each tick expires with the beacon itself: without
+                # an expiry every tick stays stored until pruning,
+                # and a long beacon evicts the room's real history
+                # from the 500-message per-channel cap.
+                expires_at=marker["expires_at"],
             )
         except ChannelError as exc:
             raise NodeError(str(exc)) from exc
         try:
-            published = app.publish(message)
+            # Bound the fan-out like the gossip relays: an unbounded
+            # publish walks every registry peer in turn, 15 s each,
+            # on the mail loop.
+            published = app.publish(message, fanout=app.gossip_fanout)
         except ChannelError as exc:
             raise NodeError(str(exc)) from exc
+        if published.get("peers", 0) > 0 and published.get("delivered", 0) == 0:
+            # Peers were attempted but none received the update: the
+            # tick stays due instead of advancing the schedule, so
+            # the next round retries it rather than silently
+            # dropping a round of live location.
+            raise NodeError(
+                "channel beacon update reached no peers "
+                f"({published.get('peers')} attempted)"
+            )
         return {"message": message, "published": published}
 
     def send_beacon_update(
