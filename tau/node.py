@@ -10616,13 +10616,15 @@ class TauNode:
             # recalling the node's own hash would succeed and register
             # the node as its own peer — the circular loop behind #618.
             raise NodeError("cannot resolve this node as a peer")
-        deadline = time.time() + max(0.0, timeout)
+        # Monotonic, so a backward wall-clock step cannot stretch the
+        # wait past the caller's budget.
+        deadline = time.monotonic() + max(0.0, timeout)
         try:
             RNS.Transport.request_path(dest_hash)
         except Exception:  # pragma: no cover - network dependent
             log.debug("Path request failed", exc_info=True)
 
-        while time.time() < deadline:
+        while time.monotonic() < deadline:
             peer = self.registry.get(dest_hash)
             if peer is not None:
                 return peer
