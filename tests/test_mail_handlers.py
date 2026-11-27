@@ -7911,6 +7911,53 @@ def test_retired_group_poll_close_pending_edit_keeps_canonical_text_when_relayed
     assert close_record["edited_at"] == 3000.0
 
 
+def test_canonical_edit_text_fails_closed_when_retired_lookup_fails(tmp_path):
+    """A failed retired-group lookup must not read as "not retired":
+    when get_retired() raises, the canonical text is kept instead
+    of letting the edit's arbitrary text through."""
+    node, author, author_hash, _third, group_id, members = (
+        _retired_poll_setup(tmp_path)
+    )
+    close = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "closed the poll",
+            message_id="retired-close-1",
+            group_id=group_id,
+            group_name="weekend",
+            creator=author_hash,
+            members=members,
+            sent_at=2000.0,
+            poll_close={"author": author_hash, "sent_at": 1000.0},
+        ),
+        remote_identity=author,
+    )
+    assert close["ok"] is True
+    history = node.inbox.list_messages(
+        limit=None, group=group_id, direction=None
+    )
+    close_record = next(
+        record for record in history if record.get("poll_close") is not None
+    )
+    assert close_record["text"] == "closed the poll"
+    retired = node.groups.get_retired(group_id)
+    assert retired is not None
+    # Sanity: the lookup succeeding still canonicalizes.
+    assert (
+        node._canonical_edit_text(retired, author_hash, close_record)
+        == "closed the poll"
+    )
+
+    def _failing_lookup(group_id):
+        raise RuntimeError("retired store unavailable")
+
+    node.groups.get_retired = _failing_lookup
+    assert (
+        node._canonical_edit_text(retired, author_hash, close_record)
+        == "closed the poll"
+    )
+
+
 def test_retired_group_ordinary_message_still_refused(tmp_path):
     """The narrow receipt path is for closes only: an ordinary post
     under a retired id is still refused, and nothing is stored."""

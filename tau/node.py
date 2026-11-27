@@ -6388,12 +6388,14 @@ class TauNode:
         sanitized to the canonical text on receipt, and an edit —
         live, or pending against a copy that had not landed yet —
         cannot replace it, or the retired-group refusal is bypassed
-        by editing the close afterward.  Returns the canonical text
-        when the record is a non-creator member's vote or close in
-        an announcements-only group, or a poll close under a retired
-        group id, else None (the edit applies normally).  Ordinary
-        messages keep their edits, including ones sent before the
-        restriction.
+        by editing the close afterward.  A failed retired-group
+        lookup fails closed: it keeps the canonical text rather
+        than reading as "not retired" and letting the edit through.
+        Returns the canonical text when the record is a non-creator
+        member's vote or close in an announcements-only group, or a
+        poll close under a retired group id, else None (the edit
+        applies normally).  Ordinary messages keep their edits,
+        including ones sent before the restriction.
         """
         if record.get("poll_close") is not None:
             group_id = record.get("group")
@@ -6405,7 +6407,9 @@ class TauNode:
                     try:
                         retired = get_retired(group_id)
                     except Exception:
-                        retired = None
+                        # Unknown, not "not retired": fail closed
+                        # and keep the canonical text.
+                        return "closed the poll"
                     if retired is not None:
                         return "closed the poll"
         if not (group or {}).get("announcements_only"):
