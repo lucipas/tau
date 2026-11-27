@@ -50,6 +50,10 @@ except ImportError:  # pragma: no cover - POSIX
     msvcrt = None  # type: ignore[assignment]
 
 POLL_CLOSES_FILE_MODE = 0o600
+# A close pass shares the 20-second budget of the scheduled-post
+# publish pass (``PUBLISH_PASS_BUDGET_SECONDS``): one mail-loop pass
+# must never wait out an unbounded sweep of blocking sends.
+CLOSE_PASS_BUDGET_SECONDS = 20.0
 # A close deadline shares the 7-day horizon of the other Tan
 # scheduling caps (``MAX_TAN_POST_EXPIRY``, ``MAX_SCHEDULED_POST_DELAY``):
 # a poll cannot be asked to close itself further out than it could be
@@ -197,25 +201,90 @@ def due_poll_closes(
     return due
 
 
+def _close_record(app: Any, target: str) -> Dict[str, Any]:
+    """The signed close entry for *target*, created or re-found.
+
+    A pass that already wrote the close but reached no peer re-sends
+    the stored entry: creating a second close would raise (a poll is
+    closed at most once) and wrongly drop the schedule as terminal.
+    Apps without ``get_poll_close`` (older fakes) go straight to
+    creating, as before.
+    """
+    existing = getattr(app, "get_poll_close", None)
+    if existing is not None:
+        record = existing(target)
+        if record is not None:
+            return record
+    return app.close_poll(target, publish=False)
+
+
+def _publish_close(
+    app: Any,
+    record: Dict[str, Any],
+    *,
+    should_stop: Optional[Any] = None,
+    deadline: Optional[float] = None,
+) -> str:
+    """Publish a signed close; ``"closed"``, ``"kept"`` or ``"paused"``.
+
+    The close is sent with the gossip fanout, the pass deadline and
+    the stop callback, so one slow peer cannot stall the mail loop.
+    ``"closed"`` when at least one peer took it — gossip and feed
+    sync carry it to the rest — or when there is no node to publish
+    from (the close is stored locally, as a manual ``close_poll``
+    with no node does).  ``"kept"`` when no peer took it: the
+    schedule stays for a later pass, which re-sends the same signed
+    record.  ``"paused"`` when the pass budget or stop ended the send
+    mid-way: the pass stops, and the unattempted peers stay queued
+    with the schedule.
+    """
+    if getattr(app, "node", None) is None or not hasattr(app, "publish"):
+        return "closed"
+    result = app.publish(
+        record,
+        fanout=getattr(app, "gossip_fanout", None),
+        should_stop=should_stop,
+        deadline=deadline,
+    )
+    if not isinstance(result, dict):
+        return "closed"
+    if result.get("unsent"):
+        return "paused"
+    peers = result.get("peers") or 0
+    delivered = result.get("delivered") or 0
+    if peers > 0 and delivered == 0:
+        return "kept"
+    return "closed"
+
+
 def close_due_polls(
     path: Union[str, Path],
     app: Any,
     *,
     now: Optional[float] = None,
+    should_stop: Optional[Any] = None,
+    deadline: Optional[float] = None,
 ) -> Dict[str, int]:
     """Close every poll whose scheduled deadline has come, via *app*.
 
-    Each close goes through ``app.close_poll(target, publish=True)`` —
-    the same path a manual ``tau tan close-poll`` uses, so the
-    in-lock recheck still decides a race with a manual close and the
-    close entry gossips to every peer that holds the poll.  A close
-    that fails because the poll is already closed, deleted, expired
-    or unknown is terminal: the schedule is dropped, not retried.  Any
-    other failure keeps the schedule for the next pass.  A corrupt
-    schedule file logs a warning and closes nothing, so one bad file
-    cannot stall the mail loop that calls this.
+    Each close is created through ``app.close_poll(target,
+    publish=False)`` — the same path a manual ``tau tan close-poll``
+    uses, so the in-lock recheck still decides a race with a manual
+    close — and then published with the gossip fanout, the pass
+    deadline and the stop callback.  The pass is bounded: it stops
+    starting new closes once *deadline* (a ``time.monotonic`` value,
+    defaulting to ``CLOSE_PASS_BUDGET_SECONDS`` from now) passes or
+    *should_stop* (the node's stop event) is set, leaving the rest
+    due for a later pass.  A close that fails because the poll is
+    already closed, deleted, expired or unknown is terminal: the
+    schedule is dropped, not retried.  A close that reached no peer
+    keeps its schedule — the next pass re-sends the same signed close
+    record instead of creating a second one.  Any other failure keeps
+    the schedule for the next pass.  A corrupt schedule file logs a
+    warning and closes nothing, so one bad file cannot stall the
+    mail loop that calls this.
 
-    Returns ``{\"closed\": n, \"dropped\": m, \"kept\": k}``.
+    Returns ``{"closed": n, "dropped": m, "kept": k}``.
     """
     # Lazy import: this module stays importable without Reticulum, the
     # same reason scheduled_posts imports its Tan helpers lazily.
@@ -226,18 +295,27 @@ def close_due_polls(
     except PollClosesError as exc:
         log.warning("Poll closes at %s are unusable (%s); skipping", path, exc)
         return {"closed": 0, "dropped": 0, "kept": 0}
+    if deadline is None:
+        deadline = time.monotonic() + CLOSE_PASS_BUDGET_SECONDS
     closed = 0
     dropped = 0
     kept = 0
-    for target, _close_at in due:
+    for index, (target, _close_at) in enumerate(due):
+        if should_stop is not None and should_stop():
+            kept += len(due) - index
+            break
+        if time.monotonic() > deadline:
+            kept += len(due) - index
+            break
         try:
-            app.close_poll(target, publish=True)
+            record = _close_record(app, target)
         except TanError as exc:
             # Terminal: the poll is already closed, deleted, expired
             # or unknown — nothing a later pass could close.
             log.info("Dropping scheduled close for %s: %s", target, exc)
             drop_poll_close(path, target)
             dropped += 1
+            continue
         except Exception:  # noqa: BLE001 - a failed close retries
             log.warning(
                 "Scheduled close for %s failed; keeping it queued",
@@ -245,7 +323,31 @@ def close_due_polls(
                 exc_info=True,
             )
             kept += 1
-        else:
-            drop_poll_close(path, target)
-            closed += 1
+            continue
+        try:
+            outcome = _publish_close(
+                app, record, should_stop=should_stop, deadline=deadline
+            )
+        except Exception:  # noqa: BLE001 - a failed publish retries
+            log.warning(
+                "Scheduled close for %s failed to publish; keeping it queued",
+                target,
+                exc_info=True,
+            )
+            kept += 1
+            continue
+        if outcome == "paused":
+            # The send stopped mid-way (stop or budget): end the pass
+            # here, with this close and the rest still scheduled.
+            kept += len(due) - index
+            break
+        if outcome == "kept":
+            log.warning(
+                "Scheduled close for %s reached no peer; keeping it queued",
+                target,
+            )
+            kept += 1
+            continue
+        drop_poll_close(path, target)
+        closed += 1
     return {"closed": closed, "dropped": dropped, "kept": kept}
