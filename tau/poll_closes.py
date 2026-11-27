@@ -428,7 +428,12 @@ def close_due_polls(
                 target,
                 exc_info=True,
             )
-            _record_close_failure(path, target, time.time())
+            # Stamped in the pass's own clock frame (``at``), not the
+            # wall clock: ``due_poll_closes`` reads backoff against
+            # the same ``now``, so a failure stamped in another frame
+            # would never become due again under it.  In production
+            # ``at`` is time.time() sampled at pass start.
+            _record_close_failure(path, target, at)
             kept += 1
             continue
         if record is None:
@@ -451,7 +456,7 @@ def close_due_polls(
                 target,
                 exc_info=True,
             )
-            _record_close_failure(path, target, time.time())
+            _record_close_failure(path, target, at)
             kept += 1
             continue
         if outcome == "paused":
@@ -464,7 +469,7 @@ def close_due_polls(
                 "Scheduled close for %s reached no peer; keeping it queued",
                 target,
             )
-            _record_close_failure(path, target, time.time())
+            _record_close_failure(path, target, at)
             kept += 1
             continue
         drop_poll_close(path, target)

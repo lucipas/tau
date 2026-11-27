@@ -4527,6 +4527,10 @@ class WebBridge:
         record = app.create_poll(
             question, options, publish=False, expires_at=expires_at
         )
+        # The close deadline and any schedule error are local state
+        # for the API caller: peers get the signed record as created,
+        # never the annotated copy (Qodo review of #847).
+        signed = record
         if close_after is not None:
             # The close deadline counts from the poll's signed creation
             # time, not from when publication returns, and it registers
@@ -4565,7 +4569,7 @@ class WebBridge:
                 else:
                     record = {**record, "close_at": close_at}
         if app.node is not None:
-            app.publish(record)
+            app.publish(signed)
         return record
 
     def tan_repost(self, target: str) -> Dict[str, Any]:

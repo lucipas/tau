@@ -15123,8 +15123,10 @@ class TauNode:
         if RNS.Transport.has_path(dest_hash):
             return
         RNS.Transport.request_path(dest_hash)
-        deadline = time.time() + timeout
-        while time.time() < deadline:
+        # Monotonic, like wait_for_peer: a backward wall-clock step
+        # must not stretch the wait past the caller's budget.
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
             if RNS.Transport.has_path(dest_hash):
                 return
             time.sleep(0.1)
