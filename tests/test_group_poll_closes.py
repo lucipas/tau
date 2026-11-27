@@ -73,9 +73,15 @@ def _close_record(*, author=OWN_HASH, sent_at=1000.0):
 class _FakeGroups:
     def __init__(self, groups=None):
         self._groups = groups or {}
+        self._retired_groups = {}
 
     def find(self, group_id):
         return self._groups.get(group_id)
+
+    def get_retired(self, group_id):
+        # Mirror GroupStore.get_retired: the retained record of a
+        # retired group, for closes addressed to a rotated roster.
+        return self._retired_groups.get(group_id)
 
 
 class _FakeNode:
@@ -629,7 +635,7 @@ def test_close_sends_to_the_retired_original_roster(tmp_path):
     path = tmp_path / "group-poll-closes.json"
     schedule_group_poll_close(path, GROUP_ID, OWN_HASH, 1000.0, 2000.0, now=1000.0)
     node = _FakeNode(tmp_path, group=False)
-    node.groups._retired[GROUP_ID] = {
+    node.groups._retired_groups[GROUP_ID] = {
         "id": GROUP_ID,
         "name": "weekend",
         "creator": OWN_HASH,
