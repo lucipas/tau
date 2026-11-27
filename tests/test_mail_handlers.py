@@ -7756,6 +7756,161 @@ def test_retired_group_poll_close_strips_a_smuggled_post_when_relayed(tmp_path):
     )
 
 
+def test_retired_group_poll_close_edit_keeps_canonical_text(tmp_path):
+    """A later edit cannot rewrite a retired-group close: the poll
+    author, removed by a roster change but still on the retained
+    roster, passes the edit membership check — so the edit lands,
+    but the stored text stays the canonical close text while the
+    edit's send time still advances the ordering state."""
+    node, author, author_hash, _third, group_id, members = (
+        _retired_poll_setup(tmp_path)
+    )
+    close = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "closed the poll",
+            message_id="retired-close-1",
+            group_id=group_id,
+            group_name="weekend",
+            creator=author_hash,
+            members=members,
+            sent_at=2000.0,
+            poll_close={"author": author_hash, "sent_at": 1000.0},
+        ),
+        remote_identity=author,
+    )
+    assert close["ok"] is True
+    seen = []
+    node.on_edit = seen.append
+    response = call_handler(
+        node._handle_dm_edit,
+        signed_edit(
+            author,
+            "retired-close-1",
+            "still here — edited",
+            "retired-close-edit-1",
+            sent_at=3000.0,
+            group=group_id,
+            target_author=author_hash,
+            target_sent_at=2000.0,
+        ),
+        remote_identity=author,
+    )
+    assert response["ok"] is True
+    assert response["edited"] is True
+    history = node.inbox.list_messages(
+        limit=None, group=group_id, direction=None
+    )
+    close_record = next(
+        record for record in history if record.get("poll_close") is not None
+    )
+    assert close_record["text"] == "closed the poll"
+    assert close_record["edited_at"] == 3000.0
+    assert len(seen) == 1
+    assert seen[0]["text"] == "closed the poll"
+
+
+def test_retired_group_poll_close_pending_edit_keeps_canonical_text(tmp_path):
+    """An edit planted before the close arrives cannot smuggle a
+    post in through the pending-edit path either: the close lands
+    already canonical, not with the pending text."""
+    node, author, author_hash, _third, group_id, members = (
+        _retired_poll_setup(tmp_path)
+    )
+    edit = call_handler(
+        node._handle_dm_edit,
+        signed_edit(
+            author,
+            "retired-close-1",
+            "still here — edited early",
+            "retired-close-edit-1",
+            sent_at=3000.0,
+            group=group_id,
+            target_author=author_hash,
+            target_sent_at=2000.0,
+        ),
+        remote_identity=author,
+    )
+    assert edit["ok"] is True
+    assert edit["edited"] is False
+    assert edit["group_edit"] is True
+    close = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "closed the poll",
+            message_id="retired-close-1",
+            group_id=group_id,
+            group_name="weekend",
+            creator=author_hash,
+            members=members,
+            sent_at=2000.0,
+            poll_close={"author": author_hash, "sent_at": 1000.0},
+        ),
+        remote_identity=author,
+    )
+    assert close["ok"] is True
+    history = node.inbox.list_messages(
+        limit=None, group=group_id, direction=None
+    )
+    close_record = next(
+        record for record in history if record.get("poll_close") is not None
+    )
+    assert close_record["text"] == "closed the poll"
+    assert close_record["edited_at"] == 3000.0
+
+
+def test_retired_group_poll_close_pending_edit_keeps_canonical_text_when_relayed(
+    tmp_path,
+):
+    """Same pending-edit rule on the relayed path: a close that
+    reaches the holder inside a sealed envelope lands canonical,
+    not with the pending edit's text."""
+    node, author, author_hash, _third, group_id, members = (
+        _retired_poll_setup(tmp_path)
+    )
+    edit = call_handler(
+        node._handle_dm_edit,
+        signed_edit(
+            author,
+            "retired-close-relayed-1",
+            "still here — edited early",
+            "retired-close-edit-1",
+            sent_at=3000.0,
+            group=group_id,
+            target_author=author_hash,
+            target_sent_at=2000.0,
+        ),
+        remote_identity=author,
+    )
+    assert edit["ok"] is True
+    assert edit["edited"] is False
+    node.identity = RNS.Identity()
+    blob = seal_message(
+        author,
+        sender_name="alice",
+        recipient_public_key=node.identity.get_public_key(),
+        message_id="retired-close-relayed-1",
+        text="closed the poll",
+        sent_at=2000.0,
+        group={
+            "id": group_id,
+            "name": "weekend",
+            "creator": author_hash,
+            "members": members,
+        },
+        poll_close={"author": author_hash, "sent_at": 1000.0},
+    )
+    assert node._deliver_collected(open_message(node.identity, blob)) is True
+    history = node.inbox.list_messages(
+        limit=None, group=group_id, direction=None
+    )
+    close_record = next(
+        record for record in history if record.get("poll_close") is not None
+    )
+    assert close_record["text"] == "closed the poll"
+    assert close_record["edited_at"] == 3000.0
+
+
 def test_retired_group_ordinary_message_still_refused(tmp_path):
     """The narrow receipt path is for closes only: an ordinary post
     under a retired id is still refused, and nothing is stored."""
