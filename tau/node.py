@@ -3559,6 +3559,7 @@ class TauNode:
             message["contact"] = None
             message["beacon"] = None
             message["in_reply_to"] = None
+            message["edited_at"] = None
         if (
             group.get("announcements_only")
             and caller_hash.lower() != (group.get("creator") or "").lower()
@@ -3737,7 +3738,7 @@ class TauNode:
                                 # replace the canonical vote text this
                                 # copy was sanitized to, or the vote
                                 # exemption smuggles a post in.
-                                canonical = self._announcements_edit_text(
+                                canonical = self._canonical_edit_text(
                                     group, caller_hash, record
                                 )
                                 if canonical is not None:
@@ -3794,7 +3795,7 @@ class TauNode:
                         record["edited_at"] = pending["edited_at"]
                         # As in the id branch: an edit of a member's
                         # vote cannot replace the canonical vote text.
-                        canonical = self._announcements_edit_text(
+                        canonical = self._canonical_edit_text(
                             group, caller_hash, record
                         )
                         if canonical is not None:
@@ -5216,14 +5217,15 @@ class TauNode:
             )
         try:
             # An edit of a member's vote in an announcements-only
-            # group cannot replace the canonical vote text with
-            # arbitrary content: substitute the canonical rendering
-            # for the edit's text (see _announcements_edit_text).
-            # The console callback below sends this text too, so the
-            # served copy never shows the smuggled one either.
+            # group — or of a close under a retired group id — cannot
+            # replace the canonical text with arbitrary content:
+            # substitute the canonical rendering for the edit's text
+            # (see _canonical_edit_text).  The console callback below
+            # sends this text too, so the served copy never shows the
+            # smuggled one either.
             edit_text = edit["text"]
             if is_group:
-                canonical = self._announcements_edit_text(
+                canonical = self._canonical_edit_text(
                     pinned, caller_hash, record
                 )
                 if canonical is not None:
@@ -6369,24 +6371,43 @@ class TauNode:
             float(ann_at) if isinstance(ann_at, (int, float)) else None,
         )
 
-    def _announcements_edit_text(
+    def _canonical_edit_text(
         self,
         group: Optional[Dict[str, Any]],
         author_hash: str,
         record: Dict[str, Any],
     ) -> Optional[str]:
-        """Canonical text for an edited vote or close in an announcements-only group.
+        """Canonical text for an edited vote or close whose display text is fixed.
 
         A member's vote or close is not a post, but its display text
         must stay the canonical rendering: an edit of a vote — live,
         or pending against a copy that had not landed yet — cannot
         replace that rendering with arbitrary content, or the vote
-        exemption smuggles a post into the group.  Returns the
-        canonical text when the record is a non-creator member's vote
-        or close in an announcements-only group, else None (the edit
-        applies normally).  Ordinary messages keep their edits,
-        including ones sent before the restriction.
+        exemption smuggles a post into the group.  The same holds
+        for a close stored under a retired group id: the close was
+        sanitized to the canonical text on receipt, and an edit —
+        live, or pending against a copy that had not landed yet —
+        cannot replace it, or the retired-group refusal is bypassed
+        by editing the close afterward.  Returns the canonical text
+        when the record is a non-creator member's vote or close in
+        an announcements-only group, or a poll close under a retired
+        group id, else None (the edit applies normally).  Ordinary
+        messages keep their edits, including ones sent before the
+        restriction.
         """
+        if record.get("poll_close") is not None:
+            group_id = record.get("group")
+            if isinstance(group_id, str) and group_id:
+                get_retired = getattr(
+                    self.groups, "get_retired", None
+                )
+                if get_retired is not None:
+                    try:
+                        retired = get_retired(group_id)
+                    except Exception:
+                        retired = None
+                    if retired is not None:
+                        return "closed the poll"
         if not (group or {}).get("announcements_only"):
             return None
         if (author_hash or "").lower() == (group.get("creator") or "").lower():
@@ -10421,6 +10442,7 @@ class TauNode:
                 message["contact"] = None
                 message["beacon"] = None
                 message["in_reply_to"] = None
+                message["edited_at"] = None
             if (
                 pinned.get("announcements_only")
                 and (sender or "").lower() != (pinned.get("creator") or "").lower()
@@ -10587,7 +10609,7 @@ class TauNode:
                         # As in the direct path: an edit of a
                         # member's vote cannot replace the canonical
                         # vote text.
-                        canonical = self._announcements_edit_text(
+                        canonical = self._canonical_edit_text(
                             pinned,
                             message.get("from")
                             if isinstance(message.get("from"), str)
