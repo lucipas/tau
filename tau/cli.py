@@ -8726,8 +8726,11 @@ def cmd_tan_poll(args: argparse.Namespace) -> int:
             )
             return None
         try:
+            # allow_due: a deadline that passed while the poll was being
+            # stored is kept for the close sweep, which closes it, rather
+            # than publishing a poll with no close registered.
             return schedule_poll_close(
-                config.poll_closes_path, poll["hash"], close_at
+                config.poll_closes_path, poll["hash"], close_at, allow_due=True
             )
         except PollClosesError as exc:
             print(

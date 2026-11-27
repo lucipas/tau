@@ -4551,10 +4551,13 @@ class WebBridge:
                 }
             else:
                 try:
+                    # allow_due: a deadline that passed while the poll was
+                    # being stored is kept for the close sweep to close.
                     close_at = schedule_poll_close(
                         self.node.config.poll_closes_path,
                         record["hash"],
                         close_at,
+                        allow_due=True,
                     )
                 except PollClosesError as exc:
                     log.warning("Could not schedule the poll close: %s", exc)

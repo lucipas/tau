@@ -220,18 +220,22 @@ def schedule_poll_close(
     close_at: float,
     *,
     now: Optional[float] = None,
+    allow_due: bool = False,
 ) -> float:
     """Schedule the close of poll *target* at *close_at*; returns it.
 
     One schedule per poll: scheduling the same poll again replaces
     its deadline.  A deadline that has already passed is refused — a
-    close due now is a manual close, not a schedule.  A fresh
+    close due now is a manual close, not a schedule — unless
+    *allow_due* is set, which the publish paths use for a close whose
+    deadline came due before it could be registered (or whose stored
+    close still needs re-sending): the sweep then closes it.  A fresh
     schedule clears any retry backoff from an earlier one.
     """
     cleaned_target = _clean_target(target)
     cleaned_close_at = _clean_close_at(close_at)
     at = now if now is not None else time.time()
-    if cleaned_close_at <= at:
+    if cleaned_close_at <= at and not allow_due:
         raise PollClosesError("a poll close must be scheduled in the future")
     with poll_closes_lock(path):
         closes = load_poll_closes(path)
@@ -424,7 +428,7 @@ def close_due_polls(
                 target,
                 exc_info=True,
             )
-            _record_close_failure(path, target, at)
+            _record_close_failure(path, target, time.time())
             kept += 1
             continue
         if record is None:
@@ -447,7 +451,7 @@ def close_due_polls(
                 target,
                 exc_info=True,
             )
-            _record_close_failure(path, target, at)
+            _record_close_failure(path, target, time.time())
             kept += 1
             continue
         if outcome == "paused":
@@ -460,7 +464,7 @@ def close_due_polls(
                 "Scheduled close for %s reached no peer; keeping it queued",
                 target,
             )
-            _record_close_failure(path, target, at)
+            _record_close_failure(path, target, time.time())
             kept += 1
             continue
         drop_poll_close(path, target)
