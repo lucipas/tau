@@ -12,7 +12,9 @@ import tau.mailbox as mailbox_module
 from tau.config import TauConfig
 from tau.identity import destination_hash, load_public_key
 from tau.mailbox import (
+    GROUP_POLL_IDENTITY_RETENTION,
     MAX_GROUP_PENDING_EDITS_PER_SENDER,
+    MAX_GROUP_POLL_IDENTITIES_PER_AUTHOR,
     RETRACTED_CLOCK_SKEW_TOLERANCE,
     RETRACTED_RETENTION,
     SENT_RETRACTED_RETENTION,
@@ -2015,6 +2017,76 @@ def test_group_pending_edit_markers_bound_each_sender(tmp_path):
     ]
     assert len(kept) == MAX_GROUP_PENDING_EDITS_PER_SENDER
     assert kept == list(range(5, MAX_GROUP_PENDING_EDITS_PER_SENDER + 5))
+
+
+def test_group_poll_identities_persist_and_expire(tmp_path):
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    author = "aa" * 32
+    group = "cc" * 16
+    assert box.has_group_poll_identity(author, group, 100.0) is False
+
+    recorded_at = time.time()
+    assert box.record_group_poll_identity(author, group, 100.0, now=recorded_at) is True
+    assert box.has_group_poll_identity(author, group, 100.0) is True
+    # Keyed by (author, group, send time): any other triple is
+    # unaffected, and a non-numeric send time never matches.
+    assert box.has_group_poll_identity("bb" * 32, group, 100.0) is False
+    assert box.has_group_poll_identity(author, "dd" * 16, 100.0) is False
+    assert box.has_group_poll_identity(author, group, 101.0) is False
+    assert box.has_group_poll_identity(author, group, "soon") is False
+    assert box.record_group_poll_identity(author, group, "soon") is False
+
+    # The marker survives a reload, and lifts once its retention ends.
+    reloaded = Mailbox(path)
+    assert reloaded.has_group_poll_identity(author, group, 100.0) is True
+    assert (
+        reloaded.has_group_poll_identity(
+            author, group, 100.0,
+            now=recorded_at + GROUP_POLL_IDENTITY_RETENTION - 1,
+        )
+        is True
+    )
+    assert (
+        reloaded.has_group_poll_identity(
+            author, group, 100.0,
+            now=recorded_at + GROUP_POLL_IDENTITY_RETENTION,
+        )
+        is False
+    )
+
+    reloaded.prune(now=recorded_at + GROUP_POLL_IDENTITY_RETENTION)
+    assert reloaded.has_group_poll_identity(author, group, 100.0) is False
+
+
+def test_group_poll_identities_bound_each_author(tmp_path):
+    # One author flooding the pool with polls must not evict another
+    # author's live identities.  Each author is bounded independently,
+    # before the global cap applies.
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    flooder = "aa" * 32
+    victim = "bb" * 32
+    group = "cc" * 16
+    box.record_group_poll_identity(victim, group, 100.0)
+    for index in range(MAX_GROUP_POLL_IDENTITIES_PER_AUTHOR + 5):
+        box.record_group_poll_identity(
+            flooder,
+            f"group-{index}",
+            100.0 + index,
+        )
+    # The victim's identity survives the flood.
+    assert box.has_group_poll_identity(victim, group, 100.0) is True
+    # The flooder keeps only their newest identities, up to their cap.
+    kept = [
+        index
+        for index in range(MAX_GROUP_POLL_IDENTITIES_PER_AUTHOR + 5)
+        if box.has_group_poll_identity(
+            flooder, f"group-{index}", 100.0 + index
+        )
+    ]
+    assert len(kept) == MAX_GROUP_POLL_IDENTITIES_PER_AUTHOR
+    assert kept == list(range(5, MAX_GROUP_POLL_IDENTITIES_PER_AUTHOR + 5))
 
 
 def test_group_pending_edit_markers_drop_malformed_entries():

@@ -8241,3 +8241,67 @@ def test_retired_group_poll_close_lands_once_its_poll_arrives(tmp_path):
         group_poll_tally(history, poll_record, own_hash="ab" * 16)["closed"]
         is True
     )
+
+
+def test_retired_group_poll_close_lands_after_its_poll_is_evicted(tmp_path):
+    """Qodo Warning on PR #854: a genuine close must not defer forever
+    when its poll was received but later evicted from the capped
+    inbox.  The poll's identity is recorded when it lands, so the
+    close still validates — and lands — after the record itself is
+    gone."""
+    node, author, author_hash, _third, group_id, members = (
+        _retired_poll_setup(tmp_path)
+    )
+    # The poll's identity was recorded when it landed.
+    assert node.mailbox.has_group_poll_identity(
+        author_hash, group_id, 1000.0
+    )
+    # Flood the inbox past its retention cap so the poll record is
+    # evicted: 500 filler records in one import, all newer than it.
+    fillers = [
+        {
+            "from": "filler",
+            "destination": "ab" * 16,
+            "text": f"filler {index}",
+            "sent_at": 2000.0 + index,
+            "received_at": 2000.0 + index,
+            "id": f"filler-{index}",
+            "kind": "chat",
+        }
+        for index in range(500)
+    ]
+    result = node.inbox.import_messages(
+        {"format": "tau-messages-export", "version": 1, "messages": fillers}
+    )
+    assert result["imported"] == 500
+    history = node.inbox.list_messages(
+        limit=None, group=group_id, direction=None
+    )
+    assert not any(
+        record.get("poll_options") is not None for record in history
+    )
+    # The close still lands: the durable identity, not the evicted
+    # record, validates it.
+    close = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "closed the poll",
+            message_id="retired-close-1",
+            group_id=group_id,
+            group_name="weekend",
+            creator=author_hash,
+            members=members,
+            sent_at=2000.0,
+            poll_close={"author": author_hash, "sent_at": 1000.0},
+        ),
+        remote_identity=author,
+    )
+    assert close["ok"] is True
+    history = node.inbox.list_messages(
+        limit=None, group=group_id, direction=None
+    )
+    close_record = next(
+        record for record in history if record.get("poll_close") is not None
+    )
+    assert close_record["text"] == "closed the poll"
+    assert node.groups.get_retired(group_id) is not None

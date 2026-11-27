@@ -136,6 +136,21 @@ MAX_ABORTED_LOCAL_EDITS = 1024
 # peer flooding the pool with edits for absent copies must not evict
 # another sender's live markers (see _evict_group_pending_edits).
 MAX_GROUP_PENDING_EDITS_PER_SENDER = 64
+# Group-poll identities (see record_group_poll_identity) are rarer —
+# one per received group poll — so their own smaller cap keeps the
+# same earliest-expiry eviction without sharing the per-message
+# marker budget.
+MAX_GROUP_POLL_IDENTITIES = 1024
+# One author may hold at most this many poll identities: a peer
+# flooding the pool with polls must not evict another author's live
+# identities (see _evict_group_poll_identities).
+MAX_GROUP_POLL_IDENTITIES_PER_AUTHOR = 64
+# A poll identity must outlive both windows a close for that poll can
+# still arrive in: the close may be scheduled up to a week after the
+# poll (see tau.poll_closes.MAX_POLL_CLOSE_AFTER), and its leg may
+# take the 7-day mail TTL to arrive — so the identity lives twice the
+# mail TTL from when it was recorded.
+GROUP_POLL_IDENTITY_RETENTION = 2 * DEFAULT_TTL
 # Sent-message history (for read receipts) and queued receipts waiting
 # on an unreachable sender.  Both are small metadata records, capped
 # like the seen set; sent entries also keep the text so `tau messages
@@ -1387,6 +1402,13 @@ class Mailbox:
         # Only the newest edit per message is kept: an older edit
         # never rewinds a newer marker.
         self._group_pending_edits: Dict[str, Dict[str, Any]] = {}
+        # Group-poll identities (see record_group_poll_identity): the
+        # logical identity — (author, group, shared send time) — of
+        # every group poll this node received, so a retired-group close
+        # arriving after inbox retention evicted the poll record
+        # itself still validates.  Keyed like the group-retraction
+        # markers, with the expiry as the value.
+        self._group_poll_identities: Dict[str, float] = {}
         # Confirmed edits whose local apply is deferred: the delivery
         # was confirmed but the final-sibling check timed out, so the
         # sender's own copies still hold the old text.  The next
@@ -1545,6 +1567,7 @@ class Mailbox:
             self._sent_group_retracted = state["sent_group_retracted"]
             self._retract_cleanup_blocked = state["retract_cleanup_blocked"]
             self._group_pending_edits = state["group_pending_edits"]
+            self._group_poll_identities = state["group_poll_identities"]
             self._pending_local_edits = state["pending_local_edits"]
             self._aborted_local_edits = state["aborted_local_edits"]
             self._sent = state["sent"]
@@ -1710,6 +1733,10 @@ class Mailbox:
         group_pending_edits = _parse_pending_edit_markers(
             raw.get("group_pending_edits")
         )
+        group_poll_identities = _parse_retraction_markers(
+            raw.get("group_poll_identities"),
+            retention=GROUP_POLL_IDENTITY_RETENTION,
+        )
         pending_local_edits = _parse_pending_local_edits(
             raw.get("pending_local_edits")
         )
@@ -1816,6 +1843,7 @@ class Mailbox:
             "sent_group_retracted": sent_group_retracted,
             "retract_cleanup_blocked": retract_cleanup_blocked,
             "group_pending_edits": group_pending_edits,
+            "group_poll_identities": group_poll_identities,
             "pending_local_edits": pending_local_edits,
             "aborted_local_edits": aborted_local_edits,
             "sent": sent,
@@ -1854,6 +1882,7 @@ class Mailbox:
                     key: dict(marker)
                     for key, marker in self._group_pending_edits.items()
                 },
+                "group_poll_identities": dict(self._group_poll_identities),
                 "pending_local_edits": [
                     dict(record) for record in self._pending_local_edits
                 ],
@@ -3473,6 +3502,111 @@ class Mailbox:
                 "edited_at": float(marker["edited_at"]),
             }
 
+    # -- group-poll identities --------------------------------------------
+
+    def record_group_poll_identity(
+        self,
+        author_hash: str,
+        group_id: str,
+        sent_at: float,
+        *,
+        now: Optional[float] = None,
+    ) -> bool:
+        """Remember a received group poll's identity past inbox eviction.
+
+        The marker is keyed by the poll's logical identity — (author,
+        group, shared send time) — the same triple a retired-group
+        close names, so a close arriving after retention evicted the
+        poll record itself still validates (see
+        :meth:`has_group_poll_identity`).  It lives for the possible
+        arrival lifetime of a close for that poll
+        (GROUP_POLL_IDENTITY_RETENTION), like a retraction marker.
+        Recording the same poll again refreshes its expiry: a
+        re-delivered leg means the poll is still in flight, so its
+        closes may still arrive.  Returns False when the identity
+        cannot be formed (a non-hex author or group, or a non-numeric
+        send time).
+        """
+        if not isinstance(author_hash, str) or not isinstance(group_id, str):
+            return False
+        try:
+            key = _group_retraction_key(
+                author_hash.lower(), group_id.lower(), float(sent_at)
+            )
+        except (TypeError, ValueError, OverflowError):
+            return False
+        timestamp = now if now is not None else time.time()
+        with self._transaction():
+            self._group_poll_identities[key] = (
+                timestamp + GROUP_POLL_IDENTITY_RETENTION
+            )
+            self._evict_group_poll_identities(author_hash.lower())
+            self.save()
+            return True
+
+    def _evict_group_poll_identities(self, author_hash: str) -> None:
+        """Keep the poll-identity pool within its caps, author-fairly.
+
+        First the author that just recorded an identity drops its own
+        earliest-expiry identities past its per-author share.  Then
+        the global cap is enforced by evicting the earliest-expiry
+        identity of whichever author holds the most identities, so a
+        flood from one author never displaces another author's live
+        identity.
+
+        Call with the transaction held.
+        """
+        pool = self._group_poll_identities
+
+        def owner(key: str) -> str:
+            return key.partition(":")[0]
+
+        own = [key for key in pool if owner(key) == author_hash]
+        while len(own) > MAX_GROUP_POLL_IDENTITIES_PER_AUTHOR:
+            oldest = min(own, key=lambda key: pool[key])
+            own.remove(oldest)
+            del pool[oldest]
+        while len(pool) > MAX_GROUP_POLL_IDENTITIES:
+            counts: Dict[str, int] = {}
+            for key in pool:
+                counts[owner(key)] = counts.get(owner(key), 0) + 1
+            heaviest = max(counts, key=lambda s: counts[s])
+            oldest = min(
+                (key for key in pool if owner(key) == heaviest),
+                key=lambda key: pool[key],
+            )
+            del pool[oldest]
+
+    def has_group_poll_identity(
+        self,
+        author_hash: str,
+        group_id: str,
+        sent_at: float,
+        *,
+        now: Optional[float] = None,
+    ) -> bool:
+        """True when a live poll-identity marker covers this poll.
+
+        An expired marker reads as absent even before :meth:`prune`
+        sweeps it away; a marker for another author, group, or send
+        time never matches.  A non-numeric send time cannot match a
+        recorded marker.
+        """
+        with self._lock:
+            timestamp = now if now is not None else time.time()
+            if not isinstance(author_hash, str) or not isinstance(
+                group_id, str
+            ):
+                return False
+            try:
+                key = _group_retraction_key(
+                    author_hash.lower(), group_id.lower(), float(sent_at)
+                )
+            except (TypeError, ValueError, OverflowError):
+                return False
+            until = self._group_poll_identities.get(key)
+            return until is not None and timestamp < float(until)
+
     # -- sent-retraction markers -------------------------------------------
 
     def record_sent_retraction(
@@ -3872,6 +4006,13 @@ class Mailbox:
             ]
             for key in dead_group_pending_edits:
                 del self._group_pending_edits[key]
+            dead_group_poll_identities = [
+                key
+                for key, until in self._group_poll_identities.items()
+                if until <= timestamp
+            ]
+            for key in dead_group_poll_identities:
+                del self._group_poll_identities[key]
             dead_aborted_local_edits = [
                 key
                 for key, until in self._aborted_local_edits.items()
@@ -3900,6 +4041,7 @@ class Mailbox:
                 or dead_sent_retracted
                 or dead_sent_group_retracted
                 or dead_group_pending_edits
+                or dead_group_poll_identities
                 or dead_aborted_local_edits
                 or dead_retract_cleanup_blocked
             ):

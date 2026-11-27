@@ -3301,6 +3301,13 @@ class TauNode:
         capped received history with closes for polls that never
         existed.  A history that cannot be read fails closed — the
         close is deferred, not accepted.
+
+        The history scan is not the whole check: a poll this node
+        received can be evicted from the capped inbox before its
+        close arrives, so a durable identity recorded when the poll
+        landed (see :meth:`_record_group_poll_identity`) validates
+        the close as well — a marker that outlives the record it
+        names, like a retraction marker.
         """
         inbox = getattr(self, "inbox", None)
         if inbox is None:
@@ -3320,7 +3327,48 @@ class TauNode:
             if poll_identity(record, self.destination_hexhash) != identity:
                 continue
             return True
-        return False
+        mailbox = getattr(self, "mailbox", None)
+        if mailbox is None:
+            return False
+        has_identity = getattr(mailbox, "has_group_poll_identity", None)
+        if has_identity is None:
+            return False
+        try:
+            return bool(
+                has_identity(sender, group_id, target["sent_at"])
+            )
+        except (OSError, ValueError, TypeError):
+            return False
+
+    def _record_group_poll_identity(
+        self, record: Dict[str, Any], author_hash: str
+    ) -> None:
+        """Remember a received group poll past inbox eviction.
+
+        Called after a poll record lands in history, so a close
+        arriving after retention evicted the record still validates
+        (see :meth:`_has_retired_group_poll`).  Best-effort: the
+        poll itself is already stored, so a mailbox failure is
+        logged, never breaks the delivery.
+        """
+        if not is_group_poll(record):
+            return
+        mailbox = getattr(self, "mailbox", None)
+        if mailbox is None:
+            return
+        record_identity = getattr(
+            mailbox, "record_group_poll_identity", None
+        )
+        if record_identity is None:
+            return
+        try:
+            record_identity(
+                author_hash, record.get("group"), record.get("sent_at")
+            )
+        except (OSError, ValueError, TypeError):
+            log.warning(
+                "Could not record group poll identity", exc_info=True
+            )
 
     def _accept_retired_group_poll_close(
         self,
@@ -3622,7 +3670,7 @@ class TauNode:
             log.info(
                 "Deferring retired-group poll close from %s: its poll "
                 "has not arrived yet for group %s",
-                caller_hash or "anonymous",
+                caller_hash[:8] if caller_hash else "anonymous",
                 group.get("name"),
             )
             return response_error(
@@ -3839,6 +3887,9 @@ class TauNode:
                                 members=set(group.get("members") or []),
                             )
                             self.mailbox.mark_seen(message_id)
+                            self._record_group_poll_identity(
+                                record, caller_hash
+                            )
                 except OSError:
                     log.warning(
                         "Could not authorize group reactions",
@@ -3889,6 +3940,7 @@ class TauNode:
                         if canonical is not None:
                             record["text"] = canonical
                     self._record_received(record)
+                    self._record_group_poll_identity(record, caller_hash)
             if not duplicate:
                 self._notify_message(record, publish_ok=publish_ok)
                 # A message from a member ends their typing in the
@@ -10529,7 +10581,7 @@ class TauNode:
                 log.info(
                     "Deferring relayed retired-group poll close from "
                     "%s: its poll has not arrived yet for group %s",
-                    sender or "unknown",
+                    sender[:8] if sender else "unknown",
                     pinned.get("name"),
                 )
                 raise DeliveryDeferredError(
@@ -10733,6 +10785,12 @@ class TauNode:
                         members=set(pinned.get("members") or []),
                     )
                     self.mailbox.mark_seen(message["id"])
+                    self._record_group_poll_identity(
+                        record,
+                        message.get("from")
+                        if isinstance(message.get("from"), str)
+                        else "",
+                    )
             except OSError as exc:
                 raise DeliveryDeferredError(
                     "could not authorize group reactions for "
