@@ -148,7 +148,10 @@ def test_wait_for_path_uses_monotonic_time_when_wall_clock_steps_back(
     # Qodo #847-6 (Warning): the path wait enforced its timeout with
     # time.time(), so a backward clock step could stretch a bounded
     # wait past the caller's deadline. A backward jump must not
-    # extend it.
+    # extend it. The wait runs on a thread with a join timeout: if
+    # the implementation regressed to a wall-clock deadline, the
+    # backward-stepping fake would stall it forever, and the test
+    # must fail loudly instead of hanging the suite.
     node = make_node(tmp_path)
     dest_hash = bytes(range(16))
     monkeypatch.setattr(
@@ -164,17 +167,32 @@ def test_wait_for_path_uses_monotonic_time_when_wall_clock_steps_back(
         return clock[0]
 
     monkeypatch.setattr(time, "time", _stepping_back)
+    outcome: list = []
+
+    def _wait():
+        try:
+            node._wait_for_path(dest_hash, timeout=0.2)
+        except Exception as exc:  # noqa: BLE001 - captured for the test
+            outcome.append(exc)
+
+    worker = threading.Thread(target=_wait, daemon=True)
     started = time.monotonic()
-    with pytest.raises(NodeError, match="no path to"):
-        node._wait_for_path(dest_hash, timeout=0.2)
+    worker.start()
+    worker.join(timeout=5.0)
+    assert not worker.is_alive(), "path wait stalled past its timeout"
     assert time.monotonic() - started < 5.0
+    assert len(outcome) == 1
+    assert isinstance(outcome[0], NodeError)
+    assert "no path to" in str(outcome[0])
 
 
 def test_wait_for_peer_uses_monotonic_time_when_wall_clock_steps_back(
     tmp_path, monkeypatch
 ):
     # Same clock-step hazard in the announce wait: the discovery
-    # timeout is a bound on the request, not on the wall clock.
+    # timeout is a bound on the request, not on the wall clock. The
+    # wait runs on a thread with a join timeout for the same reason
+    # as the path-wait test above.
     node = make_node(tmp_path)
     identity, own_hash = _make_self_destination()
     node.destination = SimpleNamespace(hash=own_hash, hexhash=own_hash.hex())
@@ -190,10 +208,23 @@ def test_wait_for_peer_uses_monotonic_time_when_wall_clock_steps_back(
         return clock[0]
 
     monkeypatch.setattr(time, "time", _stepping_back)
+    outcome: list = []
+
+    def _wait():
+        try:
+            node.wait_for_peer(dest_hash, timeout=0.2)
+        except Exception as exc:  # noqa: BLE001 - captured for the test
+            outcome.append(exc)
+
+    worker = threading.Thread(target=_wait, daemon=True)
     started = time.monotonic()
-    with pytest.raises(NodeError, match="did not announce"):
-        node.wait_for_peer(dest_hash, timeout=0.2)
+    worker.start()
+    worker.join(timeout=5.0)
+    assert not worker.is_alive(), "announce wait stalled past its timeout"
     assert time.monotonic() - started < 5.0
+    assert len(outcome) == 1
+    assert isinstance(outcome[0], NodeError)
+    assert "did not announce" in str(outcome[0])
 
 
 def test_drop_self_peer_purges_registry_and_persists(tmp_path):
