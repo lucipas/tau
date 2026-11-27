@@ -7542,3 +7542,269 @@ def test_direct_message_without_expiry_has_none(tmp_path):
     assert response["ok"] is True
     assert received[0]["expires_at"] is None
     assert node.inbox.list_messages()[0]["expires_at"] is None
+
+
+
+# -- scheduled group poll closes for retired groups -------------------------
+
+
+def _retired_poll_setup(tmp_path):
+    """A holder node holding a poll whose group is then retired.
+
+    Returns ``(node, author, author_hash, third, group_id, members)``:
+    the author posts a poll under the original roster, then rotates the
+    roster (dropping the third member), which the holder processes —
+    retiring the poll's group id on the holder.
+    """
+    holder_hash = "ab" * 16
+    author = RNS.Identity()
+    author_hash = destination_hash(author).hex()
+    third = RNS.Identity()
+    third_hash = destination_hash(third).hex()
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    node.destination = SimpleNamespace(
+        hexhash=holder_hash, hash=bytes.fromhex(holder_hash)
+    )
+    members = [author_hash, holder_hash, third_hash]
+    group_id = derive_group_id(author_hash, "weekend", members)
+    poll = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "which day?",
+            message_id="retired-poll-1",
+            group_id=group_id,
+            group_name="weekend",
+            creator=author_hash,
+            members=members,
+            sent_at=1000.0,
+            poll_options=["Saturday", "Sunday"],
+        ),
+        remote_identity=author,
+    )
+    assert poll["ok"] is True
+    new_members = [author_hash, holder_hash]
+    successor_id = derive_group_id(author_hash, "weekend", new_members)
+    successor = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "weekend continues",
+            message_id="retired-successor-1",
+            group_id=successor_id,
+            group_name="weekend",
+            creator=author_hash,
+            members=new_members,
+            sent_at=1100.0,
+            renamed_from=[group_id],
+        ),
+        remote_identity=author,
+    )
+    assert successor["ok"] is True
+    assert node.groups.get(group_id) is None
+    assert node.groups.get_retired(group_id) is not None
+    return node, author, author_hash, third, group_id, members
+
+
+def test_retired_group_poll_close_lands_after_a_successor(tmp_path):
+    """A scheduled close for a poll in a retired group still lands.
+
+    The author's sweep sends the close under the retired id and the
+    original roster; the recipient validates the sender and the roster
+    against the retained retired record, stores the close, and the
+    poll renders closed — without restoring the retired group.
+    """
+    from tau.group_polls import group_poll_tally
+
+    node, author, author_hash, _third, group_id, members = (
+        _retired_poll_setup(tmp_path)
+    )
+    close = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "closed the poll",
+            message_id="retired-close-1",
+            group_id=group_id,
+            group_name="weekend",
+            creator=author_hash,
+            members=members,
+            sent_at=2000.0,
+            poll_close={"author": author_hash, "sent_at": 1000.0},
+        ),
+        remote_identity=author,
+    )
+    assert close["ok"] is True
+    # The retired group stays retired: the close did not restore it.
+    assert node.groups.get(group_id) is None
+    assert node.groups.get_retired(group_id) is not None
+    history = node.inbox.list_messages(
+        limit=None, group=group_id, direction=None
+    )
+    poll_record = next(
+        record for record in history if record.get("poll_options") is not None
+    )
+    assert (
+        group_poll_tally(history, poll_record, own_hash="ab" * 16)["closed"]
+        is True
+    )
+
+
+def test_retired_group_ordinary_message_still_refused(tmp_path):
+    """The narrow receipt path is for closes only: an ordinary post
+    under a retired id is still refused, and nothing is stored."""
+    node, author, author_hash, _third, group_id, members = (
+        _retired_poll_setup(tmp_path)
+    )
+    before = node.inbox.list_messages()
+    response = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "still here?",
+            message_id="retired-post-1",
+            group_id=group_id,
+            group_name="weekend",
+            creator=author_hash,
+            members=members,
+            sent_at=2000.0,
+        ),
+        remote_identity=author,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_a_member"
+    assert node.inbox.list_messages() == before
+    assert node.groups.get(group_id) is None
+
+
+def test_retired_group_poll_close_from_non_author_refused(tmp_path):
+    """A close under a retired id must come from the poll's author:
+    another member of the retired roster cannot close it."""
+    node, author, author_hash, third, group_id, members = (
+        _retired_poll_setup(tmp_path)
+    )
+    before = node.inbox.list_messages()
+    response = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "closed the poll",
+            message_id="retired-close-2",
+            group_id=group_id,
+            group_name="weekend",
+            creator=author_hash,
+            members=members,
+            sent_at=2000.0,
+            poll_close={"author": author_hash, "sent_at": 1000.0},
+        ),
+        remote_identity=third,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_a_member"
+    assert node.inbox.list_messages() == before
+    # Control: the author's own close for the same poll lands.
+    close = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "closed the poll",
+            message_id="retired-close-3",
+            group_id=group_id,
+            group_name="weekend",
+            creator=author_hash,
+            members=members,
+            sent_at=2000.0,
+            poll_close={"author": author_hash, "sent_at": 1000.0},
+        ),
+        remote_identity=author,
+    )
+    assert close["ok"] is True
+
+
+def test_retired_group_poll_close_cannot_smuggle_a_post(tmp_path):
+    """A close under a retired id is stored as only a close: arbitrary
+    text, a pin, and a smuggled poll riding with it are stripped, so a
+    removed member cannot post to the group through the close path."""
+    from tau.group_polls import group_poll_tally
+    from tau.protocol import encode as encode_payload
+
+    node, author, author_hash, _third, group_id, members = (
+        _retired_poll_setup(tmp_path)
+    )
+    payload = encode_payload(
+        {
+            "type": "group_message",
+            "v": 1,
+            "text": "buy my stuff",
+            "sent_at": 2000.0,
+            "id": "smuggled-close-1",
+            "group": group_id,
+            "group_name": "weekend",
+            "creator": author_hash,
+            "members": members,
+            "poll_close": {"author": author_hash, "sent_at": 1000.0},
+            # The parser itself drops co-present poll fields, so the
+            # smuggleable content here is the text and the pin.
+            "location": {"lat": 1.0, "lon": 2.0},
+        }
+    )
+    response = call_handler(
+        node._handle_group_message, payload, remote_identity=author
+    )
+    assert response["ok"] is True
+    history = node.inbox.list_messages(
+        limit=None, group=group_id, direction=None
+    )
+    closes = [r for r in history if r.get("poll_close") is not None]
+    assert len(closes) == 1
+    assert closes[0]["text"] == "closed the poll"
+    assert "location" not in closes[0]
+    assert "poll_options" not in closes[0]
+    # The poll still closes, and no smuggled poll renders.
+    poll_record = next(
+        record for record in history if record.get("poll_options") is not None
+    )
+    assert poll_record["text"] == "which day?"
+    assert (
+        group_poll_tally(history, poll_record, own_hash="ab" * 16)["closed"]
+        is True
+    )
+
+
+def test_relayed_retired_group_poll_close_cannot_smuggle_a_post(tmp_path):
+    """Same stripping on the relayed path: a sealed close carrying a
+    post lands as only a close."""
+    from tau.group_polls import group_poll_tally
+
+    node, author, author_hash, _third, group_id, members = (
+        _retired_poll_setup(tmp_path)
+    )
+    delivered = node._deliver_collected(
+        {
+            "from": author_hash,
+            "from_name": "alice",
+            "id": "relayed-smuggled-1",
+            "text": "buy my stuff",
+            "sent_at": 2000.0,
+            "group": {
+                "id": group_id,
+                "name": "weekend",
+                "creator": author_hash,
+                "members": members,
+            },
+            "poll_close": {"author": author_hash, "sent_at": 1000.0},
+            "poll_options": ["Yes", "No"],
+            "location": {"lat": 1.0, "lon": 2.0},
+        }
+    )
+    assert delivered is True
+    history = node.inbox.list_messages(
+        limit=None, group=group_id, direction=None
+    )
+    closes = [r for r in history if r.get("poll_close") is not None]
+    assert len(closes) == 1
+    assert closes[0]["text"] == "closed the poll"
+    assert "location" not in closes[0]
+    assert "poll_options" not in closes[0]
+    poll_record = next(
+        record for record in history if record.get("poll_options") is not None
+    )
+    assert (
+        group_poll_tally(history, poll_record, own_hash="ab" * 16)["closed"]
+        is True
+    )
