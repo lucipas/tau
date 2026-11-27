@@ -747,6 +747,45 @@ def test_backup_restore_round_trip_keeps_poll_closes(tmp_path, capsys):
     }
 
 
+def test_backup_restore_round_trip_keeps_group_poll_closes(tmp_path, capsys):
+    from tau.group_poll_closes import (
+        load_group_poll_closes,
+        schedule_group_poll_close,
+    )
+
+    node_a = _init_node(tmp_path, "a", "alice")
+    schedule_group_poll_close(
+        node_a / "group-poll-closes.json",
+        "12" * 16,
+        "ab" * 16,
+        1000.0,
+        9000.0,
+        now=1000.0,
+    )
+    capsys.readouterr()
+    archive = tmp_path / "backup.tar.gz"
+    assert cli.main(["backup", str(archive), "--data-dir", str(node_a)]) == 0
+    capsys.readouterr()
+
+    node_b = tmp_path / "b"
+    assert (
+        cli.main(
+            [
+                "restore",
+                str(archive),
+                "--data-dir",
+                str(node_b),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert "group-poll-closes.json" in payload["files"]
+    closes = load_group_poll_closes(node_b / "group-poll-closes.json")
+    assert [entry["close_at"] for entry in closes.values()] == [9000.0]
+
+
 def test_restore_rejects_misplaced_files_member(tmp_path):
     # Received-file members are exactly files/<sender>/<name>: a file
     # directly under files/, or nested any deeper, is not a member
