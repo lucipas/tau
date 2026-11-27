@@ -142,6 +142,60 @@ def test_wait_for_peer_refuses_own_hash_without_recall(tmp_path, monkeypatch):
     assert node.registry.get(own_hash) is None
 
 
+def test_wait_for_path_uses_monotonic_time_when_wall_clock_steps_back(
+    tmp_path, monkeypatch
+):
+    # Qodo #847-6 (Warning): the path wait enforced its timeout with
+    # time.time(), so a backward clock step could stretch a bounded
+    # wait past the caller's deadline. A backward jump must not
+    # extend it.
+    node = make_node(tmp_path)
+    dest_hash = bytes(range(16))
+    monkeypatch.setattr(
+        RNS.Transport, "has_path", staticmethod(lambda _dest: False)
+    )
+    monkeypatch.setattr(
+        RNS.Transport, "request_path", staticmethod(lambda _dest: None)
+    )
+    clock = [1_000_000.0]
+
+    def _stepping_back():
+        clock[0] -= 100.0
+        return clock[0]
+
+    monkeypatch.setattr(time, "time", _stepping_back)
+    started = time.monotonic()
+    with pytest.raises(NodeError, match="no path to"):
+        node._wait_for_path(dest_hash, timeout=0.2)
+    assert time.monotonic() - started < 5.0
+
+
+def test_wait_for_peer_uses_monotonic_time_when_wall_clock_steps_back(
+    tmp_path, monkeypatch
+):
+    # Same clock-step hazard in the announce wait: the discovery
+    # timeout is a bound on the request, not on the wall clock.
+    node = make_node(tmp_path)
+    identity, own_hash = _make_self_destination()
+    node.destination = SimpleNamespace(hash=own_hash, hexhash=own_hash.hex())
+    dest_hash = bytes(range(16))
+    monkeypatch.setattr(
+        RNS.Transport, "request_path", staticmethod(lambda _dest: None)
+    )
+    monkeypatch.setattr(RNS.Identity, "recall", staticmethod(lambda _dest: None))
+    clock = [1_000_000.0]
+
+    def _stepping_back():
+        clock[0] -= 100.0
+        return clock[0]
+
+    monkeypatch.setattr(time, "time", _stepping_back)
+    started = time.monotonic()
+    with pytest.raises(NodeError, match="did not announce"):
+        node.wait_for_peer(dest_hash, timeout=0.2)
+    assert time.monotonic() - started < 5.0
+
+
 def test_drop_self_peer_purges_registry_and_persists(tmp_path):
     node = make_node(tmp_path)
     identity, own_hash = _make_self_destination()

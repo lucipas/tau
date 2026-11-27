@@ -1838,6 +1838,53 @@ def test_tan_publish_reports_unsent_peers_past_deadline(tmp_path):
     assert deadlines == [live_deadline, live_deadline]
 
 
+def test_tan_publish_treats_deadline_cut_send_as_unsent(tmp_path, monkeypatch):
+    # Qodo #847-2 (Major): a send cut short by the pass deadline
+    # raised NodeError and landed in errors, so the caller burned an
+    # attempt and a backoff on a pass that simply ran out of time.
+    # The clipped peer — and everyone after it — is unsent instead.
+    from tau.config import TauConfig
+    from tau.identity import load_identity
+    from tau.tangents.tan import TanApp
+
+    data_dir = tmp_path / "node"
+    assert _run_cli(data_dir, ["init", "--json"]) == 0
+    config = TauConfig.resolve(data_dir=data_dir)
+    app = TanApp(config, load_identity(config.identity_path), name=config.name)
+
+    sent = []
+
+    class _FailingNode:
+        def request(self, peer, path, payload, *, timeout=15.0, deadline=None):
+            sent.append(peer.hexhash)
+            if peer.hexhash == "b" * 64:
+                raise RuntimeError("deadline passed before sending")
+            return None
+
+    app.node = _FailingNode()
+    post = app.create_post("hello mesh")
+    peers = [SimpleNamespace(hexhash="a" * 64), SimpleNamespace(hexhash="b" * 64)]
+    deadline = time.monotonic() + 60.0
+    real_monotonic = time.monotonic
+    calls = {"n": 0}
+
+    def _fake_monotonic():
+        # The deadline passes while the second peer's send runs: the
+        # loop's pre-checks still see a live budget, but the failure
+        # itself happens past it.
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            return real_monotonic()
+        return deadline + 1.0
+
+    monkeypatch.setattr("tau.tangents.tan.time.monotonic", _fake_monotonic)
+    result = app.publish(post, targets=peers, deadline=deadline)
+    assert result["delivered"] == 1
+    assert result["errors"] == []
+    assert result["unsent"] == ["b" * 64]
+    assert sent == ["a" * 64, "b" * 64]
+
+
 def _run_cli(data_dir: Path, argv):
     return cli.main(["--data-dir", str(data_dir), *argv])
 
@@ -2489,3 +2536,198 @@ def test_publish_due_closes_poll_whose_deadline_passed_while_queued(
     # 5101, so a deadline one second out would have been dropped.
     assert [entry["target"] for entry in app.closed] == ["d" * 64]
     assert load_poll_closes(closes_path) == {}
+
+
+def test_publish_due_late_close_reaches_earlier_poll_recipients(tmp_path):
+    # Qodo #847-1 (Critical): a late close reused the narrowed retry
+    # list, so peers that received the poll on an earlier attempt
+    # never got the close. The close goes to every peer the poll was
+    # addressed to, not just the ones still owed it.
+    from tau.poll_closes import load_poll_closes
+
+    path = tmp_path / "scheduled-posts.json"
+    closes_path = tmp_path / "poll-closes.json"
+    schedule_poll(
+        path,
+        question="pizza or tacos?",
+        options=["Pizza", "Tacos"],
+        publish_at=1000.0,
+        to=["alice", "bob"],
+        now=900.0,
+        close_after=3600.0,
+        expires_in=7200.0,
+    )
+    peers = {
+        "alice": SimpleNamespace(hexhash="a" * 64),
+        "bob": SimpleNamespace(hexhash="b" * 64),
+    }
+    # Pending peers are stored as hashes after a partial send, so the
+    # resolver must answer for both names and hashes.
+    by_name_or_hash = {**peers}
+    by_name_or_hash.update({p.hexhash: p for p in peers.values()})
+
+    class _PartialApp(_FakeTanAppWithCreatedAt):
+        def __init__(self):
+            super().__init__()
+            self.delivered_once = False
+
+        def publish(
+            self, post, *, targets=None, ttl=3, should_stop=None, deadline=None
+        ):
+            self.published.append((post, targets, ttl))
+            if post.get("kind") == "close":
+                count = len(targets or [])
+                return {
+                    "delivered": count,
+                    "peers": count,
+                    "errors": [],
+                    "unsent": [],
+                }
+            if not self.delivered_once:
+                # First attempt reaches alice; bob fails and stays owed.
+                self.delivered_once = True
+                return {
+                    "delivered": 1,
+                    "peers": 2,
+                    "errors": [{"peer": "b" * 64, "error": "timeout"}],
+                    "unsent": [],
+                }
+            count = len(targets or [])
+            return {
+                "delivered": count,
+                "peers": count,
+                "errors": [],
+                "unsent": [],
+            }
+
+    app = _PartialApp()
+    result = publish_due_scheduled_posts(
+        path,
+        app,
+        resolve_peer=lambda name: by_name_or_hash[name],
+        now=2000.0,
+        poll_close_path=closes_path,
+    )
+    assert result == {"published": 0, "kept": 1}
+    assert load_poll_closes(closes_path) == {"d" * 64: 5100.0}
+
+    result = publish_due_scheduled_posts(
+        path,
+        app,
+        resolve_peer=lambda name: by_name_or_hash[name],
+        now=5100.5,
+        poll_close_path=closes_path,
+    )
+    assert result == {"published": 1, "kept": 0}
+    closes = [entry for entry in app.published if entry[0].get("kind") == "close"]
+    assert len(closes) == 1
+    # The close went to both original recipients, not just the peer
+    # still owed the poll.
+    assert [peer.hexhash for peer in closes[0][1]] == ["a" * 64, "b" * 64]
+    assert load_poll_closes(closes_path) == {}
+
+
+def test_publish_due_keeps_close_retry_when_late_close_reaches_nobody(
+    tmp_path,
+):
+    # Qodo #847-3 (Warning): the already-due close path discarded the
+    # publish result and dropped the schedule even when no peer took
+    # the close. An undelivered close keeps its retry with the sweep.
+    from tau.poll_closes import load_poll_closes
+
+    path = tmp_path / "scheduled-posts.json"
+    closes_path = tmp_path / "poll-closes.json"
+    schedule_poll(
+        path,
+        question="pizza or tacos?",
+        options=["Pizza", "Tacos"],
+        publish_at=1000.0,
+        to=["alice"],
+        now=900.0,
+        close_after=3600.0,
+        expires_in=7200.0,
+    )
+
+    class _UnreachableCloseApp(_FakeTanAppWithCreatedAt):
+        def publish(
+            self, post, *, targets=None, ttl=3, should_stop=None, deadline=None
+        ):
+            self.published.append((post, targets, ttl))
+            if post.get("kind") == "close":
+                return {
+                    "delivered": 0,
+                    "peers": 1,
+                    "errors": [{"peer": "a" * 64, "error": "timeout"}],
+                    "unsent": [],
+                }
+            return {"delivered": 1, "peers": 1, "errors": [], "unsent": []}
+
+    app = _UnreachableCloseApp()
+    result = publish_due_scheduled_posts(
+        path,
+        app,
+        resolve_peer=lambda name: SimpleNamespace(hexhash="a" * 64),
+        now=5100.5,
+        poll_close_path=closes_path,
+    )
+    assert result == {"published": 1, "kept": 0}
+    # The poll went out, but the close reached nobody: its retry stays
+    # scheduled at the original deadline for the sweep instead of
+    # being dropped.
+    assert load_poll_closes(closes_path) == {"d" * 64: 5100.0}
+
+
+def test_publish_due_close_retry_keeps_the_stored_close_republishable(
+    tmp_path,
+):
+    # Qodo #847-7 (Warning): the fallback schedule one second out
+    # landed after the stored close's creation time, so the sweep
+    # read the close as manual and dropped it instead of retrying.
+    # The retry is scheduled no later than the close's creation time.
+    from tau.poll_closes import load_poll_closes
+
+    path = tmp_path / "scheduled-posts.json"
+    closes_path = tmp_path / "poll-closes.json"
+    schedule_poll(
+        path,
+        question="pizza or tacos?",
+        options=["Pizza", "Tacos"],
+        publish_at=1000.0,
+        to=["alice"],
+        now=900.0,
+        close_after=3600.0,
+        expires_in=7200.0,
+    )
+
+    class _FailingCloseApp(_FakeTanAppWithCreatedAt):
+        def close_poll(self, target, *, publish=False):
+            record = {
+                "hash": "e" * 64,
+                "kind": "close",
+                "target": target,
+                "created_at": 5100.8,
+            }
+            self.closed.append(record)
+            return record
+
+        def publish(
+            self, post, *, targets=None, ttl=3, should_stop=None, deadline=None
+        ):
+            self.published.append((post, targets, ttl))
+            if post.get("kind") == "close":
+                raise RuntimeError("no route to peers")
+            return {"delivered": 1, "peers": 1, "errors": [], "unsent": []}
+
+    app = _FailingCloseApp()
+    result = publish_due_scheduled_posts(
+        path,
+        app,
+        resolve_peer=lambda name: SimpleNamespace(hexhash="a" * 64),
+        now=5100.5,
+        poll_close_path=closes_path,
+    )
+    assert result == {"published": 1, "kept": 0}
+    # The retry reuses the original close deadline (5100.0), capped at
+    # the stored close's creation time (5100.8), so the sweep re-sends
+    # that record instead of dropping it as a manual close.
+    assert load_poll_closes(closes_path) == {"d" * 64: 5100.0}
