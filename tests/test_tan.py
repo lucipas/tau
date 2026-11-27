@@ -3887,7 +3887,8 @@ def test_cli_tan_poll_close_after(tmp_path, capsys):
     data_dir = tmp_path / "alice"
     assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
     capsys.readouterr()
-    before = time.time()
+    # --close-after needs a published poll: a local-only poll's close
+    # would be broadcast to every peer when the deadline arrives.
     assert (
         main(
             [
@@ -3896,7 +3897,6 @@ def test_cli_tan_poll_close_after(tmp_path, capsys):
                 "--data-dir",
                 str(data_dir),
                 "--no-publish",
-                "--json",
                 "--option",
                 "Thursday",
                 "--option",
@@ -3906,17 +3906,10 @@ def test_cli_tan_poll_close_after(tmp_path, capsys):
                 "meet thursday or friday?",
             ]
         )
-        == 0
+        == 2
     )
-    after = time.time()
-    payload = json.loads(capsys.readouterr().out)
-    poll = payload["poll"]
-    assert poll["kind"] == "poll"
-    # The deadline is recorded alongside the poll: three days out,
-    # and the close schedule is keyed by the poll's hash.
-    assert before + 3 * 24 * 60 * 60 <= payload["close_at"] <= after + 3 * 24 * 60 * 60
-    closes = load_poll_closes(data_dir / "poll-closes.json")
-    assert closes == {poll["hash"]: payload["close_at"]}
+    assert "must be published" in capsys.readouterr().err
+    assert load_poll_closes(data_dir / "poll-closes.json") == {}
 
     # A deadline past the 7d horizon, and one at or past the poll's
     # own expiry, are both refused before anything is stored.

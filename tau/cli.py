@@ -8617,7 +8617,13 @@ def cmd_tan_poll(args: argparse.Namespace) -> int:
         except ValueError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
-    expires_at = time.time() + expire_seconds if expire_text is not None else None
+
+    def _poll_expires_at() -> Optional[float]:
+        # Sample the expiry against creation, not against the start of
+        # the command: node startup can take seconds, and an expiry
+        # sampled up front would already be partly spent by the time
+        # the poll is signed.
+        return time.time() + expire_seconds if expire_text is not None else None
 
     close_after_seconds = 0.0
     close_after_text = getattr(args, "close_after", None)
@@ -8635,6 +8641,13 @@ def cmd_tan_poll(args: argparse.Namespace) -> int:
             print(
                 "error: --close-after must be shorter than --expire — the "
                 "poll would expire before it is closed",
+                file=sys.stderr,
+            )
+            return 2
+        if getattr(args, "no_publish", False):
+            print(
+                "error: --close-after cannot be combined with --no-publish — "
+                "a self-closing poll must be published",
                 file=sys.stderr,
             )
             return 2
@@ -8657,7 +8670,7 @@ def cmd_tan_poll(args: argparse.Namespace) -> int:
         except ValueError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
-        if expires_at is not None and delay >= expire_seconds:
+        if expire_text is not None and delay >= expire_seconds:
             print(
                 "error: --delay must be shorter than --expire — the "
                 "poll would expire before it is published",
@@ -8688,9 +8701,51 @@ def cmd_tan_poll(args: argparse.Namespace) -> int:
             print("  with --social publishes it when the time comes.")
         return _EXIT_OK
 
+    # The close registers once the poll exists — its hash is the
+    # schedule's key — and before either publication path runs, so a
+    # publishing failure cannot lose the close for a poll that was
+    # stored.  The deadline counts from the poll's signed creation
+    # time, not from when publication returns: a slow publish must
+    # not push the close past the poll's expiry.  A schedule that
+    # cannot be recorded warns instead of failing the command: the
+    # poll is already created, and dropping it would lose the
+    # question, not just the deadline.
+    def _register_poll_close(poll: Dict[str, Any]) -> Optional[float]:
+        if close_after_text is None:
+            return None
+        created_at = poll.get("created_at")
+        if created_at is None:
+            created_at = time.time()
+        close_at = float(created_at) + close_after_seconds
+        expires = poll.get("expires_at")
+        if expires is not None and close_at >= float(expires):
+            print(
+                "warning: could not schedule the poll close: the poll "
+                "expires before its close",
+                file=sys.stderr,
+            )
+            return None
+        try:
+            # allow_due: a deadline that passed while the poll was being
+            # stored is kept for the close sweep, which closes it, rather
+            # than publishing a poll with no close registered.
+            return schedule_poll_close(
+                config.poll_closes_path, poll["hash"], close_at, allow_due=True
+            )
+        except PollClosesError as exc:
+            print(
+                f"warning: could not schedule the poll close: {exc}",
+                file=sys.stderr,
+            )
+            return None
+
+    close_at = None
+    expires_at = None
     if getattr(args, "no_publish", False):
         app = TanApp(config, _tan_identity(config), name=config.name)
-        record = app.create_poll(question, options, expires_at=expires_at)
+        record = app.create_poll(question, options, expires_at=_poll_expires_at())
+        expires_at = record.get("expires_at")
+        close_at = _register_poll_close(record)
         published = None
     else:
         node = TauNode(config, name=config.name)
@@ -8703,7 +8758,9 @@ def cmd_tan_poll(args: argparse.Namespace) -> int:
             from .local_publish import publish_running
 
             app = TanApp(config, _tan_identity(config), name=config.name)
-            record = app.create_poll(question, options, expires_at=expires_at)
+            record = app.create_poll(question, options, expires_at=_poll_expires_at())
+            expires_at = record.get("expires_at")
+            close_at = _register_poll_close(record)
             result = publish_running(
                 config.data_dir,
                 post_hash=record["hash"],
@@ -8724,7 +8781,9 @@ def cmd_tan_poll(args: argparse.Namespace) -> int:
                 targets = None
                 if getattr(args, "to", None):
                     targets = [node.resolve_peer(target) for target in args.to]
-                record = app.create_poll(question, options, expires_at=expires_at)
+                record = app.create_poll(question, options, expires_at=_poll_expires_at())
+                expires_at = record.get("expires_at")
+                close_at = _register_poll_close(record)
                 published = app.publish(
                     record,
                     targets=targets,
@@ -8732,22 +8791,6 @@ def cmd_tan_poll(args: argparse.Namespace) -> int:
                 )
             finally:
                 node.stop()
-
-    # The poll exists now — its hash is the schedule's key — so the
-    # close registers after creation on every path above.  A schedule
-    # that cannot be recorded (a corrupt close file) warns instead of
-    # failing the command: the poll is already created, and dropping
-    # it would lose the question, not just the deadline.
-    close_at = None
-    if close_after_text is not None:
-        try:
-            close_at = schedule_poll_close(
-                config.poll_closes_path,
-                record["hash"],
-                time.time() + close_after_seconds,
-            )
-        except PollClosesError as exc:
-            print(f"warning: could not schedule the poll close: {exc}", file=sys.stderr)
 
     if json_output:
         payload: Dict[str, Any] = {"poll": record, "published": published}

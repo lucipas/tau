@@ -4525,26 +4525,51 @@ class WebBridge:
         if expires_in is not None:
             expires_at = time.time() + float(expires_in)
         record = app.create_poll(
-            question, options, publish=True, expires_at=expires_at
+            question, options, publish=False, expires_at=expires_at
         )
+        # The close deadline and any schedule error are local state
+        # for the API caller: peers get the signed record as created,
+        # never the annotated copy (Qodo review of #847).
+        signed = record
         if close_after is not None:
-            # The poll exists now — its hash is the schedule's key — so
-            # the close registers after creation.  A schedule that
-            # cannot be recorded warns instead of failing the call:
-            # the poll is already created, and dropping it would lose
-            # the question, not just the deadline.
+            # The close deadline counts from the poll's signed creation
+            # time, not from when publication returns, and it registers
+            # before the publish runs, so a publishing failure cannot
+            # lose the close for a poll that was stored.  A schedule
+            # that cannot be recorded is reported on the poll instead
+            # of failing the call: the poll is already created, and
+            # dropping it would lose the question, not just the
+            # deadline — but a client that asked for a close must be
+            # able to tell it will not run.
             from .poll_closes import PollClosesError, schedule_poll_close
 
-            try:
-                close_at = schedule_poll_close(
-                    self.node.config.poll_closes_path,
-                    record["hash"],
-                    time.time() + float(close_after),
-                )
-            except PollClosesError as exc:
-                log.warning("Could not schedule the poll close: %s", exc)
+            created_at = record.get("created_at") or time.time()
+            close_at = float(created_at) + float(close_after)
+            expires = record.get("expires_at")
+            if expires is not None and close_at >= float(expires):
+                record = {
+                    **record,
+                    "close_schedule_error": (
+                        "the poll expires before its close"
+                    ),
+                }
             else:
-                record = {**record, "close_at": close_at}
+                try:
+                    # allow_due: a deadline that passed while the poll was
+                    # being stored is kept for the close sweep to close.
+                    close_at = schedule_poll_close(
+                        self.node.config.poll_closes_path,
+                        record["hash"],
+                        close_at,
+                        allow_due=True,
+                    )
+                except PollClosesError as exc:
+                    log.warning("Could not schedule the poll close: %s", exc)
+                    record = {**record, "close_schedule_error": str(exc)}
+                else:
+                    record = {**record, "close_at": close_at}
+        if app.node is not None:
+            app.publish(signed)
         return record
 
     def tan_repost(self, target: str) -> Dict[str, Any]:

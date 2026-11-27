@@ -12078,6 +12078,96 @@ def test_tan_poll_close_after_via_api(tmp_path):
         bridge.stop()
 
 
+def test_tan_poll_publishes_the_signed_record_without_local_close_fields(
+    tmp_path, monkeypatch
+):
+    # Qodo Informational on #847 (local close-schedule fields go out
+    # to peers): the web path annotated the signed record with
+    # close_at and then published the annotated dict, so every peer
+    # received the author's local scheduling state.  The publish now
+    # sends the signed record; only the API response carries the
+    # annotation.
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    conn.close()
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    node.app.node = node
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        published = []
+        monkeypatch.setattr(
+            node.app,
+            "publish",
+            lambda record, **kwargs: published.append(record),
+        )
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/poll",
+            method="POST",
+            body={
+                "question": "which day?",
+                "options": ["Thursday", "Friday"],
+                "close_after": 3600,
+            },
+        )
+        assert status == 200
+        assert payload["poll"]["close_at"] > 0
+        assert len(published) == 1
+        assert "close_at" not in published[0]
+        assert "close_schedule_error" not in published[0]
+    finally:
+        bridge.stop()
+
+
+def test_tan_poll_close_after_reports_a_lost_deadline(tmp_path):
+    # A close that cannot be recorded (a corrupt close file) still
+    # returns the created poll — but the response says so, instead of
+    # reporting success and silently dropping the requested close.
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    conn.close()
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        (tmp_path / "poll-closes.json").write_text("{not json", encoding="utf-8")
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/poll",
+            method="POST",
+            body={
+                "question": "which day?",
+                "options": ["Thursday", "Friday"],
+                "close_after": 3600,
+            },
+        )
+        assert status == 200
+        assert payload["ok"] is True
+        poll = payload["poll"]
+        assert poll["kind"] == "poll"
+        assert "close_at" not in poll
+        assert "close_schedule_error" in poll
+    finally:
+        bridge.stop()
+
+
 def test_tan_repost_via_api(tmp_path):
     import RNS
 

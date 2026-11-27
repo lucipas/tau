@@ -5487,13 +5487,15 @@ class TauNode:
         poll_closes_path = getattr(self.config, "poll_closes_path", None)
         if poll_closes_path is None:
             return
-        from .poll_closes import close_due_polls
+        from .poll_closes import CLOSE_PASS_BUDGET_SECONDS, close_due_polls
 
+        stop_event = getattr(self, "_stop_event", None)
         try:
             result = close_due_polls(
                 poll_closes_path,
                 app,
-                should_stop=self._stop_event.is_set,
+                should_stop=stop_event.is_set if stop_event is not None else None,
+                deadline=time.monotonic() + CLOSE_PASS_BUDGET_SECONDS,
             )
         except Exception:  # pragma: no cover - defensive; helper logs
             log.debug("Scheduled poll-close round failed", exc_info=True)
@@ -10614,13 +10616,15 @@ class TauNode:
             # recalling the node's own hash would succeed and register
             # the node as its own peer — the circular loop behind #618.
             raise NodeError("cannot resolve this node as a peer")
-        deadline = time.time() + max(0.0, timeout)
+        # Monotonic, so a backward wall-clock step cannot stretch the
+        # wait past the caller's budget.
+        deadline = time.monotonic() + max(0.0, timeout)
         try:
             RNS.Transport.request_path(dest_hash)
         except Exception:  # pragma: no cover - network dependent
             log.debug("Path request failed", exc_info=True)
 
-        while time.time() < deadline:
+        while time.monotonic() < deadline:
             peer = self.registry.get(dest_hash)
             if peer is not None:
                 return peer
@@ -15073,15 +15077,28 @@ class TauNode:
         *,
         timeout: float = 20.0,
         discover_timeout: Optional[float] = None,
+        deadline: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """Send an arbitrary request to a peer and decode the response."""
+        """Send an arbitrary request to a peer and decode the response.
+
+        ``deadline`` (a ``time.monotonic`` value) bounds the whole
+        request: discovery gets only the time left before it, and
+        the link setup and response wait are clipped the same way
+        by ``_request`` — so a slow peer cannot run a bounded
+        caller past its budget by stalling any single stage.
+        """
+        discover = (
+            discover_timeout
+            if discover_timeout is not None
+            else min(timeout, 10.0)
+        )
+        if deadline is not None:
+            discover = min(discover, _remaining(deadline))
         peer = self.resolve_peer(
             target,
-            timeout=discover_timeout
-            if discover_timeout is not None
-            else min(timeout, 10.0),
+            timeout=discover,
         )
-        return self._request(peer, path, payload, timeout)
+        return self._request(peer, path, payload, timeout, deadline=deadline)
 
     # -- links and requests ------------------------------------------------
 
@@ -15106,8 +15123,10 @@ class TauNode:
         if RNS.Transport.has_path(dest_hash):
             return
         RNS.Transport.request_path(dest_hash)
-        deadline = time.time() + timeout
-        while time.time() < deadline:
+        # Monotonic, like wait_for_peer: a backward wall-clock step
+        # must not stretch the wait past the caller's budget.
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
             if RNS.Transport.has_path(dest_hash):
                 return
             time.sleep(0.1)

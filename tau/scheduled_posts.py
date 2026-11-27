@@ -1161,7 +1161,11 @@ def publish_due_scheduled_posts(
     starts at publish time.  When *poll_close_path* is given, a poll
     carrying a close deadline registers it there once the poll is
     signed (see :func:`tau.poll_closes.schedule_poll_close`), so the
-    serving node's close pass can close it at the deadline.  A queued
+    serving node's close pass can close it at the deadline — unless
+    the deadline already passed while the poll was still queued, in
+    which case the poll is closed in this pass, right after its
+    publish, instead of being given a deadline the close pass would
+    drop once the poll expires.  A queued
     repost or quote publishes the
     same way, through ``app.repost`` / ``app.quote`` with its target
     post, so the target checks (cached, linked, not deleted, no
@@ -1243,6 +1247,7 @@ def publish_due_scheduled_posts(
                         save_scheduled_posts(path, queue)
                         continue
                 failed_peers: Optional[Tuple[str, ...]] = None
+                close_now = False
                 try:
                     targets = _resolve_publish_targets(
                         post, resolve_peer, should_stop, deadline
@@ -1307,26 +1312,53 @@ def publish_due_scheduled_posts(
                         # registers the same deadline instead of
                         # pushing it later.  (A record without a
                         # creation time falls back to this pass — only
-                        # a non-conforming app omits one.)  When the
-                        # deadline already passed while the poll was
-                        # still queued, it closes at the next sweep,
-                        # as soon as it is out: the voting window has
-                        # already elapsed.  Registering before the
-                        # publish means a failure here keeps the entry
-                        # queued like any other failed publish, so a
-                        # poll never goes out without the close it was
-                        # promised.
-                        from .poll_closes import schedule_poll_close
+                        # a non-conforming app omits one.)  Registering
+                        # before the publish means a failure here keeps
+                        # the entry queued like any other failed
+                        # publish, so a poll never goes out without the
+                        # close it was promised.
+                        from .poll_closes import (
+                            PollClosesError,
+                            schedule_poll_close,
+                        )
 
                         close_at = (created.get("created_at") or at) + post.close_after
                         if close_at <= at:
-                            close_at = at + 1.0
-                        schedule_poll_close(
-                            poll_close_path,
-                            created["hash"],
-                            close_at,
-                            now=at,
-                        )
+                            # The deadline already passed while the poll
+                            # was still queued: a deadline pushed one
+                            # second out could land after the poll's
+                            # expiry, which the sweep drops — so close
+                            # it in this pass, right after the publish
+                            # below, instead of scheduling one.
+                            close_now = True
+                        else:
+                            try:
+                                schedule_poll_close(
+                                    poll_close_path,
+                                    created["hash"],
+                                    close_at,
+                                    now=at,
+                                )
+                            except PollClosesError as exc:
+                                # A corrupt close file is local state,
+                                # not a failed publication: keep the
+                                # entry queued for recovery with a
+                                # bounded delay, without burning one
+                                # of its limited publish attempts.
+                                post = replace(
+                                    post,
+                                    next_attempt_at=at
+                                    + PUBLISH_RETRY_BASE_SECONDS,
+                                )
+                                queue = queue.with_replaced(post)
+                                save_scheduled_posts(path, queue)
+                                log.warning(
+                                    "Scheduled poll %s could not record "
+                                    "its close (%s); keeping it queued",
+                                    post.id,
+                                    exc,
+                                )
+                                continue
                     result = app.publish(
                         created,
                         targets=targets,
@@ -1406,12 +1438,130 @@ def publish_due_scheduled_posts(
                             attempts,
                         )
                     continue
+                if close_now:
+                    # The deadline already passed while this poll was
+                    # queued: close it now, in this pass, instead of
+                    # leaving a deadline the sweep would drop once the
+                    # poll expires.
+                    from .poll_closes import PollClosesError, drop_poll_close
+                    from .tangents.tan import TanError
+
+                    close_record = None
+                    try:
+                        close_record = app.close_poll(
+                            created["hash"], publish=False
+                        )
+                        # The close goes to the poll's own recipients,
+                        # not the peers still owed the poll: an earlier
+                        # attempt may have delivered it to the rest.
+                        close_targets = _resolve_publish_targets(
+                            replace(post, pending_peers=()),
+                            resolve_peer,
+                            should_stop,
+                            deadline,
+                        )
+                        close_result = app.publish(
+                            close_record,
+                            targets=close_targets,
+                            ttl=post.ttl,
+                            should_stop=should_stop,
+                            deadline=deadline,
+                        )
+                    except TanError as exc:
+                        # Expired, deleted, unknown or already closed:
+                        # nothing left to close; drop any stale
+                        # schedule so the sweep does not retry it.
+                        log.info(
+                            "Published poll %s cannot be closed now (%s)",
+                            created["hash"],
+                            exc,
+                        )
+                        try:
+                            drop_poll_close(
+                                poll_close_path, created["hash"]
+                            )
+                        except PollClosesError:
+                            pass
+                    except Exception:  # noqa: BLE001 - close retries
+                        # Transient: leave the close to the sweep, which
+                        # re-sends a stored close or creates it if none was.
+                        log.warning(
+                            "Published poll %s could not be closed now; "
+                            "leaving it to the close sweep",
+                            created["hash"],
+                            exc_info=True,
+                        )
+                        _keep_close_for_sweep(
+                            poll_close_path, created["hash"], close_at, close_record
+                        )
+                    else:
+                        if _close_reached_peer(close_result):
+                            try:
+                                drop_poll_close(
+                                    poll_close_path, created["hash"]
+                                )
+                            except PollClosesError:
+                                pass
+                        else:
+                            # No peer took the close (budget or stop, or
+                            # every peer refused): keep it for the sweep.
+                            log.warning(
+                                "Published poll %s reached no peer for its "
+                                "close; leaving it to the close sweep",
+                                created["hash"],
+                            )
+                            _keep_close_for_sweep(
+                                poll_close_path,
+                                created["hash"],
+                                close_at,
+                                close_record,
+                            )
                 queue = queue.with_removed(post.id)
                 save_scheduled_posts(path, queue)
                 published += 1
         except _PassPaused:
             pass
     return {"published": published, "kept": len(candidates) - published}
+
+
+def _close_reached_peer(result: Any) -> bool:
+    """True when a close publish got the close to at least one peer.
+
+    A send cut short (peers left unsent) or one where every targeted
+    peer refused did not reach anyone, so the close must stay scheduled.
+    """
+    if not isinstance(result, dict):
+        return True
+    if result.get("unsent"):
+        return False
+    peers = result.get("peers") or 0
+    delivered = result.get("delivered") or 0
+    return not (peers > 0 and delivered == 0)
+
+
+def _keep_close_for_sweep(
+    path: Any, poll_hash: str, close_at: float, close_record: Any
+) -> None:
+    """Keep an already-due poll close scheduled for the close sweep.
+
+    The sweep re-sends a stored close only when its creation time is at
+    or after the scheduled deadline; a later deadline would make the
+    sweep read the stored close as a manual one and drop it.  So the
+    schedule is recorded at the deadline, capped at the stored close's
+    creation time.
+    """
+    from .poll_closes import PollClosesError, schedule_poll_close
+
+    retry_at = close_at
+    created_at = (
+        close_record.get("created_at") if isinstance(close_record, dict) else None
+    )
+    if isinstance(created_at, (int, float)) and not isinstance(created_at, bool):
+        retry_at = min(retry_at, float(created_at))
+    try:
+        schedule_poll_close(path, poll_hash, retry_at, allow_due=True)
+    except PollClosesError as exc:
+        log.warning("Could not record the close for %s: %s", poll_hash, exc)
 
 
 def _resolve_publish_targets(

@@ -229,6 +229,88 @@ def test_close_due_polls_keeps_a_close_that_reached_no_peer(tmp_path):
     assert app.published[0] == app.published[1]
 
 
+def test_close_due_polls_backs_off_a_close_that_reached_no_peer(tmp_path):
+    path = tmp_path / "poll-closes.json"
+    schedule_poll_close(path, _hash("a"), 2000.0, now=1000.0)
+    app = _FakeTanApp(
+        publish_result={
+            "delivered": 0,
+            "peers": 2,
+            "errors": [{"peer": "aa", "error": "timeout"}],
+            "unsent": [],
+        }
+    )
+
+    result = close_due_polls(path, app, now=2500.0)
+    assert result == {"closed": 0, "dropped": 0, "kept": 1}
+    assert load_poll_closes(path) == {_hash("a"): 2000.0}
+    # The first failure backs off 30s: the close is not due again
+    # until 2530, even though its deadline has passed.
+    assert due_poll_closes(path, now=2529.0) == []
+    result = close_due_polls(path, app, now=2520.0)
+    assert result == {"closed": 0, "dropped": 0, "kept": 0}
+    assert len(app.published) == 1
+    # At the next attempt time the pass retries it.
+    assert due_poll_closes(path, now=2530.0) == [(_hash("a"), 2000.0)]
+    result = close_due_polls(path, app, now=2530.0)
+    assert result == {"closed": 0, "dropped": 0, "kept": 1}
+    assert len(app.published) == 2
+
+
+def test_close_retry_backoff_doubles_on_each_failure(tmp_path):
+    from tau.poll_closes import _close_backoff_until
+
+    path = tmp_path / "poll-closes.json"
+    schedule_poll_close(path, _hash("a"), 2000.0, now=1000.0)
+    app = _FakeTanApp(
+        publish_result={
+            "delivered": 0,
+            "peers": 2,
+            "errors": [{"peer": "aa", "error": "timeout"}],
+            "unsent": [],
+        }
+    )
+    # 30s after the first failure, 60s after the second, 120s
+    # after the third — and the deadline itself never moves.
+    close_due_polls(path, app, now=2500.0)
+    assert _close_backoff_until(path, _hash("a")) == 2530.0
+    close_due_polls(path, app, now=2530.0)
+    assert _close_backoff_until(path, _hash("a")) == 2590.0
+    close_due_polls(path, app, now=2590.0)
+    assert _close_backoff_until(path, _hash("a")) == 2710.0
+    assert load_poll_closes(path) == {_hash("a"): 2000.0}
+
+
+def test_close_backoff_clears_once_the_close_lands(tmp_path):
+    path = tmp_path / "poll-closes.json"
+    schedule_poll_close(path, _hash("a"), 2000.0, now=1000.0)
+    app = _FakeTanApp(
+        publish_result={
+            "delivered": 0,
+            "peers": 2,
+            "errors": [{"peer": "aa", "error": "timeout"}],
+            "unsent": [],
+        }
+    )
+    result = close_due_polls(path, app, now=2500.0)
+    assert result == {"closed": 0, "dropped": 0, "kept": 1}
+    assert due_poll_closes(path, now=2520.0) == []
+
+    # The close lands on the retry: the schedule is dropped and the
+    # backoff with it, so a fresh schedule for the same poll is due
+    # on its own deadline, not the old retry time.
+    app.publish_result = {
+        "delivered": 1,
+        "peers": 2,
+        "errors": [],
+        "unsent": [],
+    }
+    result = close_due_polls(path, app, now=2530.0)
+    assert result == {"closed": 1, "dropped": 0, "kept": 0}
+    schedule_poll_close(path, _hash("a"), 3000.0, now=2600.0)
+    assert due_poll_closes(path, now=3050.0) == [(_hash("a"), 3000.0)]
+
+
 def test_close_due_polls_drops_a_close_that_reached_a_peer(tmp_path):
     path = tmp_path / "poll-closes.json"
     schedule_poll_close(path, _hash("a"), 2000.0, now=1000.0)

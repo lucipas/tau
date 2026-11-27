@@ -142,6 +142,91 @@ def test_wait_for_peer_refuses_own_hash_without_recall(tmp_path, monkeypatch):
     assert node.registry.get(own_hash) is None
 
 
+def test_wait_for_path_uses_monotonic_time_when_wall_clock_steps_back(
+    tmp_path, monkeypatch
+):
+    # Qodo #847-6 (Warning): the path wait enforced its timeout with
+    # time.time(), so a backward clock step could stretch a bounded
+    # wait past the caller's deadline. A backward jump must not
+    # extend it. The wait runs on a thread with a join timeout: if
+    # the implementation regressed to a wall-clock deadline, the
+    # backward-stepping fake would stall it forever, and the test
+    # must fail loudly instead of hanging the suite.
+    node = make_node(tmp_path)
+    dest_hash = bytes(range(16))
+    monkeypatch.setattr(
+        RNS.Transport, "has_path", staticmethod(lambda _dest: False)
+    )
+    monkeypatch.setattr(
+        RNS.Transport, "request_path", staticmethod(lambda _dest: None)
+    )
+    clock = [1_000_000.0]
+
+    def _stepping_back():
+        clock[0] -= 100.0
+        return clock[0]
+
+    monkeypatch.setattr(time, "time", _stepping_back)
+    outcome: list = []
+
+    def _wait():
+        try:
+            node._wait_for_path(dest_hash, timeout=0.2)
+        except Exception as exc:  # noqa: BLE001 - captured for the test
+            outcome.append(exc)
+
+    worker = threading.Thread(target=_wait, daemon=True)
+    started = time.monotonic()
+    worker.start()
+    worker.join(timeout=5.0)
+    assert not worker.is_alive(), "path wait stalled past its timeout"
+    assert time.monotonic() - started < 5.0
+    assert len(outcome) == 1
+    assert isinstance(outcome[0], NodeError)
+    assert "no path to" in str(outcome[0])
+
+
+def test_wait_for_peer_uses_monotonic_time_when_wall_clock_steps_back(
+    tmp_path, monkeypatch
+):
+    # Same clock-step hazard in the announce wait: the discovery
+    # timeout is a bound on the request, not on the wall clock. The
+    # wait runs on a thread with a join timeout for the same reason
+    # as the path-wait test above.
+    node = make_node(tmp_path)
+    identity, own_hash = _make_self_destination()
+    node.destination = SimpleNamespace(hash=own_hash, hexhash=own_hash.hex())
+    dest_hash = bytes(range(16))
+    monkeypatch.setattr(
+        RNS.Transport, "request_path", staticmethod(lambda _dest: None)
+    )
+    monkeypatch.setattr(RNS.Identity, "recall", staticmethod(lambda _dest: None))
+    clock = [1_000_000.0]
+
+    def _stepping_back():
+        clock[0] -= 100.0
+        return clock[0]
+
+    monkeypatch.setattr(time, "time", _stepping_back)
+    outcome: list = []
+
+    def _wait():
+        try:
+            node.wait_for_peer(dest_hash, timeout=0.2)
+        except Exception as exc:  # noqa: BLE001 - captured for the test
+            outcome.append(exc)
+
+    worker = threading.Thread(target=_wait, daemon=True)
+    started = time.monotonic()
+    worker.start()
+    worker.join(timeout=5.0)
+    assert not worker.is_alive(), "announce wait stalled past its timeout"
+    assert time.monotonic() - started < 5.0
+    assert len(outcome) == 1
+    assert isinstance(outcome[0], NodeError)
+    assert "did not announce" in str(outcome[0])
+
+
 def test_drop_self_peer_purges_registry_and_persists(tmp_path):
     node = make_node(tmp_path)
     identity, own_hash = _make_self_destination()
@@ -186,6 +271,50 @@ def test_info_requires_start(tmp_path):
         node.info()
     with pytest.raises(NodeError):
         node.send_message("alice", "hi")
+
+
+def test_request_passes_deadline_to_request_and_clips_discovery(
+    tmp_path, monkeypatch
+):
+    # The public request() is the gap the #844 review found: _request
+    # already clips every stage by a deadline, but request() never
+    # passed one through, so discovery alone could run a bounded
+    # caller past its budget.
+    node = make_node(tmp_path)
+    peer = make_peer()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name=peer.name, now=1.0
+    )
+    seen = {}
+
+    def fake_resolve(target, *, timeout=10.0):
+        seen["discover_timeout"] = timeout
+        return peer
+
+    def fake_request(peer_arg, path, payload, timeout, deadline=None):
+        seen["deadline"] = deadline
+        seen["timeout"] = timeout
+        return {"ok": True}
+
+    monkeypatch.setattr(node, "resolve_peer", fake_resolve)
+    monkeypatch.setattr(node, "_request", fake_request)
+
+    deadline = time.monotonic() + 2.0
+    assert node.request(peer.hexhash, "/tau/x", b"{}", deadline=deadline) == {
+        "ok": True
+    }
+    assert seen["deadline"] == deadline
+    # Discovery gets only the time left before the deadline, not
+    # the usual 10s.
+    assert 0.0 <= seen["discover_timeout"] <= 2.0
+    assert seen["timeout"] == 20.0
+
+    # Without a deadline nothing changes: the full discover window
+    # and no deadline reach _request.
+    seen.clear()
+    assert node.request(peer.hexhash, "/tau/x", b"{}") == {"ok": True}
+    assert seen["deadline"] is None
+    assert seen["discover_timeout"] == 10.0
 
 
 def test_send_message_sends_kind_on_the_wire(tmp_path, monkeypatch):

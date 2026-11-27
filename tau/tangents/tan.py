@@ -9998,8 +9998,11 @@ class TanApp:
         When ``should_stop`` or ``deadline`` (a ``time.monotonic``
         value) is given, sending stops early — between peers — and
         the peers never attempted come back in ``"unsent"`` so the
-        caller can keep them queued.  Callers that pass neither send
-        to every peer, as before.
+        caller can keep them queued.  The deadline also bounds each
+        peer's send itself: it is passed to ``Node.request``, so
+        discovery, link setup and the response wait for one peer
+        cannot run the pass past its budget either.  Callers that
+        pass neither send to every peer, as before.
         """
         node = self.node
         if node is None:
@@ -10028,10 +10031,20 @@ class TanApp:
                 break
             try:
                 node.request(
-                    peer, TAN_POST_PATH, payload, timeout=self.request_timeout
+                    peer,
+                    TAN_POST_PATH,
+                    payload,
+                    timeout=self.request_timeout,
+                    deadline=deadline,
                 )
                 delivered += 1
             except Exception as exc:
+                if deadline is not None and time.monotonic() >= deadline:
+                    # The pass budget ran out inside this send: the
+                    # peer was never really tried, so it is unsent,
+                    # not a delivery failure.
+                    unsent = [getattr(p, "hexhash", "?") for p in peers[index:]]
+                    break
                 errors.append(
                     {"peer": getattr(peer, "hexhash", "?"), "error": str(exc)}
                 )
