@@ -3667,11 +3667,13 @@ class TauNode:
             # close never consumes a slot in the capped history.
             # Nothing is stored and the id is not marked seen, so a
             # re-sent close is re-evaluated, not answered duplicate.
+            # The group name is not logged: CodeQL flags the group
+            # record as sensitive data, so only the sender hash goes
+            # in the log line.
             log.info(
                 "Deferring retired-group poll close from %s: its poll "
-                "has not arrived yet for group %s",
+                "has not arrived yet",
                 caller_hash[:8] if caller_hash else "anonymous",
-                group.get("name"),
             )
             return response_error(
                 "storage_failed",
