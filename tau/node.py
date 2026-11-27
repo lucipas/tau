@@ -3281,6 +3281,47 @@ class TauNode:
             raise ValueError("no pending join request from that peer")
         return {"status": "denied", "group": _invite_group_summary(group)}
 
+    def _has_retired_group_poll(
+        self,
+        group_id: str,
+        sender: str,
+        target: Dict[str, Any],
+    ) -> bool:
+        """True when a genuine poll by *sender* is on record for *group_id*.
+
+        A retired-group close names its poll by the logical identity
+        reactions and retracts use — the poll author's destination
+        hash and the shared send time — so the check is the same scan
+        the scheduled-close sweep makes (see
+        :func:`tau.group_poll_closes._find_poll`): a stored group
+        poll in this group's history whose identity is the close's
+        target.  A close for a poll this node has never seen is not
+        accepted on the strength of the target alone: a removed
+        member could mint distinct targets forever and flood the
+        capped received history with closes for polls that never
+        existed.  A history that cannot be read fails closed — the
+        close is deferred, not accepted.
+        """
+        inbox = getattr(self, "inbox", None)
+        if inbox is None:
+            return False
+        try:
+            history = inbox.list_messages(
+                limit=None, group=group_id, direction=None
+            )
+        except (OSError, ValueError):
+            return False
+        identity = (sender.lower(), float(target["sent_at"]))
+        for record in history:
+            if record.get("group") != group_id:
+                continue
+            if not is_group_poll(record):
+                continue
+            if poll_identity(record, self.destination_hexhash) != identity:
+                continue
+            return True
+        return False
+
     def _accept_retired_group_poll_close(
         self,
         sender_hash: str,
@@ -3309,6 +3350,21 @@ class TauNode:
         exact roster this node retired.  A group this node left, or a
         retired id whose record was evicted from the capped retained
         cache, stays refused.
+
+        The close must also name a genuine poll: a stored group poll
+        in this group's history by this sender with the target's
+        send time (see :meth:`_has_retired_group_poll`).  The
+        target alone proves nothing — a member removed from the
+        successor can mint distinct targets forever, and every
+        accepted close consumes a slot in the capped received
+        history.  When no such poll is on record yet the close is
+        deferred, not discarded: the returned record carries
+        ``retired_poll_close_deferred`` instead of
+        ``retired_poll_close``, and the handlers answer transiently
+        (see :meth:`_handle_group_message` /
+        :meth:`_deliver_collected`), so the sender retries once the
+        poll arrives — a close can outrun its poll — and nothing is
+        stored meanwhile.
         """
         try:
             target = clean_group_poll_target(poll_close)
@@ -3338,6 +3394,16 @@ class TauNode:
         own_hash = (self.destination_hexhash or "").lower()
         if sender not in members or own_hash not in members:
             return None
+        if not self._has_retired_group_poll(group_id, sender, target):
+            # No genuine poll by this sender on record yet: the close
+            # may have outrun its poll, so defer it instead of
+            # discarding it — but store nothing, so a fabricated
+            # close cannot flood the capped received history.  The
+            # deferred marker tells both receipt paths to answer
+            # transiently, so the sender retries once the poll
+            # arrives (see _handle_group_message / _deliver_collected).
+            retired["retired_poll_close_deferred"] = True
+            return retired
         # Transient marker on the returned copy (get_retired hands out
         # a fresh dict, so this never persists): the handlers rewrite
         # a close accepted this way to the canonical close, so a
@@ -3388,7 +3454,11 @@ class TauNode:
         carries one: a close for a retained retired group is accepted
         on its own narrow path (see
         :meth:`_accept_retired_group_poll_close`) instead of being
-        refused with the retired id.
+        refused with the retired id — except a close naming no poll
+        on record yet, which is deferred instead of stored: the
+        returned record then carries ``retired_poll_close_deferred``
+        and the handlers answer transiently, so the sender retries
+        once the poll arrives.
         """
         members = group.get("members") or []
         own_hash = self.destination_hexhash
@@ -3540,6 +3610,24 @@ class TauNode:
             )
             return response_error(
                 "not_a_member", "sender or recipient is not a group member"
+            )
+        if group.get("retired_poll_close_deferred"):
+            # The close names no poll this node has seen yet: answer
+            # transiently instead of storing it.  storage_failed is
+            # the transient code (see PeerRejectedError), so the
+            # sender retries once the poll arrives — and a fabricated
+            # close never consumes a slot in the capped history.
+            # Nothing is stored and the id is not marked seen, so a
+            # re-sent close is re-evaluated, not answered duplicate.
+            log.info(
+                "Deferring retired-group poll close from %s: its poll "
+                "has not arrived yet for group %s",
+                caller_hash or "anonymous",
+                group.get("name"),
+            )
+            return response_error(
+                "storage_failed",
+                "group poll has not arrived yet",
             )
         if group.get("retired_poll_close"):
             # A close accepted under a retired id must not smuggle a
@@ -10432,6 +10520,21 @@ class TauNode:
                     sender or "unknown",
                 )
                 return False
+            if pinned.get("retired_poll_close_deferred"):
+                # Same as the live path, but a relayed delivery
+                # defers by raising: returning False would ack the
+                # envelope and let the holder drop the only copy of
+                # a close its poll may still validate (see
+                # DeliveryDeferredError).
+                log.info(
+                    "Deferring relayed retired-group poll close from "
+                    "%s: its poll has not arrived yet for group %s",
+                    sender or "unknown",
+                    pinned.get("name"),
+                )
+                raise DeliveryDeferredError(
+                    "group poll has not arrived yet"
+                )
             if pinned.get("retired_poll_close"):
                 # Same as the live path: a close accepted under a
                 # retired id must not smuggle a post — rewrite it to

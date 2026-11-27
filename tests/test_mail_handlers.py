@@ -8024,3 +8024,220 @@ def test_retired_group_poll_close_from_non_author_refused(tmp_path):
         remote_identity=author,
     )
     assert close["ok"] is True
+
+
+def test_retired_group_poll_close_without_a_poll_is_deferred(tmp_path):
+    """A close naming no poll on record is deferred, not stored: a
+    removed member cannot flood the capped history with fabricated
+    closes, and the sender is told to retry (storage_failed is the
+    transient code) instead of the close being silently dropped."""
+    from tau.group_polls import group_poll_tally
+
+    node, author, author_hash, _third, group_id, members = (
+        _retired_poll_setup(tmp_path)
+    )
+    before = node.inbox.list_messages(
+        limit=None, group=group_id, direction=None
+    )
+    # Three distinct fabricated targets: none names the real poll
+    # (sent_at 1000.0), so none may land as a history record.
+    for index, target_sent_at in enumerate((2000.0, 3000.0, 4000.0)):
+        response = call_handler(
+            node._handle_group_message,
+            encode_group_message(
+                "closed the poll",
+                message_id=f"retired-close-fake-{index}",
+                group_id=group_id,
+                group_name="weekend",
+                creator=author_hash,
+                members=members,
+                sent_at=5000.0 + index,
+                poll_close={"author": author_hash, "sent_at": target_sent_at},
+            ),
+            remote_identity=author,
+        )
+        assert response["ok"] is False
+        assert response["error"]["code"] == "storage_failed"
+    after = node.inbox.list_messages(
+        limit=None, group=group_id, direction=None
+    )
+    assert after == before
+    # The real poll is still open: no fabricated close closed it.
+    poll_record = next(
+        record for record in after if record.get("poll_options") is not None
+    )
+    assert (
+        group_poll_tally(after, poll_record, own_hash="ab" * 16)["closed"]
+        is False
+    )
+    assert node.groups.get_retired(group_id) is not None
+
+
+def test_retired_group_poll_close_without_a_poll_is_deferred_when_relayed(
+    tmp_path,
+):
+    """Same deferral on the relayed path — but by raising, not by
+    returning False: a False return would ack the envelope and let
+    the holder drop the only copy of a close its poll may still
+    validate."""
+    node, author, author_hash, _third, group_id, members = (
+        _retired_poll_setup(tmp_path)
+    )
+    before = node.inbox.list_messages(
+        limit=None, group=group_id, direction=None
+    )
+    node.identity = RNS.Identity()
+    blob = seal_message(
+        author,
+        sender_name="alice",
+        recipient_public_key=node.identity.get_public_key(),
+        message_id="retired-close-fake-relayed-1",
+        text="closed the poll",
+        sent_at=2000.0,
+        group={
+            "id": group_id,
+            "name": "weekend",
+            "creator": author_hash,
+            "members": members,
+        },
+        poll_close={"author": author_hash, "sent_at": 9999.0},
+    )
+    with pytest.raises(DeliveryDeferredError):
+        node._deliver_collected(open_message(node.identity, blob))
+    assert (
+        node.inbox.list_messages(limit=None, group=group_id, direction=None)
+        == before
+    )
+
+
+def test_retired_group_poll_close_lands_once_its_poll_arrives(tmp_path):
+    """Deferral is not a discard: a close that outran its poll lands
+    once the poll is on record.  The poll arrives here through a
+    history import — a poll leg under the retired id is refused on
+    the wire, so the import is the arrival path — and the re-sent
+    close (the sender's retry) then closes the poll."""
+    from tau.group_polls import group_poll_tally
+
+    holder_hash = "ab" * 16
+    author = RNS.Identity()
+    author_hash = destination_hash(author).hex()
+    third = RNS.Identity()
+    third_hash = destination_hash(third).hex()
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    node.destination = SimpleNamespace(
+        hexhash=holder_hash, hash=bytes.fromhex(holder_hash)
+    )
+    members = [author_hash, holder_hash, third_hash]
+    group_id = derive_group_id(author_hash, "weekend", members)
+    # Pin the group with an ordinary message, then retire it with
+    # the successor — the poll itself never arrives, so the group is
+    # retired and the poll is unknown to this node.
+    pinned = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "weekend plans",
+            message_id="retired-pin-1",
+            group_id=group_id,
+            group_name="weekend",
+            creator=author_hash,
+            members=members,
+            sent_at=900.0,
+        ),
+        remote_identity=author,
+    )
+    assert pinned["ok"] is True
+    new_members = [author_hash, holder_hash]
+    successor_id = derive_group_id(author_hash, "weekend", new_members)
+    successor = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "weekend continues",
+            message_id="retired-successor-1",
+            group_id=successor_id,
+            group_name="weekend",
+            creator=author_hash,
+            members=new_members,
+            sent_at=1100.0,
+            renamed_from=[group_id],
+        ),
+        remote_identity=author,
+    )
+    assert successor["ok"] is True
+    assert node.groups.get_retired(group_id) is not None
+    # The close outruns its poll: deferred, nothing stored.
+    deferred = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "closed the poll",
+            message_id="retired-close-1",
+            group_id=group_id,
+            group_name="weekend",
+            creator=author_hash,
+            members=members,
+            sent_at=2000.0,
+            poll_close={"author": author_hash, "sent_at": 1000.0},
+        ),
+        remote_identity=author,
+    )
+    assert deferred["ok"] is False
+    assert deferred["error"]["code"] == "storage_failed"
+    assert (
+        node.inbox.list_messages(limit=None, group=group_id, direction=None)
+        == [
+            record
+            for record in node.inbox.list_messages(
+                limit=None, group=group_id, direction=None
+            )
+            if record.get("id") == "retired-pin-1"
+        ]
+    )
+    # The poll arrives through a history import.
+    result = node.inbox.import_messages(
+        {
+            "format": "tau-messages-export",
+            "version": 1,
+            "messages": [
+                {
+                    "from": "alice",
+                    "destination": author_hash,
+                    "text": "which day?",
+                    "sent_at": 1000.0,
+                    "received_at": 1500.0,
+                    "id": "retired-poll-1",
+                    "kind": "group",
+                    "group": group_id,
+                    "group_name": "weekend",
+                    "poll_options": ["Saturday", "Sunday"],
+                }
+            ],
+        }
+    )
+    assert result["imported"] == 1
+    # The sender's retry of the same close now lands, and the poll
+    # renders closed.
+    close = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "closed the poll",
+            message_id="retired-close-1",
+            group_id=group_id,
+            group_name="weekend",
+            creator=author_hash,
+            members=members,
+            sent_at=2000.0,
+            poll_close={"author": author_hash, "sent_at": 1000.0},
+        ),
+        remote_identity=author,
+    )
+    assert close["ok"] is True
+    history = node.inbox.list_messages(
+        limit=None, group=group_id, direction=None
+    )
+    poll_record = next(
+        record for record in history if record.get("poll_options") is not None
+    )
+    assert (
+        group_poll_tally(history, poll_record, own_hash="ab" * 16)["closed"]
+        is True
+    )
