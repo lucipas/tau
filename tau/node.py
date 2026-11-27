@@ -5387,6 +5387,12 @@ class TauNode:
             except Exception:  # pragma: no cover - defensive
                 log.debug("Scheduled poll-close round failed", exc_info=True)
             try:
+                self._close_due_group_polls()
+            except Exception:  # pragma: no cover - defensive
+                log.debug(
+                    "Scheduled group poll-close round failed", exc_info=True
+                )
+            try:
                 self._publish_due_scheduled_channel_messages()
             except Exception:  # pragma: no cover - defensive
                 log.debug("Scheduled channel-message publish failed", exc_info=True)
@@ -5503,6 +5509,40 @@ class TauNode:
         if result["closed"]:
             log.info(
                 "Closed %d Tan poll(s) at their scheduled deadline",
+                result["closed"],
+            )
+
+    def _close_due_group_polls(self) -> None:
+        """Close group polls whose scheduled deadline has come.
+
+        No app is needed: a group close is a group message, so any
+        serving node can send it.  A close that fails for a transient
+        reason keeps its schedule for the next pass — see
+        ``tau.group_poll_closes`` — so this never raises into the
+        mail loop.
+        """
+        group_poll_closes_path = getattr(
+            self.config, "group_poll_closes_path", None
+        )
+        if group_poll_closes_path is None:
+            return
+        from .group_poll_closes import close_due_group_polls
+        from .poll_closes import CLOSE_PASS_BUDGET_SECONDS
+
+        stop_event = getattr(self, "_stop_event", None)
+        try:
+            result = close_due_group_polls(
+                group_poll_closes_path,
+                self,
+                should_stop=stop_event.is_set if stop_event is not None else None,
+                deadline=time.monotonic() + CLOSE_PASS_BUDGET_SECONDS,
+            )
+        except Exception:  # pragma: no cover - defensive; helper logs
+            log.debug("Scheduled group poll-close round failed", exc_info=True)
+            return
+        if result["closed"]:
+            log.info(
+                "Closed %d group poll(s) at their scheduled deadline",
                 result["closed"],
             )
 

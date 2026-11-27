@@ -10388,6 +10388,127 @@ def test_parser_group_poll_delay():
     assert args.delay == "2h"
 
 
+def test_parser_group_poll_close_after():
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "group",
+            "poll",
+            "--close-after",
+            "2h",
+            "weekend",
+            "which day?",
+            "Sat",
+            "Sun",
+        ]
+    )
+    assert args.func is cli.cmd_group_poll
+    assert args.close_after == "2h"
+
+
+def test_group_poll_close_after_registers_close(tmp_path, capsys, monkeypatch):
+    from tau.group_poll_closes import load_group_poll_closes
+
+    _init_node(tmp_path, "node", "bob")
+    capsys.readouterr()
+    data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
+    sent_at = 1700000000.0
+
+    def fake_send(
+        args,
+        config,
+        text,
+        *,
+        poll_options=None,
+        poll_vote=None,
+        poll_close=None,
+        send_after=None,
+    ):
+        assert poll_options == ["Saturday", "Sunday"]
+        assert poll_vote is None and poll_close is None
+        assert send_after is None
+        return {
+            "ok": True,
+            "group": group["id"],
+            "name": group["name"],
+            "sent_at": sent_at,
+            "results": [
+                {
+                    "to": "cd" * 16,
+                    "to_name": "alice",
+                    "delivered": True,
+                    "id": "f" * 32,
+                }
+            ],
+        }
+
+    monkeypatch.setattr(cli, "_send_group_poll_message", fake_send)
+    code = cli.main(
+        [
+            "group",
+            "poll",
+            "--data-dir",
+            str(data_dir),
+            "--close-after",
+            "2h",
+            "weekend",
+            "which day?",
+            "Saturday",
+            "Sunday",
+        ]
+    )
+    assert code == 0
+    assert "closes 2h after it goes out" in capsys.readouterr().out
+    closes = load_group_poll_closes(data_dir / "group-poll-closes.json")
+    assert len(closes) == 1
+    entry = next(iter(closes.values()))
+    assert entry["group"] == group["id"]
+    assert entry["sent_at"] == sent_at
+    assert entry["close_at"] == sent_at + 7200.0
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    assert entry["author"] == cli._own_destination_hash(config)
+
+
+def test_group_poll_close_after_refuses_delay_and_long_horizon(
+    tmp_path, capsys
+):
+    data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
+    code = cli.main(
+        [
+            "group",
+            "poll",
+            "--data-dir",
+            str(data_dir),
+            "--delay",
+            "5m",
+            "--close-after",
+            "1h",
+            "weekend",
+            "which day?",
+            "Saturday",
+            "Sunday",
+        ]
+    )
+    assert code == 2
+    assert "cannot be combined with --delay" in capsys.readouterr().err
+    code = cli.main(
+        [
+            "group",
+            "poll",
+            "--data-dir",
+            str(data_dir),
+            "--close-after",
+            "8d",
+            "weekend",
+            "which day?",
+            "Saturday",
+            "Sunday",
+        ]
+    )
+    assert code == 2
+    assert "at most 1w" in capsys.readouterr().err
+
+
 def _run_group_poll(tmp_path, monkeypatch, argv):
     data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
     monkeypatch.setattr(cli, "TauNode", _FakeGroupSendNode)

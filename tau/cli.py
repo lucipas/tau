@@ -262,6 +262,10 @@ from .profile import (
     resolve_avatar,
     save_local_profile,
 )
+from .group_poll_closes import (
+    GroupPollClosesError,
+    schedule_group_poll_close,
+)
 from .poll_closes import (
     MAX_POLL_CLOSE_AFTER,
     PollClosesError,
@@ -3353,6 +3357,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="schedule the poll: queue it now and ask it after "
         "this long (e.g. 30s, 5m, 2h, 7d; at most 29d23h — the 30d "
         "mail TTL less an hour of delivery slack)",
+    )
+    group_poll.add_argument(
+        "--close-after",
+        metavar="DURATION",
+        help="close the poll by itself this long after it goes out "
+        "(e.g. 30s, 5m, 2h, 7d; at most 7d — cannot be combined "
+        "with --delay)",
     )
     group_poll.set_defaults(func=cmd_group_poll)
 
@@ -23538,6 +23549,70 @@ def cmd_close_poll(args: argparse.Namespace) -> int:
     return _report_dm_poll_send(args, response, summary)
 
 
+def _register_group_poll_close(
+    config: TauConfig,
+    group: Dict[str, Any],
+    response: Dict[str, Any],
+    close_after_seconds: float,
+) -> Optional[float]:
+    """Schedule the close for a just-posted group poll; None when it cannot be.
+
+    The close registers once the poll exists — its identity is the
+    group's id, this node's hash, and the send time every leg shares
+    (``sent_at`` on the send response) — so a send that reached no
+    member registers nothing: there is no poll to close.  The
+    deadline counts from the poll's send time, not from when the
+    command returns: a slow fan-out must not push the close past the
+    deadline.  A schedule that cannot be recorded warns instead of
+    failing the command: the poll is already posted, and dropping it
+    would lose the question, not just the deadline.
+    """
+    results = response.get("results") or []
+    if not any(
+        result.get("delivered") or result.get("queued") for result in results
+    ):
+        print(
+            "warning: the poll did not go out, so no close was scheduled",
+            file=sys.stderr,
+        )
+        return None
+    sent_at = response.get("sent_at")
+    if isinstance(sent_at, bool) or not isinstance(sent_at, (int, float)):
+        print(
+            "warning: could not schedule the poll close: the send did "
+            "not report its send time",
+            file=sys.stderr,
+        )
+        return None
+    own_hash = _own_destination_hash(config)
+    if own_hash is None:
+        print(
+            "warning: could not schedule the poll close: this node has "
+            "no identity",
+            file=sys.stderr,
+        )
+        return None
+    close_at = float(sent_at) + close_after_seconds
+    try:
+        # allow_due: a deadline that passed while the poll was going
+        # out is kept for the close sweep, which closes it, rather
+        # than dropping the close for a poll that was just posted.
+        return schedule_group_poll_close(
+            config.group_poll_closes_path,
+            group["id"],
+            own_hash.lower(),
+            float(sent_at),
+            close_at,
+            allow_due=True,
+        )
+    except GroupPollClosesError as exc:
+        print(
+            f"warning: could not schedule the poll close: {exc}",
+            file=sys.stderr,
+        )
+        return None
+
+
 def cmd_group_poll(args: argparse.Namespace) -> int:
     delay_text = getattr(args, "delay", None)
     if delay_text is not None and getattr(args, "no_queue", False):
@@ -23569,6 +23644,29 @@ def cmd_group_poll(args: argparse.Namespace) -> int:
             )
             return 2
         send_after = time.time() + delay
+    close_after_seconds = 0.0
+    close_after_text = getattr(args, "close_after", None)
+    if close_after_text is not None:
+        try:
+            close_after_seconds = _parse_duration(
+                close_after_text,
+                flag="--close-after",
+                max_seconds=MAX_POLL_CLOSE_AFTER,
+            )
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        if send_after is not None:
+            # A delayed poll is queued in the outbox and only exists
+            # once it goes out, so its close cannot be registered at
+            # schedule time — like Tan's --close-after with
+            # --no-publish, refuse the combination outright.
+            print(
+                "error: --close-after cannot be combined with --delay — "
+                "a delayed poll only exists once it goes out",
+                file=sys.stderr,
+            )
+            return 2
     try:
         response = _send_group_poll_message(
             args, config, args.question, poll_options=options,
@@ -23588,6 +23686,16 @@ def cmd_group_poll(args: argparse.Namespace) -> int:
         + ": "
         + args.question
     )
+    close_at = None
+    if close_after_text is not None:
+        close_at = _register_group_poll_close(
+            config, group, response, close_after_seconds
+        )
+        if close_at is not None:
+            summary += (
+                f"\n  closes {_ago(close_after_seconds)} after it goes out"
+            )
+            response["close_at"] = close_at
     if send_after is not None:
         response["send_after"] = send_after
     return _report_group_poll_send(args, response, summary)
