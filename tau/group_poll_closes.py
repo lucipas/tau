@@ -37,7 +37,12 @@ is in-memory, keyed by schedule file and poll key, so the schedule
 file keeps its shape; a restart simply retries at the base delay
 again.  Backoff only spaces retries: the close keeps its original
 deadline, so it still fires at the time it was scheduled for, and a
-close that lands or is dropped clears its backoff.
+close that lands or is dropped clears its backoff.  The cap is a
+spacing, not a give-up: like the Tan closes this mirrors, the close
+keeps retrying at the capped delay until it lands or is dropped,
+because a close that stops retrying would leave the poll open past
+its deadline — and the outbox already tolerates week-long delivery
+windows, so a one-day give-up would be incoherent with it.
 """
 
 from __future__ import annotations
@@ -51,7 +56,12 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
-from .group_polls import group_poll_tally, is_group_poll, poll_identity
+from .group_polls import (
+    group_poll_tally,
+    is_group_poll,
+    is_group_poll_close,
+    poll_identity,
+)
 from .poll_closes import (
     CLOSE_PASS_BUDGET_SECONDS,
     CLOSE_RETRY_BASE_DELAY_SECONDS,
@@ -84,11 +94,6 @@ GROUP_CLOSE_LEG_TIMEOUT_SECONDS = 5.0
 # file as well as key so two data directories never share backoff,
 # and so a test's tmp dir cannot leak a delay into another test.
 _CLOSE_BACKOFF: Dict[Tuple[str, str], Tuple[int, float]] = {}
-
-# A close that still reaches no member after this many attempts is
-# given up: its schedule is dropped with a warning.  At the capped
-# 30-minute spacing, 48 attempts bound retries to about a day.
-CLOSE_RETRY_MAX_ATTEMPTS = 48
 
 # A leg that failed because the member explicitly refused the close
 # (or it expired) can never land: retrying it would fail the same
@@ -171,25 +176,6 @@ def _record_close_failure(
     next_attempt_at = now + delay
     _CLOSE_BACKOFF[backoff_key] = (attempts, next_attempt_at)
     return next_attempt_at
-
-
-def _note_close_failure(
-    path: Union[str, Path], key: str, now: float, entry: Dict[str, Any]
-) -> bool:
-    """Back off a failed close; True when it hit the attempt limit and was dropped."""
-    _record_close_failure(path, key, now)
-    attempts, _ = _CLOSE_BACKOFF[_backoff_key(path, key)]
-    if attempts < CLOSE_RETRY_MAX_ATTEMPTS:
-        return False
-    log.warning(
-        "Dropping scheduled group poll close for %s after %d failed attempts",
-        key,
-        attempts,
-    )
-    drop_group_poll_close(
-        path, entry["group"], entry["author"], entry["sent_at"]
-    )
-    return True
 
 
 def _clear_close_backoff(path: Union[str, Path], key: str) -> None:
@@ -394,8 +380,57 @@ def _find_poll(
     return None, history
 
 
+def _has_close_record(
+    history: List[Dict[str, Any]],
+    entry: Dict[str, Any],
+    own_hash: Optional[str],
+) -> bool:
+    """True when the poll already has a close on record from its author.
+
+    The close record is what the tally itself reads, so this is the
+    same check the tally would make — only without needing the poll
+    record, which is what the caller is missing.  A close from anyone
+    but the poll's author is not a close.
+    """
+    for record in history:
+        if record.get("group") != entry["group"]:
+            continue
+        if not is_group_poll_close(record):
+            continue
+        target = record["poll_close"]
+        if target["author"] != entry["author"]:
+            continue
+        if float(target["sent_at"]) != float(entry["sent_at"]):
+            continue
+        if record.get("direction") == "out":
+            author = own_hash
+        else:
+            author = record.get("destination")
+        if isinstance(author, str) and author.lower() == entry["author"]:
+            return True
+    return False
+
+
+def _poll_retracted(node: Any, entry: Dict[str, Any]) -> bool:
+    """True when the poll's author explicitly retracted it.
+
+    A retraction marker is the durable record that the poll is gone
+    on purpose — as opposed to its inbox record being evicted by the
+    sent cap or deleted locally, which leave no marker.  Nodes
+    without a mailbox (test stubs) have no markers to consult.
+    """
+    mailbox = getattr(node, "mailbox", None)
+    if mailbox is None:
+        return False
+    return bool(
+        mailbox.is_group_retracted(
+            entry["author"], entry["group"], entry["sent_at"]
+        )
+    )
+
+
 def _send_close(
-    node: Any, entry: Dict[str, Any]
+    node: Any, entry: Dict[str, Any], *, deadline: Optional[float] = None
 ) -> str:
     """Send the close to the group; ``"closed"``, ``"dropped"`` or ``"kept"``.
 
@@ -406,6 +441,17 @@ def _send_close(
     could land it.  ``"kept"`` when a leg failed transiently (the
     outbox could not take it) and nothing went out: the schedule
     stays for a later pass, with backoff.
+
+    *deadline* is the sweep's pass deadline (a ``time.monotonic``
+    value): one close must not hold the mail loop past it.  The
+    remaining budget is shared across the legs — each leg gets an
+    equal slice of what is left, capped at the usual per-leg
+    timeout — so a slow member cannot stall the pass, and no leg
+    starves a later one of an attempt the way a single fan-out-wide
+    deadline did (see
+    ``test_send_group_message_slow_first_leg_does_not_starve_later_legs``).
+    A leg whose slice is exhausted is queued, never dropped: the
+    outbox delivers it on retry.
     """
     group = node.groups.find(entry["group"])
     if group is None:
@@ -414,11 +460,23 @@ def _send_close(
         group = node.groups.get_retired(entry["group"])
     if group is None:
         raise _UnknownGroup()
+    leg_timeout = GROUP_CLOSE_LEG_TIMEOUT_SECONDS
+    if deadline is not None:
+        others = [
+            member
+            for member in group.get("members") or []
+            if member != node.destination_hexhash
+        ]
+        if others:
+            remaining = deadline - time.monotonic()
+            leg_timeout = min(
+                leg_timeout, max(remaining, 0.0) / len(others)
+            )
     result = node.send_group_message(
         group,
         "closed the poll",
         poll_close={"author": entry["author"], "sent_at": entry["sent_at"]},
-        timeout=GROUP_CLOSE_LEG_TIMEOUT_SECONDS,
+        timeout=leg_timeout,
     )
     if not isinstance(result, dict):
         return "closed"
@@ -463,13 +521,18 @@ def close_due_group_polls(
     path a manual ``tau group close-poll`` uses, so the tally is
     re-read right before sending and a manual close that landed first
     drops the schedule instead of sending a second close.  A poll
-    whose group or stored record is gone is terminal: the schedule is
-    dropped, not retried.  A close that reached no member keeps its
-    schedule — the next pass re-sends it — but not on the very next
-    pass: each failed attempt backs off (30s, 60s, 120s, ... up to 30
-    minutes), and the close is skipped until its next attempt time.
-    After ``CLOSE_RETRY_MAX_ATTEMPTS`` failed attempts the schedule is
-    dropped with a warning.
+    whose group is gone is terminal: the schedule is dropped, not
+    retried.  A poll whose stored record is gone still closes: the
+    sent inbox evicts it after 500 newer sent records and a local
+    delete or prune removes it too, but the schedule entry is the
+    durable state that names the poll — only a close already on
+    record, or an explicit retract, ends it.  A close that reached
+    no member keeps its schedule — the next pass re-sends it — but
+    not on the very next pass: each failed attempt backs off (30s,
+    60s, 120s, ... up to 30 minutes), and the close is skipped until
+    its next attempt time.  The backoff is a spacing, not a give-up:
+    the close keeps retrying at the capped delay until it lands or
+    is dropped, like the Tan closes this mirrors.
     A close cut short by the pass budget or stop is not a failure:
     it carries no backoff, so the next pass retries it straight away.
     A corrupt schedule file logs a warning and closes nothing, so one
@@ -516,22 +579,8 @@ def close_due_group_polls(
             # wall clock: ``due_group_poll_closes`` reads backoff
             # against the same ``now``, so a failure stamped in
             # another frame would never become due again under it.
-            if _note_close_failure(path, key, at, entry):
-                dropped += 1
-            else:
-                kept += 1
-            continue
-        if poll is None:
-            # The poll is gone from this node's history (deleted or
-            # pruned): there is nothing left to close.
-            log.info(
-                "Dropping scheduled group poll close for %s: poll is gone",
-                key,
-            )
-            drop_group_poll_close(
-                path, entry["group"], entry["author"], entry["sent_at"]
-            )
-            dropped += 1
+            _record_close_failure(path, key, at)
+            kept += 1
             continue
         if entry["author"] != (own_hash or "").lower():
             # Only the poll's creator may close it; a schedule for
@@ -545,7 +594,41 @@ def close_due_group_polls(
             )
             dropped += 1
             continue
-        if group_poll_tally(history, poll, own_hash=own_hash)["closed"]:
+        if poll is None:
+            # The poll record is gone from this node's history — but
+            # that is not the poll being gone.  The sent inbox keeps
+            # only the newest 500 sent records, so a busy node evicts
+            # its copy long before the deadline; a local delete or
+            # prune removes it too.  The schedule entry is the
+            # durable state: it names the poll and proves it went out
+            # from here.  Only a close already on record, or an
+            # explicit retract, ends it — otherwise the close still
+            # goes out from the entry alone.
+            if _has_close_record(history, entry, own_hash):
+                log.info(
+                    "Dropping scheduled group poll close for %s: poll is "
+                    "already closed",
+                    key,
+                )
+                drop_group_poll_close(
+                    path, entry["group"], entry["author"], entry["sent_at"]
+                )
+                dropped += 1
+                continue
+            if _poll_retracted(node, entry):
+                log.info(
+                    "Dropping scheduled group poll close for %s: poll was "
+                    "retracted",
+                    key,
+                )
+                drop_group_poll_close(
+                    path, entry["group"], entry["author"], entry["sent_at"]
+                )
+                dropped += 1
+                continue
+            # No close, no retract: retention or a local delete took
+            # the record, not the poll — fall through and send.
+        elif group_poll_tally(history, poll, own_hash=own_hash)["closed"]:
             # A manual close made before the deadline: the poll is
             # already closed — drop the schedule, do not re-send it.
             log.info(
@@ -559,7 +642,7 @@ def close_due_group_polls(
             dropped += 1
             continue
         try:
-            outcome = _send_close(node, entry)
+            outcome = _send_close(node, entry, deadline=deadline)
         except _UnknownGroup:
             log.info(
                 "Dropping scheduled group poll close for %s: group is gone",
@@ -595,10 +678,8 @@ def close_due_group_polls(
                 "keeping it queued",
                 key,
             )
-            if _note_close_failure(path, key, at, entry):
-                dropped += 1
-            else:
-                kept += 1
+            _record_close_failure(path, key, at)
+            kept += 1
             continue
         drop_group_poll_close(
             path, entry["group"], entry["author"], entry["sent_at"]

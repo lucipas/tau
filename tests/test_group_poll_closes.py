@@ -99,6 +99,9 @@ class _FakeNode:
             else {}
         )
         self.inbox = Inbox(tmp_path / "inbox.json")
+        self.mailbox = SimpleNamespace(
+            is_group_retracted=lambda *args, **kwargs: False
+        )
         self.send_calls = []
         self.send_results = (
             [{"to": OTHER_HASH, "delivered": True, "id": "f" * 32}]
@@ -236,10 +239,65 @@ def test_close_due_group_polls_closes_and_drops(tmp_path):
     }
 
 
-def test_close_due_group_polls_drops_a_poll_that_is_gone(tmp_path):
+def test_close_due_group_polls_closes_a_poll_whose_record_is_gone(tmp_path):
+    # A missing poll record is not the poll being gone: the sent
+    # inbox evicts it after 500 newer sent records, and a local
+    # delete or prune removes it too.  The schedule entry is the
+    # durable state — it names the poll and proves it went out from
+    # here — so the close still goes out from the entry alone.
     path = tmp_path / "group-poll-closes.json"
     schedule_group_poll_close(path, GROUP_ID, OWN_HASH, 1000.0, 2000.0, now=1000.0)
     node = _FakeNode(tmp_path)  # no poll seeded
+
+    result = close_due_group_polls(path, node, now=2500.0)
+    assert result == {"closed": 1, "dropped": 0, "kept": 0}
+    assert len(node.send_calls) == 1
+    assert node.send_calls[0][2]["poll_close"] == {
+        "author": OWN_HASH,
+        "sent_at": 1000.0,
+    }
+    assert load_group_poll_closes(path) == {}
+
+
+def test_close_due_group_polls_drops_a_poll_with_a_close_on_record(tmp_path):
+    # The poll record is gone, but its author's close is on record:
+    # the poll is already closed — drop the schedule, do not re-send.
+    path = tmp_path / "group-poll-closes.json"
+    schedule_group_poll_close(path, GROUP_ID, OWN_HASH, 1000.0, 2000.0, now=1000.0)
+    node = _FakeNode(tmp_path)  # no poll seeded
+    node.inbox.append(_close_record())
+
+    result = close_due_group_polls(path, node, now=2500.0)
+    assert result == {"closed": 0, "dropped": 1, "kept": 0}
+    assert node.send_calls == []
+    assert load_group_poll_closes(path) == {}
+
+
+def test_close_due_group_polls_drops_a_close_from_someone_else(tmp_path):
+    # A close on record from anyone but the poll's author is not a
+    # close: with no poll record and no author close, the close
+    # still goes out.
+    path = tmp_path / "group-poll-closes.json"
+    schedule_group_poll_close(path, GROUP_ID, OWN_HASH, 1000.0, 2000.0, now=1000.0)
+    node = _FakeNode(tmp_path)  # no poll seeded
+    node.inbox.append(_close_record(author=OTHER_HASH))
+
+    result = close_due_group_polls(path, node, now=2500.0)
+    assert result == {"closed": 1, "dropped": 0, "kept": 0}
+    assert len(node.send_calls) == 1
+    assert load_group_poll_closes(path) == {}
+
+
+def test_close_due_group_polls_drops_a_retracted_poll(tmp_path):
+    # The poll record is gone and the author retracted the poll: the
+    # retract marker is the durable record that it is gone on
+    # purpose, so the schedule is dropped instead of re-sent.
+    path = tmp_path / "group-poll-closes.json"
+    schedule_group_poll_close(path, GROUP_ID, OWN_HASH, 1000.0, 2000.0, now=1000.0)
+    node = _FakeNode(tmp_path)  # no poll seeded
+    node.mailbox = SimpleNamespace(
+        is_group_retracted=lambda *args, **kwargs: True
+    )
 
     result = close_due_group_polls(path, node, now=2500.0)
     assert result == {"closed": 0, "dropped": 1, "kept": 0}
@@ -579,10 +637,12 @@ def test_close_due_group_polls_closes_a_real_poll(tmp_path):
     assert group_poll_tally(history, poll, own_hash=OWN_HASH)["closed"] is True
 
 
-def test_close_gives_up_after_the_attempt_limit(tmp_path, monkeypatch):
-    import tau.group_poll_closes as closes
-
-    monkeypatch.setattr(closes, "CLOSE_RETRY_MAX_ATTEMPTS", 3)
+def test_close_retries_without_a_give_up(tmp_path):
+    # Like the Tan closes this mirrors, the backoff is a spacing,
+    # not a give-up: a close that reaches no member keeps retrying
+    # at the capped delay until it lands or is dropped, because a
+    # close that stops retrying would leave the poll open past its
+    # deadline.
     path = tmp_path / "group-poll-closes.json"
     schedule_group_poll_close(path, GROUP_ID, OWN_HASH, 1000.0, 2000.0, now=1000.0)
     node = _FakeNode(
@@ -610,11 +670,39 @@ def test_close_gives_up_after_the_attempt_limit(tmp_path, monkeypatch):
     }
     assert close_due_group_polls(path, node, now=9700.0) == {
         "closed": 0,
-        "dropped": 1,
-        "kept": 0,
+        "dropped": 0,
+        "kept": 1,
     }
-    assert load_group_poll_closes(path) == {}
+    assert _key() in load_group_poll_closes(path)
     assert len(node.send_calls) == 3
+
+
+def test_close_shares_the_pass_budget_across_legs(tmp_path):
+    # One close must not hold the mail loop past the sweep's pass
+    # budget: the remaining budget is shared across the legs, so a
+    # slow member cannot stall the pass — and every leg keeps an
+    # attempt window instead of a single fan-out-wide deadline
+    # starving the later ones.
+    path = tmp_path / "group-poll-closes.json"
+    schedule_group_poll_close(path, GROUP_ID, OWN_HASH, 1000.0, 2000.0, now=1000.0)
+    node = _FakeNode(tmp_path)
+    node.groups._groups[GROUP_ID]["members"] = [OWN_HASH] + [
+        f"{i:032x}" for i in range(1, 11)
+    ]
+    _seed_poll(node)
+
+    result = close_due_group_polls(
+        path, node, now=2500.0, deadline=time.monotonic() + 10.0
+    )
+    assert result == {"closed": 1, "dropped": 0, "kept": 0}
+    # 10s of budget across 10 other members: 1s a leg, not 5s.
+    assert node.send_calls[0][2]["timeout"] == pytest.approx(1.0, abs=0.1)
+    # With the default 20s pass budget the same group gets 2s a leg.
+    node.send_calls.clear()
+    schedule_group_poll_close(path, GROUP_ID, OWN_HASH, 1000.0, 2000.0, now=1000.0)
+    result = close_due_group_polls(path, node, now=2500.0)
+    assert result == {"closed": 1, "dropped": 0, "kept": 0}
+    assert node.send_calls[0][2]["timeout"] == pytest.approx(2.0, abs=0.1)
 
 
 def test_close_that_reaches_no_leg_keeps_its_schedule(tmp_path):

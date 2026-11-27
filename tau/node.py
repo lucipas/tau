@@ -3281,6 +3281,65 @@ class TauNode:
             raise ValueError("no pending join request from that peer")
         return {"status": "denied", "group": _invite_group_summary(group)}
 
+    def _accept_retired_group_poll_close(
+        self,
+        sender_hash: str,
+        group: Dict[str, Any],
+        poll_close: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Accept a scheduled poll close for a retained retired group.
+
+        A rename or roster change retires the poll's group id, so a
+        close the author's sweep sends under it is refused by members
+        that already processed the successor — their ``groups.record``
+        will not re-pin the retired id, and the sender then drops the
+        schedule as terminal, leaving those members' polls open.  A
+        close is narrow enough to take on its own: it carries no post,
+        pin or vote, only the poll it closes, and the tally takes only
+        the poll author's close — so this path validates the sender
+        and the original roster against the retained retired record
+        and returns that record for the close to be stored under,
+        without restoring the group (a later ordinary message for the
+        retired id is still refused) and without accepting anything
+        but a close.  The sender must be the poll's author and on the
+        retired roster with this node, and the carried roster must be
+        the retained one: the id derivation (or the attestation, for a
+        secret group) already bound the carried roster to the id
+        before this runs, and the record comparison pins it to the
+        exact roster this node retired.  A group this node left, or a
+        retired id whose record was evicted from the capped retained
+        cache, stays refused.
+        """
+        try:
+            target = clean_group_poll_target(poll_close)
+        except ProtocolError:
+            return None
+        sender = (sender_hash or "").lower()
+        if target["author"] != sender:
+            return None
+        group_id = group.get("id") or ""
+        if self.groups.is_left(group_id):
+            return None
+        retired = self.groups.get_retired(group_id)
+        if retired is None:
+            return None
+        if (retired.get("creator") or "").lower() != (
+            group.get("creator") or ""
+        ).lower():
+            return None
+        if sanitize_group_name(retired.get("name")) != sanitize_group_name(
+            group.get("name")
+        ):
+            return None
+        members = [str(m).lower() for m in (group.get("members") or [])]
+        retained = [str(m).lower() for m in (retired.get("members") or [])]
+        if sorted(members) != sorted(retained):
+            return None
+        own_hash = (self.destination_hexhash or "").lower()
+        if sender not in members or own_hash not in members:
+            return None
+        return retired
+
     def _accept_group_message(
         self,
         sender_hash: str,
@@ -3289,6 +3348,7 @@ class TauNode:
         sent_at: Optional[float] = None,
         topic_sent_at: Optional[float] = None,
         announcements_sent_at: Optional[float] = None,
+        poll_close: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Validate a group message's roster; pin the group on first sight.
 
@@ -3318,6 +3378,11 @@ class TauNode:
         roster (sent before the successor was learned) from an
         intentional creator restore (sent after), so the stale copy
         pins alongside instead of replacing the successor.
+        ``poll_close`` is the message's poll-close target, when it
+        carries one: a close for a retained retired group is accepted
+        on its own narrow path (see
+        :meth:`_accept_retired_group_poll_close`) instead of being
+        refused with the retired id.
         """
         members = group.get("members") or []
         own_hash = self.destination_hexhash
@@ -3343,7 +3408,7 @@ class TauNode:
                     return None
             except (ProtocolError, ValueError):
                 return None
-        return self.groups.record(
+        pinned = self.groups.record(
             group["id"],
             group_name,
             members,
@@ -3357,6 +3422,17 @@ class TauNode:
             renamed_from=group.get("renamed_from"),
             roster_attestation=attestation,
         )
+        if pinned is not None:
+            return pinned
+        if poll_close is not None:
+            # A close for a retired group id: the roster was retired
+            # by a rename or roster change, so the ordinary pin
+            # refuses it — but a poll close is narrow enough to take
+            # on its own (see _accept_retired_group_poll_close).
+            return self._accept_retired_group_poll_close(
+                sender_hash, group, poll_close
+            )
+        return None
 
     def _handle_group_message(
         self,
@@ -3447,6 +3523,7 @@ class TauNode:
             sent_at=message.get("sent_at"),
             topic_sent_at=message.get("group_topic_sent_at"),
             announcements_sent_at=message.get("group_announcements_sent_at"),
+            poll_close=message.get("poll_close"),
         )
         if group is None:
             log.info(
@@ -10297,6 +10374,7 @@ class TauNode:
                 sent_at=message.get("sent_at"),
                 topic_sent_at=group.get("topic_sent_at"),
                 announcements_sent_at=group.get("announcements_sent_at"),
+                poll_close=message.get("poll_close"),
             )
             if pinned is None:
                 log.info(
