@@ -3338,6 +3338,12 @@ class TauNode:
         own_hash = (self.destination_hexhash or "").lower()
         if sender not in members or own_hash not in members:
             return None
+        # Transient marker on the returned copy (get_retired hands out
+        # a fresh dict, so this never persists): the handlers rewrite
+        # a close accepted this way to the canonical close, so a
+        # removed member cannot smuggle a post in under the retired
+        # id — see _handle_group_message / _deliver_collected.
+        retired["retired_poll_close"] = True
         return retired
 
     def _accept_group_message(
@@ -3349,7 +3355,6 @@ class TauNode:
         topic_sent_at: Optional[float] = None,
         announcements_sent_at: Optional[float] = None,
         poll_close: Optional[Dict[str, Any]] = None,
-        message: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Validate a group message's roster; pin the group on first sight.
 
@@ -3383,11 +3388,7 @@ class TauNode:
         carries one: a close for a retained retired group is accepted
         on its own narrow path (see
         :meth:`_accept_retired_group_poll_close`) instead of being
-        refused with the retired id.  ``message`` is the message
-        itself, when the caller has it: when the retired path
-        accepts a close, the message is rewritten to the close alone
-        before the caller stores it, so no post that rode with the
-        marker lands under the retired id.
+        refused with the retired id.
         """
         members = group.get("members") or []
         own_hash = self.destination_hexhash
@@ -3434,26 +3435,9 @@ class TauNode:
             # by a rename or roster change, so the ordinary pin
             # refuses it — but a poll close is narrow enough to take
             # on its own (see _accept_retired_group_poll_close).
-            retired = self._accept_retired_group_poll_close(
+            return self._accept_retired_group_poll_close(
                 sender_hash, group, poll_close
             )
-            if retired is not None and message is not None:
-                # The close is the whole message: whatever post rode
-                # with the marker — text, a pin, a card, a quote, a
-                # vote, an edit — is stripped before the record is
-                # built, or a removed member could smuggle a post
-                # under the retired id past the refusal.  The tally
-                # reads poll_close, never this text, so the close
-                # still counts exactly like a direct one.
-                message["text"] = "closed the poll"
-                message["location"] = None
-                message["contact"] = None
-                message["beacon"] = None
-                message["in_reply_to"] = None
-                message["poll_options"] = None
-                message["poll_vote"] = None
-                message["edited_at"] = None
-            return retired
         return None
 
     def _handle_group_message(
@@ -3546,7 +3530,6 @@ class TauNode:
             topic_sent_at=message.get("group_topic_sent_at"),
             announcements_sent_at=message.get("group_announcements_sent_at"),
             poll_close=message.get("poll_close"),
-            message=message,
         )
         if group is None:
             log.info(
@@ -3558,6 +3541,24 @@ class TauNode:
             return response_error(
                 "not_a_member", "sender or recipient is not a group member"
             )
+        if group.get("retired_poll_close"):
+            # A close accepted under a retired id must not smuggle a
+            # post: the sender was removed from the group, so anything
+            # beyond the close itself is refused content, not a close.
+            # Rewrite it to the canonical close, exactly like the
+            # announcements-only path does for votes and closes — and
+            # drop any poll or vote riding with it, so a smuggled poll
+            # cannot render either.  The tally reads poll_close, never
+            # this text, so the close still counts.
+            message["text"] = self._announcements_vote_text(
+                group["id"], None, message.get("poll_close")
+            )
+            message["poll_options"] = None
+            message["poll_vote"] = None
+            message["location"] = None
+            message["contact"] = None
+            message["beacon"] = None
+            message["in_reply_to"] = None
         if (
             group.get("announcements_only")
             and caller_hash.lower() != (group.get("creator") or "").lower()
@@ -3736,7 +3737,7 @@ class TauNode:
                                 # replace the canonical vote text this
                                 # copy was sanitized to, or the vote
                                 # exemption smuggles a post in.
-                                canonical = self._canonical_edit_text(
+                                canonical = self._announcements_edit_text(
                                     group, caller_hash, record
                                 )
                                 if canonical is not None:
@@ -3793,7 +3794,7 @@ class TauNode:
                         record["edited_at"] = pending["edited_at"]
                         # As in the id branch: an edit of a member's
                         # vote cannot replace the canonical vote text.
-                        canonical = self._canonical_edit_text(
+                        canonical = self._announcements_edit_text(
                             group, caller_hash, record
                         )
                         if canonical is not None:
@@ -5215,15 +5216,14 @@ class TauNode:
             )
         try:
             # An edit of a member's vote in an announcements-only
-            # group — or of a close under a retired group id — cannot
-            # replace the canonical text with arbitrary content:
-            # substitute the canonical rendering for the edit's text
-            # (see _canonical_edit_text).  The console callback below
-            # sends this text too, so the served copy never shows the
-            # smuggled one either.
+            # group cannot replace the canonical vote text with
+            # arbitrary content: substitute the canonical rendering
+            # for the edit's text (see _announcements_edit_text).
+            # The console callback below sends this text too, so the
+            # served copy never shows the smuggled one either.
             edit_text = edit["text"]
             if is_group:
-                canonical = self._canonical_edit_text(
+                canonical = self._announcements_edit_text(
                     pinned, caller_hash, record
                 )
                 if canonical is not None:
@@ -6369,43 +6369,24 @@ class TauNode:
             float(ann_at) if isinstance(ann_at, (int, float)) else None,
         )
 
-    def _canonical_edit_text(
+    def _announcements_edit_text(
         self,
         group: Optional[Dict[str, Any]],
         author_hash: str,
         record: Dict[str, Any],
     ) -> Optional[str]:
-        """Canonical text for an edited vote or close whose display text is fixed.
+        """Canonical text for an edited vote or close in an announcements-only group.
 
         A member's vote or close is not a post, but its display text
         must stay the canonical rendering: an edit of a vote — live,
         or pending against a copy that had not landed yet — cannot
         replace that rendering with arbitrary content, or the vote
-        exemption smuggles a post into the group.  The same holds
-        for a close stored under a retired group id: the close was
-        sanitized to the canonical text on receipt, and an edit —
-        live, or pending against a copy that had not landed yet —
-        cannot replace it, or the retired-group refusal is bypassed
-        by editing the close afterward.  Returns the canonical text
-        when the record is a non-creator member's vote or close in
-        an announcements-only group, or a poll close under a retired
-        group id, else None (the edit applies normally).  Ordinary
-        messages keep their edits, including ones sent before the
-        restriction.
+        exemption smuggles a post into the group.  Returns the
+        canonical text when the record is a non-creator member's vote
+        or close in an announcements-only group, else None (the edit
+        applies normally).  Ordinary messages keep their edits,
+        including ones sent before the restriction.
         """
-        if record.get("poll_close") is not None:
-            group_id = record.get("group")
-            if isinstance(group_id, str) and group_id:
-                get_retired = getattr(
-                    self.groups, "get_retired", None
-                )
-                if get_retired is not None:
-                    try:
-                        retired = get_retired(group_id)
-                    except Exception:
-                        retired = None
-                    if retired is not None:
-                        return "closed the poll"
         if not (group or {}).get("announcements_only"):
             return None
         if (author_hash or "").lower() == (group.get("creator") or "").lower():
@@ -10418,7 +10399,6 @@ class TauNode:
                 topic_sent_at=group.get("topic_sent_at"),
                 announcements_sent_at=group.get("announcements_sent_at"),
                 poll_close=message.get("poll_close"),
-                message=message,
             )
             if pinned is None:
                 log.info(
@@ -10427,6 +10407,20 @@ class TauNode:
                     sender or "unknown",
                 )
                 return False
+            if pinned.get("retired_poll_close"):
+                # Same as the live path: a close accepted under a
+                # retired id must not smuggle a post — rewrite it to
+                # the canonical close and drop any poll or vote riding
+                # with it.
+                message["text"] = self._announcements_vote_text(
+                    pinned["id"], None, message.get("poll_close")
+                )
+                message["poll_options"] = None
+                message["poll_vote"] = None
+                message["location"] = None
+                message["contact"] = None
+                message["beacon"] = None
+                message["in_reply_to"] = None
             if (
                 pinned.get("announcements_only")
                 and (sender or "").lower() != (pinned.get("creator") or "").lower()
@@ -10593,7 +10587,7 @@ class TauNode:
                         # As in the direct path: an edit of a
                         # member's vote cannot replace the canonical
                         # vote text.
-                        canonical = self._canonical_edit_text(
+                        canonical = self._announcements_edit_text(
                             pinned,
                             message.get("from")
                             if isinstance(message.get("from"), str)

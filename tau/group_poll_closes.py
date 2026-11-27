@@ -412,30 +412,28 @@ def _has_close_record(
 
 
 def _poll_retracted(node: Any, entry: Dict[str, Any]) -> bool:
-    """True when the poll's author explicitly retracted it.
+    """True when the poll was explicitly retracted.
 
     A retraction marker is the durable record that the poll is gone
     on purpose — as opposed to its inbox record being evicted by the
-    sent cap or deleted locally, which leave no marker.  Both
-    directions count: an inbound marker (a member's retract, seen
-    as a recipient) and a sent marker (this node retracted its own
-    outgoing poll — the author retracts the sent copy, so only the
-    sent marker exists).  Nodes without a mailbox (test stubs) have
-    no markers to consult.
+    sent cap or deleted locally, which leave no marker.  Both sides
+    count: an inbound marker from a member's retract, and the
+    *sent* marker this node wrote when it retracted its own outgoing
+    poll — without the second, the sweep re-sends a close to members
+    who already got the retract.  Nodes without a mailbox (test
+    stubs) have no markers to consult.
     """
     mailbox = getattr(node, "mailbox", None)
     if mailbox is None:
         return False
-    if bool(
-        mailbox.is_group_retracted(
-            entry["author"], entry["group"], entry["sent_at"]
-        )
+    if mailbox.is_group_retracted(
+        entry["author"], entry["group"], entry["sent_at"]
     ):
         return True
-    is_sent_retracted = getattr(mailbox, "is_sent_group_retracted", None)
-    if is_sent_retracted is None:
+    is_sent = getattr(mailbox, "is_sent_group_retracted", None)
+    if is_sent is None:
         return False
-    return bool(is_sent_retracted(entry["group"], entry["sent_at"]))
+    return bool(is_sent(entry["group"], entry["sent_at"]))
 
 
 def _send_close(

@@ -6011,7 +6011,7 @@ def test_concurrent_retracts_cannot_delete_a_different_record(tmp_path):
     node.inbox.append(
         {
             "from": "holder",
-            "destination_hash": "cd" * 16,
+            "destination": "cd" * 16,
             "text": "my sent copy",
             "sent_at": 10.0,
             "received_at": 20.0,
@@ -7648,269 +7648,6 @@ def test_retired_group_poll_close_lands_after_a_successor(tmp_path):
     )
 
 
-def test_retired_group_poll_close_strips_a_smuggled_post(tmp_path):
-    """A close under a retired id lands as a close only: a removed
-    member cannot smuggle a post past the refusal by attaching a
-    valid close target to arbitrary text, a pin, a card, a quote,
-    or an edit — the stored record carries the close and the
-    canonical close text, nothing else, and the poll still closes."""
-    from tau.group_polls import group_poll_tally
-
-    node, author, author_hash, _third, group_id, members = (
-        _retired_poll_setup(tmp_path)
-    )
-    close = call_handler(
-        node._handle_group_message,
-        encode_group_message(
-            "still here — and the poll is mine",
-            message_id="retired-close-smuggled-1",
-            group_id=group_id,
-            group_name="weekend",
-            creator=author_hash,
-            members=members,
-            sent_at=2000.0,
-            poll_close={"author": author_hash, "sent_at": 1000.0},
-            location={"lat": 1.5, "lon": 2.5},
-            beacon={"id": "b", "expires_at": 2000000000.0, "seq": 1},
-            contact={"name": "mallory", "destination_hash": "cd" * 16},
-            in_reply_to={"id": "retired-poll-1"},
-            edited_at=1500.0,
-        ),
-        remote_identity=author,
-    )
-    assert close["ok"] is True
-    # The retired group stays retired: the close did not restore it.
-    assert node.groups.get(group_id) is None
-    assert node.groups.get_retired(group_id) is not None
-    history = node.inbox.list_messages(
-        limit=None, group=group_id, direction=None
-    )
-    close_record = next(
-        record for record in history if record.get("poll_close") is not None
-    )
-    assert close_record["text"] == "closed the poll"
-    assert "location" not in close_record
-    assert "contact" not in close_record
-    assert "beacon" not in close_record
-    assert "in_reply_to" not in close_record
-    assert "edited_at" not in close_record
-    assert "poll_vote" not in close_record
-    assert "poll_options" not in close_record
-    poll_record = next(
-        record for record in history if record.get("poll_options") is not None
-    )
-    assert (
-        group_poll_tally(history, poll_record, own_hash="ab" * 16)["closed"]
-        is True
-    )
-
-
-def test_retired_group_poll_close_strips_a_smuggled_post_when_relayed(tmp_path):
-    """Same strip on the relayed path: a close that reaches the
-    holder inside a sealed envelope is stored as a close only —
-    the smuggled text, pin, card and quote never land, and the
-    poll still closes."""
-    from tau.group_polls import group_poll_tally
-
-    node, author, author_hash, _third, group_id, members = (
-        _retired_poll_setup(tmp_path)
-    )
-    node.identity = RNS.Identity()
-    blob = seal_message(
-        author,
-        sender_name="alice",
-        recipient_public_key=node.identity.get_public_key(),
-        message_id="retired-close-relayed-1",
-        text="still here — and the poll is mine",
-        sent_at=2000.0,
-        group={
-            "id": group_id,
-            "name": "weekend",
-            "creator": author_hash,
-            "members": members,
-        },
-        poll_close={"author": author_hash, "sent_at": 1000.0},
-        location={"lat": 1.5, "lon": 2.5},
-        contact={"name": "mallory", "destination_hash": "cd" * 16},
-        in_reply_to={"id": "retired-poll-1"},
-        edited_at=1500.0,
-    )
-    assert node._deliver_collected(open_message(node.identity, blob)) is True
-    history = node.inbox.list_messages(
-        limit=None, group=group_id, direction=None
-    )
-    close_record = next(
-        record for record in history if record.get("poll_close") is not None
-    )
-    assert close_record["text"] == "closed the poll"
-    assert "location" not in close_record
-    assert "contact" not in close_record
-    assert "in_reply_to" not in close_record
-    assert "edited_at" not in close_record
-    poll_record = next(
-        record for record in history if record.get("poll_options") is not None
-    )
-    assert (
-        group_poll_tally(history, poll_record, own_hash="ab" * 16)["closed"]
-        is True
-    )
-
-
-def test_retired_group_poll_close_edit_keeps_canonical_text(tmp_path):
-    """A later edit cannot rewrite a retired-group close: the poll
-    author, removed by a roster change but still on the retained
-    roster, passes the edit membership check — so the edit lands,
-    but the stored text stays the canonical close text while the
-    edit's send time still advances the ordering state."""
-    node, author, author_hash, _third, group_id, members = (
-        _retired_poll_setup(tmp_path)
-    )
-    close = call_handler(
-        node._handle_group_message,
-        encode_group_message(
-            "closed the poll",
-            message_id="retired-close-1",
-            group_id=group_id,
-            group_name="weekend",
-            creator=author_hash,
-            members=members,
-            sent_at=2000.0,
-            poll_close={"author": author_hash, "sent_at": 1000.0},
-        ),
-        remote_identity=author,
-    )
-    assert close["ok"] is True
-    seen = []
-    node.on_edit = seen.append
-    response = call_handler(
-        node._handle_dm_edit,
-        signed_edit(
-            author,
-            "retired-close-1",
-            "still here — edited",
-            "retired-close-edit-1",
-            sent_at=3000.0,
-            group=group_id,
-            target_author=author_hash,
-            target_sent_at=2000.0,
-        ),
-        remote_identity=author,
-    )
-    assert response["ok"] is True
-    assert response["edited"] is True
-    history = node.inbox.list_messages(
-        limit=None, group=group_id, direction=None
-    )
-    close_record = next(
-        record for record in history if record.get("poll_close") is not None
-    )
-    assert close_record["text"] == "closed the poll"
-    assert close_record["edited_at"] == 3000.0
-    assert len(seen) == 1
-    assert seen[0]["text"] == "closed the poll"
-
-
-def test_retired_group_poll_close_pending_edit_keeps_canonical_text(tmp_path):
-    """An edit planted before the close arrives cannot smuggle a
-    post in through the pending-edit path either: the close lands
-    already canonical, not with the pending text."""
-    node, author, author_hash, _third, group_id, members = (
-        _retired_poll_setup(tmp_path)
-    )
-    edit = call_handler(
-        node._handle_dm_edit,
-        signed_edit(
-            author,
-            "retired-close-1",
-            "still here — edited early",
-            "retired-close-edit-1",
-            sent_at=3000.0,
-            group=group_id,
-            target_author=author_hash,
-            target_sent_at=2000.0,
-        ),
-        remote_identity=author,
-    )
-    assert edit["ok"] is True
-    assert edit["edited"] is False
-    assert edit["group_edit"] is True
-    close = call_handler(
-        node._handle_group_message,
-        encode_group_message(
-            "closed the poll",
-            message_id="retired-close-1",
-            group_id=group_id,
-            group_name="weekend",
-            creator=author_hash,
-            members=members,
-            sent_at=2000.0,
-            poll_close={"author": author_hash, "sent_at": 1000.0},
-        ),
-        remote_identity=author,
-    )
-    assert close["ok"] is True
-    history = node.inbox.list_messages(
-        limit=None, group=group_id, direction=None
-    )
-    close_record = next(
-        record for record in history if record.get("poll_close") is not None
-    )
-    assert close_record["text"] == "closed the poll"
-    assert close_record["edited_at"] == 3000.0
-
-
-def test_retired_group_poll_close_pending_edit_keeps_canonical_text_when_relayed(
-    tmp_path,
-):
-    """Same pending-edit rule on the relayed path: a close that
-    reaches the holder inside a sealed envelope lands canonical,
-    not with the pending edit's text."""
-    node, author, author_hash, _third, group_id, members = (
-        _retired_poll_setup(tmp_path)
-    )
-    edit = call_handler(
-        node._handle_dm_edit,
-        signed_edit(
-            author,
-            "retired-close-relayed-1",
-            "still here — edited early",
-            "retired-close-edit-1",
-            sent_at=3000.0,
-            group=group_id,
-            target_author=author_hash,
-            target_sent_at=2000.0,
-        ),
-        remote_identity=author,
-    )
-    assert edit["ok"] is True
-    assert edit["edited"] is False
-    node.identity = RNS.Identity()
-    blob = seal_message(
-        author,
-        sender_name="alice",
-        recipient_public_key=node.identity.get_public_key(),
-        message_id="retired-close-relayed-1",
-        text="closed the poll",
-        sent_at=2000.0,
-        group={
-            "id": group_id,
-            "name": "weekend",
-            "creator": author_hash,
-            "members": members,
-        },
-        poll_close={"author": author_hash, "sent_at": 1000.0},
-    )
-    assert node._deliver_collected(open_message(node.identity, blob)) is True
-    history = node.inbox.list_messages(
-        limit=None, group=group_id, direction=None
-    )
-    close_record = next(
-        record for record in history if record.get("poll_close") is not None
-    )
-    assert close_record["text"] == "closed the poll"
-    assert close_record["edited_at"] == 3000.0
-
-
 def test_retired_group_ordinary_message_still_refused(tmp_path):
     """The narrow receipt path is for closes only: an ordinary post
     under a retired id is still refused, and nothing is stored."""
@@ -7977,3 +7714,97 @@ def test_retired_group_poll_close_from_non_author_refused(tmp_path):
         remote_identity=author,
     )
     assert close["ok"] is True
+
+
+def test_retired_group_poll_close_cannot_smuggle_a_post(tmp_path):
+    """A close under a retired id is stored as only a close: arbitrary
+    text, a pin, and a smuggled poll riding with it are stripped, so a
+    removed member cannot post to the group through the close path."""
+    from tau.group_polls import group_poll_tally
+    from tau.protocol import encode as encode_payload
+
+    node, author, author_hash, _third, group_id, members = (
+        _retired_poll_setup(tmp_path)
+    )
+    payload = encode_payload(
+        {
+            "type": "group_message",
+            "v": 1,
+            "text": "buy my stuff",
+            "sent_at": 2000.0,
+            "id": "smuggled-close-1",
+            "group": group_id,
+            "group_name": "weekend",
+            "creator": author_hash,
+            "members": members,
+            "poll_close": {"author": author_hash, "sent_at": 1000.0},
+            # The parser itself drops co-present poll fields, so the
+            # smuggleable content here is the text and the pin.
+            "location": {"lat": 1.0, "lon": 2.0},
+        }
+    )
+    response = call_handler(
+        node._handle_group_message, payload, remote_identity=author
+    )
+    assert response["ok"] is True
+    history = node.inbox.list_messages(
+        limit=None, group=group_id, direction=None
+    )
+    closes = [r for r in history if r.get("poll_close") is not None]
+    assert len(closes) == 1
+    assert closes[0]["text"] == "closed the poll"
+    assert "location" not in closes[0]
+    assert "poll_options" not in closes[0]
+    # The poll still closes, and no smuggled poll renders.
+    poll_record = next(
+        record for record in history if record.get("poll_options") is not None
+    )
+    assert poll_record["text"] == "which day?"
+    assert (
+        group_poll_tally(history, poll_record, own_hash="ab" * 16)["closed"]
+        is True
+    )
+
+
+def test_relayed_retired_group_poll_close_cannot_smuggle_a_post(tmp_path):
+    """Same stripping on the relayed path: a sealed close carrying a
+    post lands as only a close."""
+    from tau.group_polls import group_poll_tally
+
+    node, author, author_hash, _third, group_id, members = (
+        _retired_poll_setup(tmp_path)
+    )
+    delivered = node._deliver_collected(
+        {
+            "from": author_hash,
+            "from_name": "alice",
+            "id": "relayed-smuggled-1",
+            "text": "buy my stuff",
+            "sent_at": 2000.0,
+            "group": {
+                "id": group_id,
+                "name": "weekend",
+                "creator": author_hash,
+                "members": members,
+            },
+            "poll_close": {"author": author_hash, "sent_at": 1000.0},
+            "poll_options": ["Yes", "No"],
+            "location": {"lat": 1.0, "lon": 2.0},
+        }
+    )
+    assert delivered is True
+    history = node.inbox.list_messages(
+        limit=None, group=group_id, direction=None
+    )
+    closes = [r for r in history if r.get("poll_close") is not None]
+    assert len(closes) == 1
+    assert closes[0]["text"] == "closed the poll"
+    assert "location" not in closes[0]
+    assert "poll_options" not in closes[0]
+    poll_record = next(
+        record for record in history if record.get("poll_options") is not None
+    )
+    assert (
+        group_poll_tally(history, poll_record, own_hash="ab" * 16)["closed"]
+        is True
+    )

@@ -100,7 +100,8 @@ class _FakeNode:
         )
         self.inbox = Inbox(tmp_path / "inbox.json")
         self.mailbox = SimpleNamespace(
-            is_group_retracted=lambda *args, **kwargs: False
+            is_group_retracted=lambda *args, **kwargs: False,
+            is_sent_group_retracted=lambda *args, **kwargs: False,
         )
         self.send_calls = []
         self.send_results = (
@@ -296,7 +297,8 @@ def test_close_due_group_polls_drops_a_retracted_poll(tmp_path):
     schedule_group_poll_close(path, GROUP_ID, OWN_HASH, 1000.0, 2000.0, now=1000.0)
     node = _FakeNode(tmp_path)  # no poll seeded
     node.mailbox = SimpleNamespace(
-        is_group_retracted=lambda *args, **kwargs: True
+        is_group_retracted=lambda *args, **kwargs: True,
+        is_sent_group_retracted=lambda *args, **kwargs: False,
     )
 
     result = close_due_group_polls(path, node, now=2500.0)
@@ -305,14 +307,14 @@ def test_close_due_group_polls_drops_a_retracted_poll(tmp_path):
     assert load_group_poll_closes(path) == {}
 
 
-def test_close_due_group_polls_drops_a_poll_retracted_by_its_author(tmp_path):
-    # The poll record is gone and the author retracted their own
-    # outgoing poll: the sent marker is the durable record that it
-    # is gone on purpose, so the schedule is dropped instead of
-    # re-sent to members who already received the retract.
+def test_close_due_group_polls_drops_a_poll_this_node_retracted(tmp_path):
+    # The poll record is gone because this node retracted its own
+    # outgoing poll: that writes a *sent* retraction marker, not an
+    # inbound one — and the sweep must read it, or it re-sends a close
+    # to members who already got the retract.
     path = tmp_path / "group-poll-closes.json"
     schedule_group_poll_close(path, GROUP_ID, OWN_HASH, 1000.0, 2000.0, now=1000.0)
-    node = _FakeNode(tmp_path)  # no poll seeded
+    node = _FakeNode(tmp_path)  # no poll seeded: the retract removed it
     node.mailbox = SimpleNamespace(
         is_group_retracted=lambda *args, **kwargs: False,
         is_sent_group_retracted=lambda *args, **kwargs: True,
