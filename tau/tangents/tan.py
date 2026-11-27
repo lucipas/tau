@@ -10039,6 +10039,12 @@ class TanApp:
                 )
                 delivered += 1
             except Exception as exc:
+                if deadline is not None and time.monotonic() >= deadline:
+                    # The pass budget ran out inside this send: the
+                    # peer was never really tried, so it is unsent,
+                    # not a delivery failure.
+                    unsent = [getattr(p, "hexhash", "?") for p in peers[index:]]
+                    break
                 errors.append(
                     {"peer": getattr(peer, "hexhash", "?"), "error": str(exc)}
                 )
