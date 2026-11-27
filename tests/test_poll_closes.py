@@ -381,6 +381,42 @@ def test_close_due_polls_retries_a_failed_publish_without_a_second_close(
         conn.close()
 
 
+def test_close_due_polls_drops_a_manually_closed_poll_without_republishing(
+    tmp_path, monkeypatch
+):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, create_close_poll, init_db
+
+    config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    conn = init_db(config.social_db_path)
+    conn.close()
+    app = TanApp(config, identity, name="tester", gossip=False)
+    poll = app.create_poll("pizza or tacos?", ["Pizza", "Tacos"])
+    # A manual close made before the deadline.
+    conn = init_db(config.social_db_path)
+    try:
+        create_close_poll(conn, identity, poll["hash"], name="tester", now=1500.0)
+    finally:
+        conn.close()
+    path = tmp_path / "poll-closes.json"
+    schedule_poll_close(path, poll["hash"], 2000.0, now=1000.0)
+
+    app.node = object()
+    monkeypatch.setattr(
+        app,
+        "publish",
+        lambda record, **kwargs: (_ for _ in ()).throw(
+            AssertionError("a manual close must not be republished")
+        ),
+    )
+    result = close_due_polls(path, app, now=2500.0)
+    assert result == {"closed": 0, "dropped": 1, "kept": 0}
+    assert load_poll_closes(path) == {}
+
+
 def test_node_close_hook_skips_without_tan_app(tmp_path):
     import threading
 

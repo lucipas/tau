@@ -201,12 +201,21 @@ def due_poll_closes(
     return due
 
 
-def _close_record(app: Any, target: str) -> Dict[str, Any]:
+def _close_record(
+    app: Any, target: str, close_at: float
+) -> Optional[Dict[str, Any]]:
     """The signed close entry for *target*, created or re-found.
 
     A pass that already wrote the close but reached no peer re-sends
     the stored entry: creating a second close would raise (a poll is
     closed at most once) and wrongly drop the schedule as terminal.
+    A close created before the deadline is not the sweep's — it is a
+    manual close, so ``None`` is returned and the caller drops the
+    schedule instead of republishing it.  The sweep's own closes are
+    always created at or after the deadline they fire on; a manual
+    close made after the deadline is indistinguishable from the
+    sweep's and is re-sent once.  A record without a creation time is
+    treated as the sweep's (every close this code writes is stamped).
     Apps without ``get_poll_close`` (older fakes) go straight to
     creating, as before.
     """
@@ -214,6 +223,13 @@ def _close_record(app: Any, target: str) -> Dict[str, Any]:
     if existing is not None:
         record = existing(target)
         if record is not None:
+            created_at = record.get("created_at")
+            if (
+                isinstance(created_at, (int, float))
+                and not isinstance(created_at, bool)
+                and float(created_at) < close_at
+            ):
+                return None
             return record
     return app.close_poll(target, publish=False)
 
@@ -271,18 +287,22 @@ def close_due_polls(
     publish=False)`` — the same path a manual ``tau tan close-poll``
     uses, so the in-lock recheck still decides a race with a manual
     close — and then published with the gossip fanout, the pass
-    deadline and the stop callback.  The pass is bounded: it stops
-    starting new closes once *deadline* (a ``time.monotonic`` value,
-    defaulting to ``CLOSE_PASS_BUDGET_SECONDS`` from now) passes or
-    *should_stop* (the node's stop event) is set, leaving the rest
-    due for a later pass.  A close that fails because the poll is
-    already closed, deleted, expired or unknown is terminal: the
-    schedule is dropped, not retried.  A close that reached no peer
-    keeps its schedule — the next pass re-sends the same signed close
-    record instead of creating a second one.  Any other failure keeps
-    the schedule for the next pass.  A corrupt schedule file logs a
-    warning and closes nothing, so one bad file cannot stall the
-    mail loop that calls this.
+    deadline and the stop callback.  A close the sweep already wrote
+    but could not deliver is re-sent from storage instead of created
+    again; a close created before the deadline is a manual close, and
+    its schedule is dropped rather than republished.  The pass is
+    bounded: it stops starting new closes once *deadline* (a
+    ``time.monotonic`` value, defaulting to
+    ``CLOSE_PASS_BUDGET_SECONDS`` from now) passes or *should_stop*
+    (the node's stop event) is set, leaving the rest due for a later
+    pass.  A close that fails because the poll is already closed,
+    deleted, expired or unknown is terminal: the schedule is dropped,
+    not retried.  A close that reached no peer keeps its schedule —
+    the next pass re-sends the same signed close record instead of
+    creating a second one.  Any other failure keeps the schedule for
+    the next pass.  A corrupt schedule file logs a warning and closes
+    nothing, so one bad file cannot stall the mail loop that calls
+    this.
 
     Returns ``{"closed": n, "dropped": m, "kept": k}``.
     """
@@ -300,7 +320,7 @@ def close_due_polls(
     closed = 0
     dropped = 0
     kept = 0
-    for index, (target, _close_at) in enumerate(due):
+    for index, (target, close_at) in enumerate(due):
         if should_stop is not None and should_stop():
             kept += len(due) - index
             break
@@ -308,7 +328,7 @@ def close_due_polls(
             kept += len(due) - index
             break
         try:
-            record = _close_record(app, target)
+            record = _close_record(app, target, close_at)
         except TanError as exc:
             # Terminal: the poll is already closed, deleted, expired
             # or unknown — nothing a later pass could close.
@@ -323,6 +343,16 @@ def close_due_polls(
                 exc_info=True,
             )
             kept += 1
+            continue
+        if record is None:
+            # A manual close made before the deadline: the poll is
+            # already closed — drop the schedule, do not republish it.
+            log.info(
+                "Dropping scheduled close for %s: poll is already closed",
+                target,
+            )
+            drop_poll_close(path, target)
+            dropped += 1
             continue
         try:
             outcome = _publish_close(
