@@ -5487,13 +5487,15 @@ class TauNode:
         poll_closes_path = getattr(self.config, "poll_closes_path", None)
         if poll_closes_path is None:
             return
-        from .poll_closes import close_due_polls
+        from .poll_closes import CLOSE_PASS_BUDGET_SECONDS, close_due_polls
 
+        stop_event = getattr(self, "_stop_event", None)
         try:
             result = close_due_polls(
                 poll_closes_path,
                 app,
-                should_stop=self._stop_event.is_set,
+                should_stop=stop_event.is_set if stop_event is not None else None,
+                deadline=time.monotonic() + CLOSE_PASS_BUDGET_SECONDS,
             )
         except Exception:  # pragma: no cover - defensive; helper logs
             log.debug("Scheduled poll-close round failed", exc_info=True)
