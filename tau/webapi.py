@@ -461,6 +461,7 @@ from .group_polls import (
     is_dm_poll,
     is_group_poll,
     poll_identity,
+    record_imported_group_poll_identities,
 )
 from .ignored_groups import (
     IgnoredGroupsError,
@@ -5859,6 +5860,13 @@ class WebBridge:
                 )
         else:
             result = inbox.import_messages(document, inserted=inserted)
+        if mailbox is not None:
+            # A group poll imported from history never passed the wire
+            # handler, so record its durable identity now — the same
+            # recording the CLI import performs.  A genuine
+            # retired-group close for it must still validate after the
+            # poll record itself is evicted (see #854).
+            record_imported_group_poll_identities(mailbox, inserted)
         # A group export carries verifiable rename-lineage evidence
         # (see #801): restore the predecessor link on this node so
         # the imported older messages join the group's history, the

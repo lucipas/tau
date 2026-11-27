@@ -208,6 +208,7 @@ from .group_polls import (
     is_group_poll_close,
     is_group_poll_vote,
     poll_identity,
+    record_imported_group_poll_identities,
 )
 from .ignored_groups import (
     IgnoredGroups,
@@ -19453,13 +19454,20 @@ def cmd_messages_import(args: argparse.Namespace) -> int:
     # Hold the mailbox transaction across the import: it reloads the
     # markers from disk, so a retract persisted by a running `tau serve`
     # is seen, and it cannot land between the check and the insert.
+    inserted: List[Dict[str, Any]] = []
     with mailbox.transaction():
         result = inbox.import_messages(
             document,
+            inserted=inserted,
             is_retracted=mailbox.is_retracted,
             is_group_retracted=mailbox.is_group_retracted,
             pending_group_edit=mailbox.pending_group_edit,
         )
+    # A group poll imported from history never passed the wire
+    # handler, so record its durable identity now: a genuine
+    # retired-group close for it must still validate after the
+    # poll record itself is evicted from the capped inbox (see #854).
+    record_imported_group_poll_identities(mailbox, inserted)
     # A group export carries verifiable rename-lineage evidence
     # (see #801): restore the predecessor link on the destination
     # so the imported older messages join the group's history

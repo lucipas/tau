@@ -8530,6 +8530,64 @@ def test_messages_export_import_round_trip(tmp_path, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert [item["id"] for item in payload["messages"]] == ["m-2", "m-1"]
 
+
+def test_messages_import_records_group_poll_identities(tmp_path, capsys):
+    # Qodo Critical on PR #854: a group poll imported from history
+    # never passed the wire handler, so the import must record its
+    # durable identity — otherwise a genuine retired-group close for
+    # it defers forever once the poll record is evicted.  An
+    # outbound poll is skipped: its author is this node, never a
+    # peer whose close must validate.
+    target_dir = tmp_path / "node"
+    author_hash = "aa" * 16
+    group_id = "cc" * 16
+    document = {
+        "format": "tau-messages-export",
+        "version": 1,
+        "messages": [
+            {
+                "from": author_hash,
+                "destination": author_hash,
+                "text": "which day?",
+                "sent_at": 1000.0,
+                "received_at": 1000.0,
+                "id": "poll-1",
+                "kind": "group",
+                "group": group_id,
+                "group_name": "weekend",
+                "poll_options": ["Saturday", "Sunday"],
+            },
+            {
+                "from": "me",
+                "destination": "bb" * 16,
+                "text": "my poll",
+                "sent_at": 2000.0,
+                "received_at": 2000.0,
+                "id": "poll-2",
+                "kind": "group",
+                "group": group_id,
+                "group_name": "weekend",
+                "poll_options": ["Yes", "No"],
+                "direction": "out",
+            },
+        ],
+    }
+    export_path = tmp_path / "messages-backup.json"
+    export_path.write_text(json.dumps(document), encoding="utf-8")
+
+    code = cli.main(
+        ["messages", "import", "--data-dir", str(target_dir), str(export_path)]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "Imported 2 messages (0 already present, 0 skipped)" in out
+
+    mailbox = Mailbox(target_dir / "mailbox.json")
+    assert mailbox.has_group_poll_identity(author_hash, group_id, 1000.0) is True
+    assert (
+        mailbox.has_group_poll_identity("bb" * 16, group_id, 2000.0) is False
+    )
+
     # Re-importing the same file reports both as present, not as new.
     code = cli.main(
         ["messages", "import", "--data-dir", str(target_dir), str(export_path)]

@@ -8305,3 +8305,142 @@ def test_retired_group_poll_close_lands_after_its_poll_is_evicted(tmp_path):
     )
     assert close_record["text"] == "closed the poll"
     assert node.groups.get_retired(group_id) is not None
+
+
+def test_retired_group_poll_close_lands_after_imported_poll_is_evicted(tmp_path):
+    """Qodo Critical on PR #854: an imported poll's genuine close must
+    not defer forever when the poll is evicted from the capped inbox.
+    The import never passed the wire handler, so the import records
+    the poll's durable identity — and the close still lands after
+    the record itself is gone."""
+    from tau.group_polls import record_imported_group_poll_identities
+
+    holder_hash = "ab" * 16
+    author = RNS.Identity()
+    author_hash = destination_hash(author).hex()
+    third = RNS.Identity()
+    third_hash = destination_hash(third).hex()
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    node.destination = SimpleNamespace(
+        hexhash=holder_hash, hash=bytes.fromhex(holder_hash)
+    )
+    members = [author_hash, holder_hash, third_hash]
+    group_id = derive_group_id(author_hash, "weekend", members)
+    # The poll arrives by import, not on the wire: the wire handler
+    # never sees it, so only the import records its identity.
+    inserted = []
+    result = node.inbox.import_messages(
+        {
+            "format": "tau-messages-export",
+            "version": 1,
+            "messages": [
+                {
+                    "from": author_hash,
+                    "destination": author_hash,
+                    "text": "which day?",
+                    "sent_at": 1000.0,
+                    "received_at": 1000.0,
+                    "id": "retired-poll-1",
+                    "kind": "group",
+                    "group": group_id,
+                    "group_name": "weekend",
+                    "poll_options": ["Saturday", "Sunday"],
+                }
+            ],
+        },
+        inserted=inserted,
+    )
+    assert result["imported"] == 1
+    assert record_imported_group_poll_identities(node.mailbox, inserted) == 1
+    assert node.mailbox.has_group_poll_identity(author_hash, group_id, 1000.0)
+    # The import alone does not create the group in the store — a
+    # plain wire message under it does, the way live membership
+    # would.  It is not a poll, so it records no identity: the
+    # poll's identity still comes only from the import.
+    hello = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "weekend planning",
+            message_id="retired-hello-1",
+            group_id=group_id,
+            group_name="weekend",
+            creator=author_hash,
+            members=members,
+            sent_at=900.0,
+        ),
+        remote_identity=author,
+    )
+    assert hello["ok"] is True
+    assert node.groups.get(group_id) is not None
+    # Retire the group the same way _retired_poll_setup does: a
+    # successor message drops the third member.
+    successor_id = derive_group_id(
+        author_hash, "weekend", [author_hash, holder_hash]
+    )
+    successor = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "weekend continues",
+            message_id="retired-successor-1",
+            group_id=successor_id,
+            group_name="weekend",
+            creator=author_hash,
+            members=[author_hash, holder_hash],
+            sent_at=1100.0,
+            renamed_from=[group_id],
+        ),
+        remote_identity=author,
+    )
+    assert successor["ok"] is True
+    assert node.groups.get(group_id) is None
+    assert node.groups.get_retired(group_id) is not None
+    # Flood the inbox past its retention cap so the poll record is
+    # evicted: 500 filler records in one import, all newer than it.
+    fillers = [
+        {
+            "from": "filler",
+            "destination": "ab" * 16,
+            "text": f"filler {index}",
+            "sent_at": 2000.0 + index,
+            "received_at": 2000.0 + index,
+            "id": f"filler-{index}",
+            "kind": "chat",
+        }
+        for index in range(500)
+    ]
+    result = node.inbox.import_messages(
+        {"format": "tau-messages-export", "version": 1, "messages": fillers}
+    )
+    assert result["imported"] == 500
+    history = node.inbox.list_messages(
+        limit=None, group=group_id, direction=None
+    )
+    assert not any(
+        record.get("poll_options") is not None for record in history
+    )
+    # The close still lands: the durable identity, not the evicted
+    # record, validates it.
+    close = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "closed the poll",
+            message_id="retired-close-1",
+            group_id=group_id,
+            group_name="weekend",
+            creator=author_hash,
+            members=members,
+            sent_at=2000.0,
+            poll_close={"author": author_hash, "sent_at": 1000.0},
+        ),
+        remote_identity=author,
+    )
+    assert close["ok"] is True
+    history = node.inbox.list_messages(
+        limit=None, group=group_id, direction=None
+    )
+    close_record = next(
+        record for record in history if record.get("poll_close") is not None
+    )
+    assert close_record["text"] == "closed the poll"
+    assert node.groups.get_retired(group_id) is not None

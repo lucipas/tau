@@ -25162,6 +25162,43 @@ def test_messages_import_skips_a_retracted_message(bridge, node, tmp_path):
         bridge2.stop()
 
 
+def test_messages_import_records_group_poll_identities(bridge, node):
+    # Qodo Critical on PR #854: a group poll imported through the
+    # console never passed the wire handler, so the import must
+    # record its durable identity — otherwise a genuine
+    # retired-group close for it defers forever once the poll
+    # record is evicted.
+    author_hash = "aa" * 16
+    group_id = "cc" * 16
+    document = {
+        "format": "tau-messages-export",
+        "version": 1,
+        "messages": [
+            {
+                "from": author_hash,
+                "destination": author_hash,
+                "text": "which day?",
+                "sent_at": 1000.0,
+                "received_at": 1000.0,
+                "id": "poll-1",
+                "kind": "group",
+                "group": group_id,
+                "group_name": "weekend",
+                "poll_options": ["Saturday", "Sunday"],
+            }
+        ],
+    }
+    status, _, payload = _json(
+        bridge, "/api/messages/import", method="POST", body=document
+    )
+    assert status == 200
+    assert payload["import"]["imported"] == 1
+    assert (
+        node.mailbox.has_group_poll_identity(author_hash, group_id, 1000.0)
+        is True
+    )
+
+
 def test_messages_import_reports_failed_lineage_restore(
     bridge, node, monkeypatch
 ):

@@ -3668,9 +3668,8 @@ class TauNode:
             # Nothing is stored and the id is not marked seen, so a
             # re-sent close is re-evaluated, not answered duplicate.
             log.info(
-                "Deferring retired-group poll close from %s: its poll "
+                "Deferring retired-group poll close: its poll "
                 "has not arrived yet for group %s",
-                caller_hash[:8] if caller_hash else "anonymous",
                 group.get("name"),
             )
             return response_error(
@@ -10579,9 +10578,8 @@ class TauNode:
                 # a close its poll may still validate (see
                 # DeliveryDeferredError).
                 log.info(
-                    "Deferring relayed retired-group poll close from "
-                    "%s: its poll has not arrived yet for group %s",
-                    sender[:8] if sender else "unknown",
+                    "Deferring relayed retired-group poll close: its "
+                    "poll has not arrived yet for group %s",
                     pinned.get("name"),
                 )
                 raise DeliveryDeferredError(
