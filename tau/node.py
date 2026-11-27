@@ -5383,6 +5383,10 @@ class TauNode:
             except Exception:  # pragma: no cover - defensive
                 log.debug("Scheduled-post publish failed", exc_info=True)
             try:
+                self._close_due_polls()
+            except Exception:  # pragma: no cover - defensive
+                log.debug("Scheduled poll-close round failed", exc_info=True)
+            try:
                 self._publish_due_scheduled_channel_messages()
             except Exception:  # pragma: no cover - defensive
                 log.debug("Scheduled channel-message publish failed", exc_info=True)
@@ -5447,6 +5451,9 @@ class TauNode:
                 app,
                 resolve_peer=self.resolve_peer,
                 should_stop=self._stop_event.is_set,
+                poll_close_path=getattr(
+                    self.config, "poll_closes_path", None
+                ),
                 contact_refusal=lambda contact: channel_contact_refusal(
                     contact,
                     own_hash=self.destination_hexhash,
@@ -5459,6 +5466,42 @@ class TauNode:
         if result["published"]:
             log.info(
                 "Published %d scheduled Tan post(s)", result["published"]
+            )
+
+    def _close_due_polls(self) -> None:
+        """Close Tan polls whose scheduled deadline has come.
+
+        Only when a Tan app is attached (``tau serve --social``): the
+        close is the author's own signed entry, so it needs the app,
+        and the schedule simply waits for a serving node that has
+        one — the same rule as the scheduled-post publish pass above.
+        A close that fails for a transient reason keeps its schedule
+        for the next pass — see ``tau.poll_closes`` — so this never
+        raises into the mail loop.
+        """
+        app = self.app
+        if app is None:
+            return
+        if not hasattr(app, "close_poll"):
+            return
+        poll_closes_path = getattr(self.config, "poll_closes_path", None)
+        if poll_closes_path is None:
+            return
+        from .poll_closes import close_due_polls
+
+        try:
+            result = close_due_polls(
+                poll_closes_path,
+                app,
+                should_stop=self._stop_event.is_set,
+            )
+        except Exception:  # pragma: no cover - defensive; helper logs
+            log.debug("Scheduled poll-close round failed", exc_info=True)
+            return
+        if result["closed"]:
+            log.info(
+                "Closed %d Tan poll(s) at their scheduled deadline",
+                result["closed"],
             )
 
     def _publish_due_scheduled_channel_messages(self) -> None:

@@ -47,6 +47,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
+from .poll_closes import MAX_POLL_CLOSE_AFTER
 from .protocol import (
     ProtocolError,
     clean_contact,
@@ -340,6 +341,11 @@ class ScheduledPost:
     # expires.  Stored as a duration, not a timestamp: the clock starts
     # when the post is published, not when it is queued.
     expires_in: float = 0.0
+    # Seconds after publication until a poll closes itself; 0.0 means
+    # it never closes on its own.  Stored as a duration, not a
+    # timestamp, like ``expires_in`` — the clock starts when the poll
+    # is published, not when it is queued.  Only a poll carries one.
+    close_after: float = 0.0
     # What the entry publishes as: ``"post"`` (the text is the post,
     # optionally a reply), ``"poll"`` (the text is the question and
     # ``options`` carries its fixed choices), or ``"repost"`` /
@@ -383,6 +389,7 @@ class ScheduledPost:
         object.__setattr__(self, "paused_at", _clean_retry_at(self.paused_at))
         object.__setattr__(self, "pending_peers", _clean_targets(list(self.pending_peers)))
         object.__setattr__(self, "expires_in", _clean_duration(self.expires_in))
+        object.__setattr__(self, "close_after", _clean_duration(self.close_after))
         object.__setattr__(self, "kind", _clean_kind(self.kind))
         object.__setattr__(self, "target_post", _clean_reply_to(self.target_post))
         object.__setattr__(self, "options", _clean_options(self.options))
@@ -396,6 +403,18 @@ class ScheduledPost:
                 raise ScheduledPostsError("a scheduled poll cannot be a reply")
             if not 2 <= len(self.options) <= 8:
                 raise ScheduledPostsError("a scheduled poll needs 2-8 options")
+            if self.close_after > MAX_POLL_CLOSE_AFTER:
+                raise ScheduledPostsError(
+                    "a scheduled poll's close-after must be at most 7d"
+                )
+            if (
+                self.expires_in > 0
+                and self.close_after > 0
+                and self.close_after >= self.expires_in
+            ):
+                raise ScheduledPostsError(
+                    "a scheduled poll must close before it expires"
+                )
             if self.image is not None:
                 raise ScheduledPostsError("a scheduled poll cannot carry an image")
             if self.location is not None:
@@ -410,6 +429,11 @@ class ScheduledPost:
             # A repost/quote amplifies one post: it has no reply target
             # and no expiry (those commands have no --expire — the
             # created records carry none), and it names its original.
+            if self.close_after > 0:
+                raise ScheduledPostsError(
+                    f"a scheduled {self.kind} cannot carry a close deadline"
+                    " — only a poll can"
+                )
             if self.reply_to is not None:
                 raise ScheduledPostsError(
                     f"a scheduled {self.kind} cannot be a reply"
@@ -442,6 +466,11 @@ class ScheduledPost:
                     f"a scheduled {self.kind} cannot carry a contact card"
                 )
         else:
+            if self.close_after > 0:
+                raise ScheduledPostsError(
+                    "a scheduled post cannot carry a close deadline"
+                    " — only a poll can"
+                )
             if self.target_post is not None:
                 raise ScheduledPostsError(
                     "a scheduled post cannot carry a target post"
@@ -480,6 +509,7 @@ class ScheduledPost:
             "paused_at": self.paused_at,
             "pending_peers": list(self.pending_peers),
             "expires_in": self.expires_in,
+            "close_after": self.close_after,
             "kind": self.kind,
             "target_post": self.target_post,
             "options": list(self.options),
@@ -507,6 +537,7 @@ class ScheduledPost:
             paused_at=_clean_retry_at(data.get("paused_at", 0.0)),
             pending_peers=_clean_targets(data.get("pending_peers")),
             expires_in=_clean_duration(data.get("expires_in", 0.0)),
+            close_after=_clean_duration(data.get("close_after", 0.0)),
             kind=kind,
             target_post=_clean_reply_to(data.get("target_post")),
             options=_clean_options(data.get("options")),
@@ -654,6 +685,7 @@ def schedule_post(
     now: Optional[float] = None,
     name: Optional[str] = None,
     expires_in: float = 0.0,
+    close_after: float = 0.0,
     kind: str = "post",
     target_post: Optional[str] = None,
     options: Optional[Sequence[str]] = None,
@@ -675,6 +707,8 @@ def schedule_post(
     immediate ``tau tan poll`` gets, so a poll that could never fit
     the 8 KiB Tan request is refused here.  A poll cannot carry an
     image: no side supports a scheduled poll with an attachment.
+    When *close_after* is given the poll closes itself that long
+    after it is published (see :func:`schedule_poll`).
 
     With ``kind="repost"`` the entry carries no text and *target_post*
     is the post being reposted; with ``kind="quote"`` the text is the
@@ -827,6 +861,7 @@ def schedule_post(
         publish_at=_clean_timestamp(publish_at, "publish_at"),
         created_at=now if now is not None else time.time(),
         expires_in=clean_expires_in,
+        close_after=close_after,
         kind=clean_kind,
         target_post=clean_target,
         options=clean_options,
@@ -914,11 +949,19 @@ def schedule_poll(
     now: Optional[float] = None,
     name: Optional[str] = None,
     expires_in: float = 0.0,
+    close_after: float = 0.0,
 ) -> ScheduledPost:
     """Queue a poll for *publish_at*; returns the stored entry.
 
     Thin wrapper over :func:`schedule_post` with ``kind="poll"``: the
     question is the entry text and the options ride alongside it.
+    When *close_after* is given the poll closes itself that long
+    after it is published: the publish pass registers the close when
+    the poll is signed, so the deadline counts from publication, not
+    from queue time.  A close deadline is refused for any other kind,
+    must be at most 7d, and must come before the poll's expiry when
+    one is set — a poll that expires before its deadline could never
+    be closed.
     """
     return schedule_post(
         path,
@@ -929,6 +972,7 @@ def schedule_poll(
         now=now,
         name=name,
         expires_in=expires_in,
+        close_after=close_after,
         kind="poll",
         options=options,
     )
@@ -1097,6 +1141,7 @@ def publish_due_scheduled_posts(
     now: Optional[float] = None,
     should_stop: Optional[Callable[[], bool]] = None,
     contact_refusal: Optional[Callable[[Dict[str, Any]], Optional[str]]] = None,
+    poll_close_path: Optional[Union[str, Path]] = None,
 ) -> Dict[str, int]:
     """Publish every due queued post through *app* (a ``TanApp``).
 
@@ -1113,7 +1158,11 @@ def publish_due_scheduled_posts(
     post.  Peers that already accepted it are not sent it again.  A
     queued poll publishes the same way, through ``app.create_poll``
     with the question and its fixed options, so its expiry clock also
-    starts at publish time.  A queued repost or quote publishes the
+    starts at publish time.  When *poll_close_path* is given, a poll
+    carrying a close deadline registers it there once the poll is
+    signed (see :func:`tau.poll_closes.schedule_poll_close`), so the
+    serving node's close pass can close it at the deadline.  A queued
+    repost or quote publishes the
     same way, through ``app.repost`` / ``app.quote`` with its target
     post, so the target checks (cached, linked, not deleted, no
     standing repost) apply at publish time and a failure there keeps
@@ -1247,6 +1296,37 @@ def publish_due_scheduled_posts(
                         post = replace(post, post_hash=created["hash"])
                         queue = queue.with_replaced(post)
                         save_scheduled_posts(path, queue)
+                    if (
+                        post.kind == "poll"
+                        and post.close_after > 0
+                        and poll_close_path is not None
+                    ):
+                        # The close deadline counts from the poll's
+                        # signed creation time, not from queue time or
+                        # this pass: a retry that re-sends the same poll
+                        # registers the same deadline instead of
+                        # pushing it later.  (A record without a
+                        # creation time falls back to this pass — only
+                        # a non-conforming app omits one.)  When the
+                        # deadline already passed while the poll was
+                        # still queued, it closes at the next sweep,
+                        # as soon as it is out: the voting window has
+                        # already elapsed.  Registering before the
+                        # publish means a failure here keeps the entry
+                        # queued like any other failed publish, so a
+                        # poll never goes out without the close it was
+                        # promised.
+                        from .poll_closes import schedule_poll_close
+
+                        close_at = (created.get("created_at") or at) + post.close_after
+                        if close_at <= at:
+                            close_at = at + 1.0
+                        schedule_poll_close(
+                            poll_close_path,
+                            created["hash"],
+                            close_at,
+                            now=at,
+                        )
                     result = app.publish(
                         created,
                         targets=targets,

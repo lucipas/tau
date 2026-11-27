@@ -3880,6 +3880,119 @@ def test_cli_tan_poll_vote_results(tmp_path, capsys):
     assert "at least 2 --option values" in capsys.readouterr().err
 
 
+def test_cli_tan_poll_close_after(tmp_path, capsys):
+    from tau.poll_closes import load_poll_closes
+    from tau.scheduled_posts import load_scheduled_posts
+
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    capsys.readouterr()
+    before = time.time()
+    assert (
+        main(
+            [
+                "tan",
+                "poll",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                "--option",
+                "Thursday",
+                "--option",
+                "Friday",
+                "--close-after",
+                "3d",
+                "meet thursday or friday?",
+            ]
+        )
+        == 0
+    )
+    after = time.time()
+    payload = json.loads(capsys.readouterr().out)
+    poll = payload["poll"]
+    assert poll["kind"] == "poll"
+    # The deadline is recorded alongside the poll: three days out,
+    # and the close schedule is keyed by the poll's hash.
+    assert before + 3 * 24 * 60 * 60 <= payload["close_at"] <= after + 3 * 24 * 60 * 60
+    closes = load_poll_closes(data_dir / "poll-closes.json")
+    assert closes == {poll["hash"]: payload["close_at"]}
+
+    # A deadline past the 7d horizon, and one at or past the poll's
+    # own expiry, are both refused before anything is stored.
+    assert (
+        main(
+            [
+                "tan",
+                "poll",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--option",
+                "Thursday",
+                "--option",
+                "Friday",
+                "--close-after",
+                "8d",
+                "too far out?",
+            ]
+        )
+        == 2
+    )
+    assert "at most 1w" in capsys.readouterr().err
+    assert (
+        main(
+            [
+                "tan",
+                "poll",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--option",
+                "Thursday",
+                "--option",
+                "Friday",
+                "--close-after",
+                "2d",
+                "--expire",
+                "1d",
+                "expires first?",
+            ]
+        )
+        == 2
+    )
+    assert "must be shorter than --expire" in capsys.readouterr().err
+
+    # With --delay the deadline rides the queue entry: it counts from
+    # publication, not from queue time.
+    assert (
+        main(
+            [
+                "tan",
+                "poll",
+                "--data-dir",
+                str(data_dir),
+                "--json",
+                "--option",
+                "Thursday",
+                "--option",
+                "Friday",
+                "--delay",
+                "5m",
+                "--close-after",
+                "1h",
+                "meet thursday or friday?",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["scheduled"]["close_after"] == 3600.0
+    queue = load_scheduled_posts(data_dir / "scheduled-posts.json")
+    assert len(queue) == 1
+    assert queue.posts[0].close_after == 3600.0
+
+
 def test_cli_tan_close_poll(tmp_path, capsys):
     data_dir = tmp_path / "alice"
     assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0

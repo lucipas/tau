@@ -12003,6 +12003,81 @@ def test_tan_poll_via_api(tmp_path):
         bridge.stop()
 
 
+def test_tan_poll_close_after_via_api(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.poll_closes import load_poll_closes
+    from tau.tangents.tan import TanApp, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    conn.close()
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        before = time.time()
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/poll",
+            method="POST",
+            body={
+                "question": "which day?",
+                "options": ["Thursday", "Friday"],
+                "close_after": 3 * 24 * 60 * 60,
+            },
+        )
+        after = time.time()
+        assert status == 200
+        poll = payload["poll"]
+        assert poll["kind"] == "poll"
+        assert before + 3 * 24 * 60 * 60 <= poll["close_at"] <= after + 3 * 24 * 60 * 60
+        assert load_poll_closes(tmp_path / "poll-closes.json") == {
+            poll["hash"]: poll["close_at"]
+        }
+
+        # A deadline past the 7d horizon, and one at or past the
+        # poll's own expiry, are both refused before anything is stored.
+        for body, fragment in [
+            (
+                {
+                    "question": "which day?",
+                    "options": ["Thursday", "Friday"],
+                    "close_after": 8 * 24 * 60 * 60,
+                },
+                "close_after",
+            ),
+            (
+                {
+                    "question": "which day?",
+                    "options": ["Thursday", "Friday"],
+                    "close_after": 0,
+                },
+                "close_after",
+            ),
+            (
+                {
+                    "question": "which day?",
+                    "options": ["Thursday", "Friday"],
+                    "expires_in": 3600,
+                    "close_after": 3600,
+                },
+                "shorter than 'expires_in'",
+            ),
+        ]:
+            status, _, payload = _json(
+                bridge, "/api/tan/poll", method="POST", body=body
+            )
+            assert status == 400, body
+            assert fragment in payload["error"]["message"], body
+    finally:
+        bridge.stop()
+
+
 def test_tan_repost_via_api(tmp_path):
     import RNS
 
@@ -16912,6 +16987,71 @@ def test_tan_schedule_poll_via_api(tmp_path):
         assert status == 200
         assert payload["cancelled"]["id"] == scheduled["id"]
         assert payload["deleted_local"] is False
+    finally:
+        bridge.stop()
+
+
+def test_tan_schedule_poll_close_after_via_api(tmp_path):
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # The deadline rides the queue entry, so it counts from
+        # publication, not from queue time.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/schedule",
+            method="POST",
+            body={
+                "text": "pizza or tacos?",
+                "poll_options": ["Pizza", "Tacos"],
+                "send_in": 3600,
+                "close_after": 3600,
+            },
+        )
+        assert status == 200
+        scheduled = payload["scheduled"]
+        assert scheduled["kind"] == "poll"
+        assert scheduled["close_after"] == 3600
+
+        # A close deadline on anything but a poll, past the 7d
+        # horizon, or at or past the expiry is refused.
+        for body, fragment in [
+            (
+                {"text": "plain post", "send_in": 60, "close_after": 3600},
+                "only a scheduled poll",
+            ),
+            (
+                {
+                    "text": "pick?",
+                    "poll_options": ["Yes", "No"],
+                    "send_in": 60,
+                    "close_after": 8 * 24 * 60 * 60,
+                },
+                "close_after",
+            ),
+            (
+                {
+                    "text": "pick?",
+                    "poll_options": ["Yes", "No"],
+                    "send_in": 60,
+                    "expires_in": 3600,
+                    "close_after": 3600,
+                },
+                "close before it expires",
+            ),
+        ]:
+            status, _, payload = _json(
+                bridge, "/api/tan/schedule", method="POST", body=body
+            )
+            assert status == 400, body
+            assert fragment in payload["error"]["message"], body
+
+        status, _, payload = _json(bridge, "/api/tan/scheduled")
+        assert status == 200
+        assert payload["count"] == 1
     finally:
         bridge.stop()
 

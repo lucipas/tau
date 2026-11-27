@@ -1381,6 +1381,29 @@ def get_post(conn: sqlite3.Connection, digest: str) -> Optional[Dict[str, Any]]:
     return _row_to_post_with_meta(row) if row is not None else None
 
 
+def close_record_for_poll(
+    conn: sqlite3.Connection, target: str, author: str
+) -> Optional[Dict[str, Any]]:
+    """Return the stored close entry for poll *target* by *author*.
+
+    The newest linked close wins: a poll is closed at most once, but
+    a re-send after a failed publish must find the entry the sweep
+    already wrote, so the next pass publishes the same signed close
+    instead of signing a second one (``create_close_poll`` raises on
+    an already-closed poll).
+    """
+    _require_hex(target, HASH_HEX_LENGTH, "target")
+    _require_hex(author, AUTHOR_HEX_LENGTH, "author")
+    row = conn.execute(
+        f"SELECT {', '.join(_POST_COLUMNS)} FROM posts "
+        "WHERE kind = 'close' AND linked = 1 "
+        "AND target = ? AND author = ? "
+        "ORDER BY seq DESC LIMIT 1",
+        (target, author),
+    ).fetchone()
+    return _row_to_post_with_meta(row) if row is not None else None
+
+
 def find_post_by_image(
     conn: sqlite3.Connection, sha256: str
 ) -> Optional[Dict[str, Any]]:
@@ -9445,6 +9468,23 @@ class TanApp:
             return get_post(conn, digest)
         finally:
             conn.close()
+
+    def get_poll_close(self, target: str) -> Optional[Dict[str, Any]]:
+        """Return this app's stored close entry for poll *target*.
+
+        The canonical record (no storage-only ``seq``/``linked``
+        keys), ready to hand to :meth:`publish`: the close sweep
+        re-sends it when an earlier pass wrote the close but reached
+        no peer, instead of signing a second close entry.
+        """
+        conn = self.connect()
+        try:
+            record = close_record_for_poll(conn, target, self.author)
+        finally:
+            conn.close()
+        if record is None:
+            return None
+        return {k: v for k, v in record.items() if k not in ("seq", "linked")}
 
     def quote(
         self,

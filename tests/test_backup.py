@@ -712,6 +712,41 @@ def test_backup_restore_round_trip_keeps_reminders(tmp_path, capsys):
     assert len(ReminderStore(node_b / "reminders.json")) == 1
 
 
+def test_backup_restore_round_trip_keeps_poll_closes(tmp_path, capsys):
+    from tau.poll_closes import load_poll_closes, schedule_poll_close
+
+    node_a = _init_node(tmp_path, "a", "alice")
+    schedule_poll_close(
+        node_a / "poll-closes.json", "aa" * 32, 9000.0, now=1000.0
+    )
+    capsys.readouterr()
+    archive = tmp_path / "backup.tar.gz"
+    assert cli.main(["backup", str(archive), "--data-dir", str(node_a)]) == 0
+    capsys.readouterr()
+
+    node_b = tmp_path / "b"
+    assert (
+        cli.main(
+            [
+                "restore",
+                str(archive),
+                "--data-dir",
+                str(node_b),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert "poll-closes.json" in payload["files"]
+    assert (node_b / "poll-closes.json").read_bytes() == (
+        node_a / "poll-closes.json"
+    ).read_bytes()
+    assert load_poll_closes(node_b / "poll-closes.json") == {
+        "aa" * 32: 9000.0
+    }
+
+
 def test_restore_rejects_misplaced_files_member(tmp_path):
     # Received-file members are exactly files/<sender>/<name>: a file
     # directly under files/, or nested any deeper, is not a member
