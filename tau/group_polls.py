@@ -154,6 +154,46 @@ def poll_identity(
     return (author.lower(), float(sent_at))
 
 
+def record_imported_group_poll_identities(
+    mailbox: Any, records: Sequence[Dict[str, Any]]
+) -> int:
+    """Record durable identities for imported inbound group polls.
+
+    A history import stores group polls without them passing through
+    the wire handler, so their identities were never recorded — and
+    a genuine retired-group close for an imported poll would defer
+    forever once inbox retention evicted the poll record itself (see
+    :meth:`tau.node.TauNode._has_retired_group_poll`).  Call this
+    after each successful import with the records the import kept:
+    every retained, newly inserted inbound group poll gets its
+    identity recorded in the mailbox, keyed the same way the wire
+    path records it.  Outbound records are skipped — a poll this
+    node sent is attributed to itself, never to a peer whose close
+    must validate.  Best-effort: a mailbox failure never fails the
+    import; the messages are already in.  Returns how many
+    identities were recorded.
+    """
+    recorded = 0
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        if record.get("direction") == "out":
+            continue
+        if not is_group_poll(record):
+            continue
+        identity = poll_identity(record, None)
+        if identity is None:
+            continue
+        try:
+            if mailbox.record_group_poll_identity(
+                identity[0], record.get("group"), identity[1]
+            ):
+                recorded += 1
+        except (OSError, ValueError, TypeError):
+            continue
+    return recorded
+
+
 def _logical_sent_at(record: Dict[str, Any]) -> Optional[float]:
     """The send time every leg of *record* shares.
 
