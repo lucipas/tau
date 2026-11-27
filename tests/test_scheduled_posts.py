@@ -1637,7 +1637,7 @@ def test_publish_pass_resumes_unsent_peers_before_failed_ones(tmp_path):
     stop = {"set": False}
 
     class _FailingFirstNode:
-        def request(self, peer, path, payload, *, timeout=15.0):
+        def request(self, peer, path, payload, *, timeout=15.0, deadline=None):
             if peer.hexhash == "a" * 64:
                 stop["set"] = True
                 raise RuntimeError("no route")
@@ -1686,7 +1686,7 @@ def test_publish_pass_keeps_unsent_peers_when_stopping(tmp_path):
     stop = {"set": False}
 
     class _RecordingNode:
-        def request(self, peer, path, payload, *, timeout=15.0):
+        def request(self, peer, path, payload, *, timeout=15.0, deadline=None):
             sent.append(peer.hexhash)
             if len(sent) == 1:
                 stop["set"] = True
@@ -1753,7 +1753,7 @@ def test_paused_post_yields_to_later_due_posts(tmp_path):
     calls = {"n": 0}
 
     class _StallingNode:
-        def request(self, peer, path, payload, *, timeout=15.0):
+        def request(self, peer, path, payload, *, timeout=15.0, deadline=None):
             sent.append(peer.hexhash)
             calls["n"] += 1
             if peer.hexhash == "a" * 64 and calls["n"] == 1:
@@ -1812,10 +1812,12 @@ def test_tan_publish_reports_unsent_peers_past_deadline(tmp_path):
     app = TanApp(config, load_identity(config.identity_path), name=config.name)
 
     sent = []
+    deadlines = []
 
     class _RecordingNode:
-        def request(self, peer, path, payload, *, timeout=15.0):
+        def request(self, peer, path, payload, *, timeout=15.0, deadline=None):
             sent.append(peer.hexhash)
+            deadlines.append(deadline)
             return None
 
     app.node = _RecordingNode()
@@ -1825,10 +1827,15 @@ def test_tan_publish_reports_unsent_peers_past_deadline(tmp_path):
     assert result["delivered"] == 0
     assert result["unsent"] == ["a" * 64, "b" * 64]
     assert sent == []
-    result = app.publish(post, targets=peers, deadline=time.monotonic() + 60.0)
+    live_deadline = time.monotonic() + 60.0
+    result = app.publish(post, targets=peers, deadline=live_deadline)
     assert result["delivered"] == 2
     assert result["unsent"] == []
     assert sent == ["a" * 64, "b" * 64]
+    # The deadline reaches each peer's request, so discovery, link
+    # setup and the response wait for one slow peer cannot run the
+    # pass past its budget.
+    assert deadlines == [live_deadline, live_deadline]
 
 
 def _run_cli(data_dir: Path, argv):

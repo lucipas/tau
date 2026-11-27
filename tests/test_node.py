@@ -188,6 +188,50 @@ def test_info_requires_start(tmp_path):
         node.send_message("alice", "hi")
 
 
+def test_request_passes_deadline_to_request_and_clips_discovery(
+    tmp_path, monkeypatch
+):
+    # The public request() is the gap the #844 review found: _request
+    # already clips every stage by a deadline, but request() never
+    # passed one through, so discovery alone could run a bounded
+    # caller past its budget.
+    node = make_node(tmp_path)
+    peer = make_peer()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name=peer.name, now=1.0
+    )
+    seen = {}
+
+    def fake_resolve(target, *, timeout=10.0):
+        seen["discover_timeout"] = timeout
+        return peer
+
+    def fake_request(peer_arg, path, payload, timeout, deadline=None):
+        seen["deadline"] = deadline
+        seen["timeout"] = timeout
+        return {"ok": True}
+
+    monkeypatch.setattr(node, "resolve_peer", fake_resolve)
+    monkeypatch.setattr(node, "_request", fake_request)
+
+    deadline = time.monotonic() + 2.0
+    assert node.request(peer.hexhash, "/tau/x", b"{}", deadline=deadline) == {
+        "ok": True
+    }
+    assert seen["deadline"] == deadline
+    # Discovery gets only the time left before the deadline, not
+    # the usual 10s.
+    assert 0.0 <= seen["discover_timeout"] <= 2.0
+    assert seen["timeout"] == 20.0
+
+    # Without a deadline nothing changes: the full discover window
+    # and no deadline reach _request.
+    seen.clear()
+    assert node.request(peer.hexhash, "/tau/x", b"{}") == {"ok": True}
+    assert seen["deadline"] is None
+    assert seen["discover_timeout"] == 10.0
+
+
 def test_send_message_sends_kind_on_the_wire(tmp_path, monkeypatch):
     node = make_node(tmp_path)
     peer = make_peer()

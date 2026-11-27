@@ -22,6 +22,16 @@ on load the way the other small JSON stores are: a malformed file
 raises rather than silently dropping scheduled closes, and the
 mail-loop sweep treats a corrupt file as nothing-due (with a warning)
 so one bad file cannot stall mail.
+
+A close that reaches no peer is not retried on every pass at a
+fixed cadence: each failure backs off — 30s, then 60s, 120s, ...
+doubling up to 30 minutes — and the close is skipped by
+``due_poll_closes`` until its next attempt time.  The backoff is
+in-memory, keyed by poll hash, so the schedule file keeps its
+``{poll_hash: close_at}`` shape; a restart simply retries at the
+base delay again.  Backoff only spaces retries: the close keeps its
+original deadline, so it still fires at the time it was scheduled
+for, and a close that lands or is dropped clears its backoff.
 """
 
 from __future__ import annotations
@@ -59,6 +69,19 @@ CLOSE_PASS_BUDGET_SECONDS = 20.0
 # a poll cannot be asked to close itself further out than it could be
 # scheduled or kept alive.
 MAX_POLL_CLOSE_AFTER = 7 * 24 * 60 * 60
+# A close that reaches no peer retries with exponential backoff:
+# 30s, then 60s, 120s, ... up to 30 minutes.  The cap is a spacing,
+# not a give-up: the close keeps retrying at the capped delay until
+# it lands or is dropped, because a close that stops retrying would
+# leave the poll open past its deadline.
+CLOSE_RETRY_BASE_DELAY_SECONDS = 30.0
+CLOSE_RETRY_MAX_DELAY_SECONDS = 30 * 60.0
+
+# In-memory retry backoff, keyed by (schedule file, poll hash):
+# ``(attempts, next_attempt_at)`` in wall-clock seconds.  Keyed by
+# file as well as hash so two data directories never share backoff,
+# and so a test's tmp dir cannot leak a delay into another test.
+_CLOSE_BACKOFF: Dict[Tuple[str, str], Tuple[int, float]] = {}
 
 
 class PollClosesError(ValueError):
@@ -85,6 +108,44 @@ def _clean_close_at(value: Any) -> float:
     if stamp <= 0 or not math.isfinite(stamp):
         raise PollClosesError(f"not a close time: {value!r}")
     return stamp
+
+
+def _backoff_key(path: Union[str, Path], target: str) -> Tuple[str, str]:
+    return (str(Path(path).expanduser()), _clean_target(target))
+
+
+def _record_close_failure(
+    path: Union[str, Path], target: str, now: float
+) -> float:
+    """Note a failed close attempt; return its next attempt time.
+
+    The delay doubles from ``CLOSE_RETRY_BASE_DELAY_SECONDS`` on
+    each consecutive failure, up to
+    ``CLOSE_RETRY_MAX_DELAY_SECONDS``.
+    """
+    key = _backoff_key(path, target)
+    attempts, _ = _CLOSE_BACKOFF.get(key, (0, 0.0))
+    attempts += 1
+    delay = min(
+        CLOSE_RETRY_BASE_DELAY_SECONDS * (2 ** (attempts - 1)),
+        CLOSE_RETRY_MAX_DELAY_SECONDS,
+    )
+    next_attempt_at = now + delay
+    _CLOSE_BACKOFF[key] = (attempts, next_attempt_at)
+    return next_attempt_at
+
+
+def _clear_close_backoff(path: Union[str, Path], target: str) -> None:
+    """Forget any retry backoff for *target* (it landed or is gone)."""
+    _CLOSE_BACKOFF.pop(_backoff_key(path, target), None)
+
+
+def _close_backoff_until(
+    path: Union[str, Path], target: str
+) -> Optional[float]:
+    """When *target* may next be retried, or None when not backing off."""
+    entry = _CLOSE_BACKOFF.get(_backoff_key(path, target))
+    return entry[1] if entry is not None else None
 
 
 def load_poll_closes(path: Union[str, Path]) -> Dict[str, float]:
@@ -164,7 +225,8 @@ def schedule_poll_close(
 
     One schedule per poll: scheduling the same poll again replaces
     its deadline.  A deadline that has already passed is refused — a
-    close due now is a manual close, not a schedule.
+    close due now is a manual close, not a schedule.  A fresh
+    schedule clears any retry backoff from an earlier one.
     """
     cleaned_target = _clean_target(target)
     cleaned_close_at = _clean_close_at(close_at)
@@ -175,6 +237,7 @@ def schedule_poll_close(
         closes = load_poll_closes(path)
         closes[cleaned_target] = cleaned_close_at
         save_poll_closes(path, closes)
+    _clear_close_backoff(path, cleaned_target)
     return cleaned_close_at
 
 
@@ -187,16 +250,29 @@ def drop_poll_close(path: Union[str, Path], target: str) -> bool:
             return False
         del closes[cleaned_target]
         save_poll_closes(path, closes)
+    _clear_close_backoff(path, cleaned_target)
     return True
 
 
 def due_poll_closes(
     path: Union[str, Path], now: Optional[float] = None
 ) -> List[Tuple[str, float]]:
-    """Scheduled closes whose deadline has come, soonest first."""
+    """Scheduled closes whose deadline has come, soonest first.
+
+    A close that failed to reach a peer is skipped until its retry
+    backoff has elapsed (see ``_record_close_failure``): it stays
+    scheduled, it is just not due yet.
+    """
     at = now if now is not None else time.time()
     closes = load_poll_closes(path)
-    due = [(target, close_at) for target, close_at in closes.items() if close_at <= at]
+    due: List[Tuple[str, float]] = []
+    for target, close_at in closes.items():
+        if close_at > at:
+            continue
+        retry_at = _close_backoff_until(path, target)
+        if retry_at is not None and retry_at > at:
+            continue
+        due.append((target, close_at))
     due.sort(key=lambda item: item[1])
     return due
 
@@ -299,8 +375,13 @@ def close_due_polls(
     deleted, expired or unknown is terminal: the schedule is dropped,
     not retried.  A close that reached no peer keeps its schedule —
     the next pass re-sends the same signed close record instead of
-    creating a second one.  Any other failure keeps the schedule for
-    the next pass.  A corrupt schedule file logs a warning and closes
+    creating a second one — but not on the very next pass: each
+    failed attempt backs off (30s, 60s, 120s, ... up to 30 minutes),
+    and the close is skipped until its next attempt time.  Any other
+    failure keeps the schedule for the next pass, with the same
+    backoff.  A close cut short by the pass budget or stop is not a
+    failure: it carries no backoff, so the next pass retries it
+    straight away.  A corrupt schedule file logs a warning and closes
     nothing, so one bad file cannot stall the mail loop that calls
     this.
 
@@ -310,8 +391,9 @@ def close_due_polls(
     # same reason scheduled_posts imports its Tan helpers lazily.
     from .tangents.tan import TanError
 
+    at = now if now is not None else time.time()
     try:
-        due = due_poll_closes(path, now=now)
+        due = due_poll_closes(path, now=at)
     except PollClosesError as exc:
         log.warning("Poll closes at %s are unusable (%s); skipping", path, exc)
         return {"closed": 0, "dropped": 0, "kept": 0}
@@ -342,6 +424,7 @@ def close_due_polls(
                 target,
                 exc_info=True,
             )
+            _record_close_failure(path, target, at)
             kept += 1
             continue
         if record is None:
@@ -364,6 +447,7 @@ def close_due_polls(
                 target,
                 exc_info=True,
             )
+            _record_close_failure(path, target, at)
             kept += 1
             continue
         if outcome == "paused":
@@ -376,6 +460,7 @@ def close_due_polls(
                 "Scheduled close for %s reached no peer; keeping it queued",
                 target,
             )
+            _record_close_failure(path, target, at)
             kept += 1
             continue
         drop_poll_close(path, target)

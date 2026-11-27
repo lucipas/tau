@@ -15075,15 +15075,28 @@ class TauNode:
         *,
         timeout: float = 20.0,
         discover_timeout: Optional[float] = None,
+        deadline: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """Send an arbitrary request to a peer and decode the response."""
+        """Send an arbitrary request to a peer and decode the response.
+
+        ``deadline`` (a ``time.monotonic`` value) bounds the whole
+        request: discovery gets only the time left before it, and
+        the link setup and response wait are clipped the same way
+        by ``_request`` — so a slow peer cannot run a bounded
+        caller past its budget by stalling any single stage.
+        """
+        discover = (
+            discover_timeout
+            if discover_timeout is not None
+            else min(timeout, 10.0)
+        )
+        if deadline is not None:
+            discover = min(discover, _remaining(deadline))
         peer = self.resolve_peer(
             target,
-            timeout=discover_timeout
-            if discover_timeout is not None
-            else min(timeout, 10.0),
+            timeout=discover,
         )
-        return self._request(peer, path, payload, timeout)
+        return self._request(peer, path, payload, timeout, deadline=deadline)
 
     # -- links and requests ------------------------------------------------
 
