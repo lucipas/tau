@@ -991,8 +991,14 @@ class _FakeTanApp:
         self.quoted = []
         self.polled = []
         self.published = []
+        self.closed = []
         self.fail_publish = fail_publish
         self.fail_repost = fail_repost
+
+    def close_poll(self, target, *, publish=False):
+        record = {"hash": "e" * 64, "kind": "close", "target": target}
+        self.closed.append(record)
+        return record
 
     def create_post(
         self, text, *, reply_to=None, expires_at=None, image=None, location=None,
@@ -2358,9 +2364,11 @@ def test_publish_due_without_close_after_registers_nothing(tmp_path):
 def test_publish_due_keeps_poll_queued_when_close_registration_fails(
     tmp_path,
 ):
-    # A close schedule that cannot be recorded keeps the poll queued
-    # like any other failed publish: the poll never goes out without
-    # the close it was promised.
+    # A close schedule that cannot be recorded keeps the poll queued:
+    # the poll never goes out without the close it was promised.  A
+    # corrupt close file is local state, not a failed publication, so
+    # the entry keeps its publish attempts and retries after a bounded
+    # delay instead of burning one.
     from tau.poll_closes import load_poll_closes
 
     path = tmp_path / "scheduled-posts.json"
@@ -2383,7 +2391,8 @@ def test_publish_due_keeps_poll_queued_when_close_registration_fails(
     assert app.published == []
     queue = load_scheduled_posts(path)
     assert len(queue) == 1
-    assert queue.posts[0].attempts == 1
+    assert queue.posts[0].attempts == 0
+    assert queue.posts[0].next_attempt_at == 2060.0
 
 
 class _FakeTanAppWithCreatedAt(_FakeTanApp):
@@ -2432,3 +2441,44 @@ def test_publish_due_registers_the_same_deadline_on_retry(tmp_path):
     # The retry re-sends the same poll, so the deadline does not
     # slide forward with the retry.
     assert load_poll_closes(closes_path) == {"d" * 64: 5100.0}
+
+
+def test_publish_due_closes_poll_whose_deadline_passed_while_queued(
+    tmp_path,
+):
+    # A retry inside the final second before expiry: the deadline
+    # already passed while the poll was queued, so pushing it one
+    # second out would land after expiry and the sweep would drop
+    # it.  The publish pass closes the poll itself, right after
+    # the publish, and leaves no schedule behind.
+    from tau.poll_closes import load_poll_closes
+
+    path = tmp_path / "scheduled-posts.json"
+    closes_path = tmp_path / "poll-closes.json"
+    schedule_poll(
+        path,
+        question="pizza or tacos?",
+        options=["Pizza", "Tacos"],
+        publish_at=1000.0,
+        now=900.0,
+        close_after=3600.0,
+        expires_in=3601.0,
+    )
+    app = _FakeTanAppWithCreatedAt(fail_publish=True)
+    result = publish_due_scheduled_posts(
+        path, app, now=2000.0, poll_close_path=closes_path
+    )
+    assert result == {"published": 0, "kept": 1}
+    # The deadline was registered when the poll was signed, even
+    # though the publish itself failed.
+    assert load_poll_closes(closes_path) == {"d" * 64: 5100.0}
+
+    app.fail_publish = False
+    result = publish_due_scheduled_posts(
+        path, app, now=5100.5, poll_close_path=closes_path
+    )
+    assert result == {"published": 1, "kept": 0}
+    # Closed in the same pass, not scheduled: the poll expires at
+    # 5101, so a deadline one second out would have been dropped.
+    assert [entry["target"] for entry in app.closed] == ["d" * 64]
+    assert load_poll_closes(closes_path) == {}
