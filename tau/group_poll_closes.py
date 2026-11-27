@@ -85,6 +85,11 @@ GROUP_CLOSE_LEG_TIMEOUT_SECONDS = 5.0
 # and so a test's tmp dir cannot leak a delay into another test.
 _CLOSE_BACKOFF: Dict[Tuple[str, str], Tuple[int, float]] = {}
 
+# A close that still reaches no member after this many attempts is
+# given up: its schedule is dropped with a warning.  At the capped
+# 30-minute spacing, 48 attempts bound retries to about a day.
+CLOSE_RETRY_MAX_ATTEMPTS = 48
+
 # A leg that failed because the member explicitly refused the close
 # (or it expired) can never land: retrying it would fail the same
 # way, so the sweep drops the schedule instead of backing off.
@@ -166,6 +171,25 @@ def _record_close_failure(
     next_attempt_at = now + delay
     _CLOSE_BACKOFF[backoff_key] = (attempts, next_attempt_at)
     return next_attempt_at
+
+
+def _note_close_failure(
+    path: Union[str, Path], key: str, now: float, entry: Dict[str, Any]
+) -> bool:
+    """Back off a failed close; True when it hit the attempt limit and was dropped."""
+    _record_close_failure(path, key, now)
+    attempts, _ = _CLOSE_BACKOFF[_backoff_key(path, key)]
+    if attempts < CLOSE_RETRY_MAX_ATTEMPTS:
+        return False
+    log.warning(
+        "Dropping scheduled group poll close for %s after %d failed attempts",
+        key,
+        attempts,
+    )
+    drop_group_poll_close(
+        path, entry["group"], entry["author"], entry["sent_at"]
+    )
+    return True
 
 
 def _clear_close_backoff(path: Union[str, Path], key: str) -> None:
@@ -385,6 +409,10 @@ def _send_close(
     """
     group = node.groups.find(entry["group"])
     if group is None:
+        # A group change retires the poll's original roster: the
+        # predecessor's record still names the poll's recipients.
+        group = node.groups.get_retired(entry["group"])
+    if group is None:
         raise _UnknownGroup()
     result = node.send_group_message(
         group,
@@ -396,7 +424,14 @@ def _send_close(
         return "closed"
     results = result.get("results") or []
     if not results:
-        return "closed"
+        # Nothing was attempted.  A solo group has no member to close
+        # for, so that is done; otherwise keep the schedule and retry.
+        others = [
+            member
+            for member in group.get("members") or []
+            if member != node.destination_hexhash
+        ]
+        return "kept" if others else "closed"
     if any(
         leg.get("delivered") or leg.get("queued") for leg in results
     ):
@@ -433,6 +468,8 @@ def close_due_group_polls(
     schedule — the next pass re-sends it — but not on the very next
     pass: each failed attempt backs off (30s, 60s, 120s, ... up to 30
     minutes), and the close is skipped until its next attempt time.
+    After ``CLOSE_RETRY_MAX_ATTEMPTS`` failed attempts the schedule is
+    dropped with a warning.
     A close cut short by the pass budget or stop is not a failure:
     it carries no backoff, so the next pass retries it straight away.
     A corrupt schedule file logs a warning and closes nothing, so one
@@ -479,8 +516,10 @@ def close_due_group_polls(
             # wall clock: ``due_group_poll_closes`` reads backoff
             # against the same ``now``, so a failure stamped in
             # another frame would never become due again under it.
-            _record_close_failure(path, key, at)
-            kept += 1
+            if _note_close_failure(path, key, at, entry):
+                dropped += 1
+            else:
+                kept += 1
             continue
         if poll is None:
             # The poll is gone from this node's history (deleted or
@@ -556,8 +595,10 @@ def close_due_group_polls(
                 "keeping it queued",
                 key,
             )
-            _record_close_failure(path, key, at)
-            kept += 1
+            if _note_close_failure(path, key, at, entry):
+                dropped += 1
+            else:
+                kept += 1
             continue
         drop_group_poll_close(
             path, entry["group"], entry["author"], entry["sent_at"]

@@ -573,6 +573,75 @@ def test_close_due_group_polls_closes_a_real_poll(tmp_path):
     assert group_poll_tally(history, poll, own_hash=OWN_HASH)["closed"] is True
 
 
+def test_close_gives_up_after_the_attempt_limit(tmp_path, monkeypatch):
+    import tau.group_poll_closes as closes
+
+    monkeypatch.setattr(closes, "CLOSE_RETRY_MAX_ATTEMPTS", 3)
+    path = tmp_path / "group-poll-closes.json"
+    schedule_group_poll_close(path, GROUP_ID, OWN_HASH, 1000.0, 2000.0, now=1000.0)
+    node = _FakeNode(
+        tmp_path,
+        send_results=[
+            {
+                "to": OTHER_HASH,
+                "ok": False,
+                "error": "could not queue: outbox is full",
+                "id": "f" * 32,
+            }
+        ],
+    )
+    _seed_poll(node)
+    # Each pass is past the backoff, so every pass is a real attempt.
+    assert close_due_group_polls(path, node, now=2500.0) == {
+        "closed": 0,
+        "dropped": 0,
+        "kept": 1,
+    }
+    assert close_due_group_polls(path, node, now=6100.0) == {
+        "closed": 0,
+        "dropped": 0,
+        "kept": 1,
+    }
+    assert close_due_group_polls(path, node, now=9700.0) == {
+        "closed": 0,
+        "dropped": 1,
+        "kept": 0,
+    }
+    assert load_group_poll_closes(path) == {}
+    assert len(node.send_calls) == 3
+
+
+def test_close_that_reaches_no_leg_keeps_its_schedule(tmp_path):
+    from tau.group_poll_closes import _close_backoff_until
+
+    path = tmp_path / "group-poll-closes.json"
+    schedule_group_poll_close(path, GROUP_ID, OWN_HASH, 1000.0, 2000.0, now=1000.0)
+    node = _FakeNode(tmp_path, send_results=[])
+    node.groups._groups[GROUP_ID]["members"] = [OWN_HASH, OTHER_HASH]
+    _seed_poll(node)
+    result = close_due_group_polls(path, node, now=2500.0)
+    assert result == {"closed": 0, "dropped": 0, "kept": 1}
+    assert _close_backoff_until(path, _key()) == 2530.0
+    assert _key() in load_group_poll_closes(path)
+
+
+def test_close_sends_to_the_retired_original_roster(tmp_path):
+    path = tmp_path / "group-poll-closes.json"
+    schedule_group_poll_close(path, GROUP_ID, OWN_HASH, 1000.0, 2000.0, now=1000.0)
+    node = _FakeNode(tmp_path, group=False)
+    node.groups._retired[GROUP_ID] = {
+        "id": GROUP_ID,
+        "name": "weekend",
+        "creator": OWN_HASH,
+        "members": [OWN_HASH, OTHER_HASH],
+    }
+    _seed_poll(node)
+    result = close_due_group_polls(path, node, now=2500.0)
+    assert result == {"closed": 1, "dropped": 0, "kept": 0}
+    assert node.send_calls[0][0]["id"] == GROUP_ID
+    assert load_group_poll_closes(path) == {}
+
+
 def test_max_close_after_is_the_seven_day_horizon():
     assert MAX_POLL_CLOSE_AFTER == 7 * 24 * 60 * 60
 
