@@ -305,6 +305,25 @@ def test_close_due_group_polls_drops_a_retracted_poll(tmp_path):
     assert load_group_poll_closes(path) == {}
 
 
+def test_close_due_group_polls_drops_a_poll_retracted_by_its_author(tmp_path):
+    # The poll record is gone and the author retracted their own
+    # outgoing poll: the sent marker is the durable record that it
+    # is gone on purpose, so the schedule is dropped instead of
+    # re-sent to members who already received the retract.
+    path = tmp_path / "group-poll-closes.json"
+    schedule_group_poll_close(path, GROUP_ID, OWN_HASH, 1000.0, 2000.0, now=1000.0)
+    node = _FakeNode(tmp_path)  # no poll seeded
+    node.mailbox = SimpleNamespace(
+        is_group_retracted=lambda *args, **kwargs: False,
+        is_sent_group_retracted=lambda *args, **kwargs: True,
+    )
+
+    result = close_due_group_polls(path, node, now=2500.0)
+    assert result == {"closed": 0, "dropped": 1, "kept": 0}
+    assert node.send_calls == []
+    assert load_group_poll_closes(path) == {}
+
+
 def test_close_due_group_polls_drops_a_poll_that_is_not_ours(tmp_path):
     path = tmp_path / "group-poll-closes.json"
     schedule_group_poll_close(path, GROUP_ID, OTHER_HASH, 1000.0, 2000.0, now=1000.0)

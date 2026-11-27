@@ -3349,6 +3349,7 @@ class TauNode:
         topic_sent_at: Optional[float] = None,
         announcements_sent_at: Optional[float] = None,
         poll_close: Optional[Dict[str, Any]] = None,
+        message: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Validate a group message's roster; pin the group on first sight.
 
@@ -3382,7 +3383,11 @@ class TauNode:
         carries one: a close for a retained retired group is accepted
         on its own narrow path (see
         :meth:`_accept_retired_group_poll_close`) instead of being
-        refused with the retired id.
+        refused with the retired id.  ``message`` is the message
+        itself, when the caller has it: when the retired path
+        accepts a close, the message is rewritten to the close alone
+        before the caller stores it, so no post that rode with the
+        marker lands under the retired id.
         """
         members = group.get("members") or []
         own_hash = self.destination_hexhash
@@ -3429,9 +3434,26 @@ class TauNode:
             # by a rename or roster change, so the ordinary pin
             # refuses it — but a poll close is narrow enough to take
             # on its own (see _accept_retired_group_poll_close).
-            return self._accept_retired_group_poll_close(
+            retired = self._accept_retired_group_poll_close(
                 sender_hash, group, poll_close
             )
+            if retired is not None and message is not None:
+                # The close is the whole message: whatever post rode
+                # with the marker — text, a pin, a card, a quote, a
+                # vote, an edit — is stripped before the record is
+                # built, or a removed member could smuggle a post
+                # under the retired id past the refusal.  The tally
+                # reads poll_close, never this text, so the close
+                # still counts exactly like a direct one.
+                message["text"] = "closed the poll"
+                message["location"] = None
+                message["contact"] = None
+                message["beacon"] = None
+                message["in_reply_to"] = None
+                message["poll_options"] = None
+                message["poll_vote"] = None
+                message["edited_at"] = None
+            return retired
         return None
 
     def _handle_group_message(
@@ -3524,6 +3546,7 @@ class TauNode:
             topic_sent_at=message.get("group_topic_sent_at"),
             announcements_sent_at=message.get("group_announcements_sent_at"),
             poll_close=message.get("poll_close"),
+            message=message,
         )
         if group is None:
             log.info(
@@ -10375,6 +10398,7 @@ class TauNode:
                 topic_sent_at=group.get("topic_sent_at"),
                 announcements_sent_at=group.get("announcements_sent_at"),
                 poll_close=message.get("poll_close"),
+                message=message,
             )
             if pinned is None:
                 log.info(
